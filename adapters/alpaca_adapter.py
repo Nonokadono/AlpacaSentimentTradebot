@@ -1,0 +1,184 @@
+import os
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
+import alpaca_trade_api as tradeapi
+
+
+class AlpacaAdapter:
+    """
+    Thin adapter around Alpaca REST API, configured purely by env vars:
+      APCA_API_BASE_URL
+      APCA_API_KEY_ID
+      APCA_API_SECRET_KEY
+    """
+
+    def __init__(self, env_mode: str):
+        self.env_mode = env_mode
+        base_url = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+        key_id = os.getenv("APCA_API_KEY_ID")
+        secret_key = os.getenv("APCA_API_SECRET_KEY")
+        if not key_id or not secret_key:
+            raise ValueError("APCA_API_KEY_ID and APCA_API_SECRET_KEY must be set")
+
+        self.rest = tradeapi.REST(
+            key_id,
+            secret_key,
+            base_url=base_url,
+            api_version="v2",
+        )
+
+    # --- Account & positions ---
+
+    def get_account(self) -> Any:
+        return self.rest.get_account()
+
+    def list_positions(self) -> List[Any]:
+        return self.rest.list_positions()
+
+    def get_position(self, symbol: str) -> Optional[Any]:
+        try:
+            return self.rest.get_position(symbol)
+        except tradeapi.rest.APIError:
+            return None
+
+    # --- Market data (simple) ---
+
+    def get_last_quote(self, symbol: str) -> float:
+        """
+        Return the latest trade price for the given symbol.
+        Uses get_latest_trade for current alpaca-trade-api versions.
+        """
+        last = self.rest.get_latest_trade(symbol)
+        return float(last.price)
+
+    def get_bar_close(self, symbol: str, timeframe: str = "1Min") -> float:
+        """
+        Return the close of the most recent bar in the given timeframe.
+
+        If no bars are returned (e.g., outside market hours or data issue),
+        fall back to the latest trade price instead of raising.
+        """
+        end = datetime.utcnow()
+        start = end - timedelta(minutes=60)
+
+        try:
+            bars = self.rest.get_bars(
+                symbol,
+                timeframe,
+                start.isoformat() + "Z",
+                end.isoformat() + "Z",
+            )
+        except Exception as e:
+            print(f"get_bars error for {symbol}: {e}")
+            bars = []
+
+        if not bars:
+            last = self.rest.get_latest_trade(symbol)
+            return float(last.price)
+
+        bar = bars[-1]
+        close_price = getattr(bar, "c", None)
+        if close_price is None:
+            close_price = bar.c
+
+        return float(close_price)
+
+    def get_recent_bars(
+        self,
+        symbol: str,
+        timeframe: str = "5Min",
+        lookback_bars: int = 30,
+    ) -> List[Any]:
+        """
+        Fetch recent bars for more advanced technical and volatility signals.
+        """
+        end = datetime.utcnow()
+        start = end - timedelta(minutes=lookback_bars * 5 + 30)
+        try:
+            bars = self.rest.get_bars(
+                symbol,
+                timeframe,
+                start.isoformat() + "Z",
+                end.isoformat() + "Z",
+                limit=lookback_bars,
+            )
+        except Exception as e:
+            print(f"get_recent_bars error for {symbol}: {e}")
+            bars = []
+        return list(bars or [])
+
+    # --- News / sentiment inputs ---
+
+    def get_news(
+        self,
+        symbol: str,
+        since: Optional[datetime] = None,
+        limit: int = 20,
+    ) -> List[Dict[str, str]]:
+        """
+        Fetch recent news for a symbol from Alpaca and normalize into a list
+        of dicts with 'headline' and 'summary' keys, suitable for SentimentModule.
+
+        If the API fails, returns an empty list (sentiment will degrade to neutral).
+        """
+        try:
+            # Alpaca uses "symbol", not "symbols"
+            kwargs: Dict[str, Any] = {"symbol": symbol, "limit": limit}
+            if since is not None:
+                kwargs["start"] = since.isoformat() + "Z"
+            raw_items = self.rest.get_news(**kwargs)
+        except Exception as e:
+            print(f"get_news error for {symbol}: {e}")
+            return []
+
+        out: List[Dict[str, str]] = []
+        for n in raw_items:
+            headline = getattr(n, "headline", "") or ""
+            summary = getattr(n, "summary", "") or ""
+            out.append(
+                {
+                    "headline": headline,
+                    "summary": summary,
+                }
+            )
+        return out
+
+
+    # --- Orders (including bracket) ---
+
+    def submit_bracket_order(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        take_profit_price: float,
+        stop_loss_price: float,
+        time_in_force: str = "day",
+    ) -> Any:
+        """
+        Bracket order: market entry with attached TP and SL.
+        """
+        order = self.rest.submit_order(
+            symbol=symbol,
+            side=side,
+            type="market",
+            qty=qty,
+            time_in_force=time_in_force,
+            order_class="bracket",
+            take_profit={"limit_price": take_profit_price},
+            stop_loss={"stop_price": stop_loss_price, "limit_price": stop_loss_price},
+        )
+        return order
+
+    def cancel_all_orders(self) -> None:
+        self.rest.cancel_all_orders()
+
+    def close_all_positions(self) -> None:
+        self.rest.close_all_positions()
+
+    def list_orders(self, status: str = "open") -> List[Any]:
+        return self.rest.list_orders(status=status)
+
+
+

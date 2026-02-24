@@ -1,0 +1,23 @@
+1----------------------------------------------------------------------------------
+
+prevent repeated orders in next loop, when position for instrument is still open.
+
+2----------------------------------------------------------------------------------
+
+Scrap upper and lower resistance with AI and use it in a viable capacity
+
+3----------------------------------------------------------------------------------
+
+test with different weights in composit value
+
+4----------------------------------------------------------------------------------
+
+tweak lot size based on weights
+
+5----------------------------------------------------------------------------------
+
+improve portfolio composition for better diversification
+
+6----------------------------------------------------------------------------------
+
+thats lowkey and highkey it

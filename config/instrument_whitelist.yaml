@@ -1,0 +1,177 @@
+AAPL:
+  exchange: NASDAQ
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+MSFT:
+  exchange: NASDAQ
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+GOOGL:
+  exchange: NASDAQ
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#AMZN:
+  exchange: NASDAQ
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#NVDA:
+  exchange: NASDAQ
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#META:
+  exchange: NASDAQ
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#TSLA:
+  exchange: NASDAQ
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#AMD:
+  exchange: NASDAQ
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#MU:
+  exchange: NASDAQ
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#NFLX:
+  exchange: NASDAQ
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#SPY:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#QQQ:
+  exchange: NASDAQ
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#VOO:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#IWM:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#XLF:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#XLE:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#SLV:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#EEM:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#BAC:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#COST:
+  exchange: NASDAQ
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "09:30-16:00"
+
+#SPY:
+  exchange: ARCA
+  lotsize: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  tradinghours: "0930-1600"
+  sector: INDEX   # S&P 500 proxy
+
+#FXE:
+  exchange: ARCA
+  lotsize: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  tradinghours: "0930-1600"
+  sector: FX      # EUR vs USD proxy
