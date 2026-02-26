@@ -1,6 +1,8 @@
 # execution/order_executor.py
 
 import logging
+import time
+from typing import Optional
 
 from alpaca_trade_api.rest import APIError
 from adapters.alpaca_adapter import AlpacaAdapter
@@ -10,15 +12,23 @@ from monitoring.monitor import (
     log_proposed_trade,
     log_sentiment_close_decision,
 )
+from config.config import ExecutionConfig
 
 logger = logging.getLogger("tradebot")
 
 
 class OrderExecutor:
-    def __init__(self, adapter: AlpacaAdapter, env_mode: str, live_trading_enabled: bool) -> None:
+    def __init__(
+        self,
+        adapter: AlpacaAdapter,
+        env_mode: str,
+        live_trading_enabled: bool,
+        execution_cfg: ExecutionConfig,
+    ) -> None:
         self.adapter = adapter
         self.env_mode = env_mode
         self.live_trading_enabled = live_trading_enabled
+        self.execution_cfg = execution_cfg
 
     def _can_place_orders(self) -> bool:
         """
@@ -29,6 +39,18 @@ class OrderExecutor:
         if self.env_mode == "LIVE" and not self.live_trading_enabled:
             return False
         return True
+
+    def _wait_for_position(self, symbol: str, timeout_sec: int) -> Optional[any]:
+        """
+        Wait briefly for the entry to fill so we can submit exit orders safely.
+        """
+        deadline = time.time() + max(0, int(timeout_sec))
+        while time.time() < deadline:
+            pos = self.adapter.get_position(symbol)
+            if pos is not None:
+                return pos
+            time.sleep(1)
+        return None
 
     def execute_proposed_trade(self, trade: ProposedTrade):
         # Log the proposed trade with environment mode
@@ -46,23 +68,66 @@ class OrderExecutor:
         if side not in ("buy", "sell"):
             raise ValueError("side must be 'buy' or 'sell'")
 
-        # Round TP and SL to 2 decimals to avoid sub‑penny issues
-        tp_price = round(trade.take_profit_price, 2)
-        sl_price = round(trade.stop_price, 2)
-
         try:
-            order = self.adapter.submit_bracket_order(
+            # 1) Entry: market order
+            entry_order = self.adapter.submit_market_order(
                 symbol=trade.symbol,
                 qty=trade.qty,
                 side=side,
-                take_profit_price=tp_price,
-                stop_loss_price=sl_price,
-                time_in_force="day",
+                time_in_force=self.execution_cfg.entry_time_in_force,
             )
-            return order
         except APIError as e:
-            logger.error(f"Order placement failed for {trade.symbol}: {e}")
+            logger.error(f"Entry order placement failed for {trade.symbol}: {e}")
             return None
+
+        # 2) If configured, attempt to place trailing stop + take profit AFTER fill
+        if not self.execution_cfg.enable_trailing_stop and not self.execution_cfg.enable_take_profit:
+            return entry_order
+
+        pos = self._wait_for_position(trade.symbol, self.execution_cfg.post_entry_fill_timeout_sec)
+        if pos is None:
+            # Position not visible yet; next loop can protect it via monitoring logic if you add it later.
+            return entry_order
+
+        try:
+            pos_qty = abs(float(getattr(pos, "qty", 0.0)))
+        except Exception:
+            pos_qty = abs(trade.qty)
+
+        if pos_qty <= 0:
+            return entry_order
+
+        # Determine exit side opposite of entry
+        exit_side = "sell" if side == "buy" else "buy"
+
+        # Place Take Profit limit (optional)
+        if self.execution_cfg.enable_take_profit:
+            tp_price = round(float(trade.take_profit_price), 2)
+            try:
+                self.adapter.submit_take_profit_limit_order(
+                    symbol=trade.symbol,
+                    qty=pos_qty,
+                    side=exit_side,
+                    limit_price=tp_price,
+                    time_in_force=self.execution_cfg.exit_time_in_force,
+                )
+            except APIError as e:
+                logger.error(f"Take profit placement failed for {trade.symbol}: {e}")
+
+        # Place Trailing Stop (5% trail by default)
+        if self.execution_cfg.enable_trailing_stop:
+            try:
+                self.adapter.submit_trailing_stop_order(
+                    symbol=trade.symbol,
+                    qty=pos_qty,
+                    side=exit_side,
+                    trail_percent=float(self.execution_cfg.trailing_stop_percent),
+                    time_in_force=self.execution_cfg.exit_time_in_force,
+                )
+            except APIError as e:
+                logger.error(f"Trailing stop placement failed for {trade.symbol}: {e}")
+
+        return entry_order
 
     def close_position_due_to_sentiment(
         self,
@@ -112,8 +177,4 @@ class OrderExecutor:
         except APIError as e:
             logger.error(f"Close position failed for {position.symbol}: {e}")
             return None
-
-
-
-
 

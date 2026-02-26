@@ -8,9 +8,9 @@ import alpaca_trade_api as tradeapi
 class AlpacaAdapter:
     """
     Thin adapter around Alpaca REST API, configured purely by env vars:
-      APCA_API_BASE_URL
-      APCA_API_KEY_ID
-      APCA_API_SECRET_KEY
+    APCA_API_BASE_URL
+    APCA_API_KEY_ID
+    APCA_API_SECRET_KEY
     """
 
     def __init__(self, env_mode: str):
@@ -22,42 +22,31 @@ class AlpacaAdapter:
             raise ValueError("APCA_API_KEY_ID and APCA_API_SECRET_KEY must be set")
 
         self.rest = tradeapi.REST(
-            key_id,
-            secret_key,
+            key_id=key_id,
+            secret_key=secret_key,
             base_url=base_url,
             api_version="v2",
         )
 
-    # --- Account & positions ---
+    # --- Account / positions ---
 
     def get_account(self) -> Any:
         return self.rest.get_account()
 
     def list_positions(self) -> List[Any]:
-        return self.rest.list_positions()
+        return list(self.rest.list_positions() or [])
 
     def get_position(self, symbol: str) -> Optional[Any]:
         try:
             return self.rest.get_position(symbol)
-        except tradeapi.rest.APIError:
+        except Exception:
             return None
 
-    # --- Market data (simple) ---
+    # --- Market data ---
 
     def get_last_quote(self, symbol: str) -> float:
         """
-        Return the latest trade price for the given symbol.
-        Uses get_latest_trade for current alpaca-trade-api versions.
-        """
-        last = self.rest.get_latest_trade(symbol)
-        return float(last.price)
-
-    def get_bar_close(self, symbol: str, timeframe: str = "1Min") -> float:
-        """
-        Return the close of the most recent bar in the given timeframe.
-
-        If no bars are returned (e.g., outside market hours or data issue),
-        fall back to the latest trade price instead of raising.
+        Get a close/last price proxy via recent bars, fallback to latest trade.
         """
         end = datetime.utcnow()
         start = end - timedelta(minutes=60)
@@ -65,7 +54,7 @@ class AlpacaAdapter:
         try:
             bars = self.rest.get_bars(
                 symbol,
-                timeframe,
+                "5Min",
                 start.isoformat() + "Z",
                 end.isoformat() + "Z",
             )
@@ -90,9 +79,6 @@ class AlpacaAdapter:
         timeframe: str = "5Min",
         lookback_bars: int = 30,
     ) -> List[Any]:
-        """
-        Fetch recent bars for more advanced technical and volatility signals.
-        """
         end = datetime.utcnow()
         start = end - timedelta(minutes=lookback_bars * 5 + 30)
         try:
@@ -116,14 +102,7 @@ class AlpacaAdapter:
         since: Optional[datetime] = None,
         limit: int = 20,
     ) -> List[Dict[str, str]]:
-        """
-        Fetch recent news for a symbol from Alpaca and normalize into a list
-        of dicts with 'headline' and 'summary' keys, suitable for SentimentModule.
-
-        If the API fails, returns an empty list (sentiment will degrade to neutral).
-        """
         try:
-            # Alpaca uses "symbol", not "symbols"
             kwargs: Dict[str, Any] = {"symbol": symbol, "limit": limit}
             if since is not None:
                 kwargs["start"] = since.isoformat() + "Z"
@@ -136,40 +115,62 @@ class AlpacaAdapter:
         for n in raw_items:
             headline = getattr(n, "headline", "") or ""
             summary = getattr(n, "summary", "") or ""
-            out.append(
-                {
-                    "headline": headline,
-                    "summary": summary,
-                }
-            )
+            out.append({"headline": headline, "summary": summary})
         return out
 
+    # --- Orders ---
 
-    # --- Orders (including bracket) ---
-
-    def submit_bracket_order(
+    def submit_market_order(
         self,
         symbol: str,
         qty: float,
         side: str,
-        take_profit_price: float,
-        stop_loss_price: float,
         time_in_force: str = "day",
     ) -> Any:
-        """
-        Bracket order: market entry with attached TP and SL.
-        """
-        order = self.rest.submit_order(
+        return self.rest.submit_order(
             symbol=symbol,
             side=side,
             type="market",
             qty=qty,
             time_in_force=time_in_force,
-            order_class="bracket",
-            take_profit={"limit_price": take_profit_price},
-            stop_loss={"stop_price": stop_loss_price, "limit_price": stop_loss_price},
         )
-        return order
+
+    def submit_take_profit_limit_order(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        limit_price: float,
+        time_in_force: str = "day",
+    ) -> Any:
+        return self.rest.submit_order(
+            symbol=symbol,
+            side=side,
+            type="limit",
+            qty=qty,
+            limit_price=limit_price,
+            time_in_force=time_in_force,
+        )
+
+    def submit_trailing_stop_order(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        trail_percent: float,
+        time_in_force: str = "day",
+    ) -> Any:
+        return self.rest.submit_order(
+            symbol=symbol,
+            side=side,
+            type="trailing_stop",
+            qty=qty,
+            trail_percent=trail_percent,
+            time_in_force=time_in_force,
+        )
+
+    def cancel_order(self, order_id: str) -> None:
+        self.rest.cancel_order(order_id)
 
     def cancel_all_orders(self) -> None:
         self.rest.cancel_all_orders()
@@ -178,7 +179,5 @@ class AlpacaAdapter:
         self.rest.close_all_positions()
 
     def list_orders(self, status: str = "open") -> List[Any]:
-        return self.rest.list_orders(status=status)
-
-
+        return list(self.rest.list_orders(status=status) or [])
 

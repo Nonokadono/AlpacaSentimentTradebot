@@ -1,6 +1,6 @@
 # core/portfolio_builder.py
 
-from typing import Dict, List
+from typing import Dict, List, Any
 
 from adapters.alpaca_adapter import AlpacaAdapter
 from core.signals import SignalEngine, Signal
@@ -39,7 +39,47 @@ class PortfolioBuilder:
         symbol: str,
         snapshot: EquitySnapshot,
         positions: Dict[str, PositionInfo],
+        pending_symbols: set,
     ) -> ProposedTrade:
+        
+        # --- DUPLICATE-ORDER & NO EQUITY GUARD ---
+        # If we already hold a position in this symbol, skip immediately (no AI API calls).
+        if symbol in positions:
+            return ProposedTrade(
+                symbol=symbol,
+                side="buy",
+                qty=0.0,
+                entry_price=0.0,
+                stop_price=0.0,
+                take_profit_price=0.0,
+                risk_amount=0.0,
+                risk_pct_of_equity=0.0,
+                sentiment_score=0.0,
+                sentiment_scale=0.0,
+                signal_score=0.0,
+                rationale="Position already open for this symbol",
+                rejected_reason="Position already open; skipping to prevent duplicate order and save API calls",
+            )
+            
+        # If an order is already pending, skip immediately (no AI API calls).
+        if symbol in pending_symbols:
+            return ProposedTrade(
+                symbol=symbol,
+                side="buy",
+                qty=0.0,
+                entry_price=0.0,
+                stop_price=0.0,
+                take_profit_price=0.0,
+                risk_amount=0.0,
+                risk_pct_of_equity=0.0,
+                sentiment_score=0.0,
+                sentiment_scale=0.0,
+                signal_score=0.0,
+                rationale="Pending order exists for this symbol",
+                rejected_reason="Pending order exists; skipping to prevent duplicate order and save API calls",
+            )
+
+        # Signal Engine is queried AFTER validation, saving an AI API call if conditions are unmet.
         sig: Signal = self.signal_engine.generate_signal_for_symbol(symbol)
 
         if sig.side == "skip":
@@ -79,7 +119,16 @@ class PortfolioBuilder:
         self,
         snapshot: EquitySnapshot,
         positions: Dict[str, PositionInfo],
+        open_orders: List[Any],
     ) -> List[ProposedTrade]:
+        
+        # Defense-in-depth: if fully allocated globally, skip all portfolio generation.
+        exposure_cap_notional = snapshot.equity * self.cfg.risk_limits.gross_exposure_cap_pct
+        if snapshot.gross_exposure >= exposure_cap_notional or len(positions) >= self.cfg.risk_limits.max_open_positions:
+            return []
+
+        pending_symbols = {getattr(o, "symbol", "") for o in open_orders if hasattr(o, "symbol")}
+
         symbols = list(self.cfg.instruments.keys())
         max_candidates = self.cfg.portfolio.max_candidates_per_loop
         if max_candidates > 0:
@@ -87,7 +136,7 @@ class PortfolioBuilder:
 
         candidates: List[ProposedTrade] = []
         for sym in symbols:
-            candidate = self._build_candidate_for_symbol(sym, snapshot, positions)
+            candidate = self._build_candidate_for_symbol(sym, snapshot, positions, pending_symbols)
             candidates.append(candidate)
 
         feasible: List[ProposedTrade] = [
@@ -103,6 +152,10 @@ class PortfolioBuilder:
         current_open_positions = len(positions)
 
         for t in feasible:
+            # Secondary guard (defensive): never select a symbol already in positions.
+            if t.symbol in positions:
+                continue
+
             notional = t.qty * t.entry_price
             projected_gross = current_gross + abs(notional)
 

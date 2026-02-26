@@ -14,7 +14,7 @@ LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "tr
 
 @dataclass
 class RiskLimits:
-    max_risk_per_trade_pct: float = 0.01     # 1% of equity
+    max_risk_per_trade_pct: float = 0.03     # 3% of equity (was 1%)
     min_risk_per_trade_pct: float = 0.005    # 0.5% of equity
     gross_exposure_cap_pct: float = 0.90     # 90% of equity
     daily_loss_limit_pct: float = 0.04       # 4% of start-of-day equity
@@ -50,6 +50,16 @@ class TechnicalSignalConfig:
 
 
 @dataclass
+class ExecutionConfig:
+    enable_trailing_stop: bool = True
+    trailing_stop_percent: float = 5.0   # 5% trailing distance
+    enable_take_profit: bool = True
+    exit_time_in_force: str = "day"
+    entry_time_in_force: str = "day"
+    post_entry_fill_timeout_sec: int = 15
+
+
+@dataclass
 class InstrumentMeta:
     symbol: str
     exchange: str
@@ -74,6 +84,7 @@ class BotConfig:
     risk_limits: RiskLimits
     sentiment: SentimentConfig
     technical: TechnicalSignalConfig
+    execution: ExecutionConfig
     instruments: Dict[str, InstrumentMeta]
     portfolio: PortfolioConfig
 
@@ -112,6 +123,7 @@ def load_config() -> BotConfig:
     risk = RiskLimits()
     sentiment = SentimentConfig()
     technical = TechnicalSignalConfig()
+    execution = ExecutionConfig()
     portfolio = PortfolioConfig()
 
     cfg = BotConfig(
@@ -120,6 +132,7 @@ def load_config() -> BotConfig:
         risk_limits=risk,
         sentiment=sentiment,
         technical=technical,
+        execution=execution,
         instruments=instruments,
         portfolio=portfolio,
     )
@@ -129,9 +142,3 @@ def load_config() -> BotConfig:
 if __name__ == "__main__":
     cfg = load_config()
     print(asdict(cfg))
-
-
-
-
-
-

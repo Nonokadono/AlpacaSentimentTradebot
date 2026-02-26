@@ -103,7 +103,7 @@ def main():
     signal_engine = SignalEngine(adapter, sentiment, cfg.technical)
     risk_engine = RiskEngine(cfg.risk_limits, cfg.sentiment, cfg.instruments)
     pm = PositionManager(adapter)
-    executor = OrderExecutor(adapter, cfg.env_mode, cfg.live_trading_enabled)
+    executor = OrderExecutor(adapter, cfg.env_mode, cfg.live_trading_enabled, cfg.execution)
     kill_switch = KillSwitch(cfg.risk_limits)
     portfolio_builder = PortfolioBuilder(cfg, adapter, sentiment, signal_engine, risk_engine)
 
@@ -120,13 +120,17 @@ def main():
             continue
 
         exposure_cap_notional = snapshot.equity * cfg.risk_limits.gross_exposure_cap_pct
-        if snapshot.gross_exposure >= exposure_cap_notional:
+        
+        # --- NO EQUITY GUARD ---
+        if snapshot.gross_exposure >= exposure_cap_notional or len(positions) >= cfg.risk_limits.max_open_positions:
             time.sleep(60)
             continue
 
-        proposed_trades = portfolio_builder.build_portfolio(snapshot, positions)
+        # Fetch open orders to prevent duplicates and pass to portfolio builder
+        open_orders = adapter.list_orders(status="open")
 
-        # Log portfolio-level overview (after all instruments evaluated)
+        proposed_trades = portfolio_builder.build_portfolio(snapshot, positions, open_orders)
+
         from monitoring.monitor import log_portfolio_overview  # local import to avoid cycles
         log_portfolio_overview(proposed_trades, cfg.env_mode)
 
@@ -136,7 +140,9 @@ def main():
         time.sleep(60)
 
 
-
 if __name__ == "__main__":
     main()
+
+
+
 
