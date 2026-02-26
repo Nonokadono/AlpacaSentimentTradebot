@@ -135,10 +135,10 @@ def log_signal_score(
     msg = (
         f"{datetime.utcnow().isoformat()}Z {env_mode} Signal "
         f"symbol={symbol_part} "
-        f"composite={composite_str} "
-        f"mom={momentum_score:.3f} "
-        f"mr={mean_reversion_score:.3f} "
-        f"pa={price_action_score:.3f}"
+        f"{ITALICON}composite={composite_str}{ITALICOFF} "
+        f"{ITALICON}momentum={momentum_score:.3f}{ITALICOFF} "
+        f"{ITALICON}mean_reversion={mean_reversion_score:.3f}{ITALICOFF} "
+        f"{ITALICON}price_action={price_action_score:.3f}{ITALICOFF}"
     )
     logger.info(f"{line_color}{msg}{RESET}")
     logger.info(separator_line())
@@ -223,6 +223,14 @@ def log_portfolio_overview(trades: List[ProposedTrade], env_mode: str) -> None:
         )
         logger.info(f"{line_color}{msg}{RESET}")
     logger.info(separator_line())
+
+def log_startup_banner(env_mode: str) -> None:
+    logger.info(separator_line())
+    logger.info(f"{DEEPBLUE}   TRADE BOT STARTING UP   {RESET}")
+    logger.info(f"{DEEPBLUE}   Environment: {env_mode} {RESET}")
+    logger.info(separator_line())
+
+
 
 
 

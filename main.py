@@ -139,7 +139,7 @@ def main():
         for proposed in proposed_trades:
             executor.execute_proposed_trade(proposed)
 
-        time.sleep(60)
+        time.sleep(600)
 
 
 if __name__ == "__main__":

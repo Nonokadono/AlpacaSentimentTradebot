@@ -155,3 +155,19 @@ class SentimentModule:
         confidence = max(0.0, min(1.0, confidence))
 
         explanation = res.get("explanation", "") or ""
+
+        
+        score = self._map_discrete_to_score(sdisc, confidence)
+
+        result = SentimentResult(
+            score=score,
+            raw_discrete=sdisc,
+            rawcompound=score,
+            ndocuments=len(newsitems),
+            explanation=explanation,
+            confidence=confidence,
+        )
+
+        self._set_last_known(symbol, result)
+        return result
+

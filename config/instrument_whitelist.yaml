@@ -22,7 +22,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#AMZN:
+AMZN:
   exchange: NASDAQ
   lot_size: 1
   fractional: true
@@ -30,7 +30,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#NVDA:
+NVDA:
   exchange: NASDAQ
   lot_size: 1
   fractional: true
@@ -38,7 +38,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#META:
+META:
   exchange: NASDAQ
   lot_size: 1
   fractional: true
@@ -46,7 +46,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#TSLA:
+TSLA:
   exchange: NASDAQ
   lot_size: 1
   fractional: true
@@ -54,7 +54,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#AMD:
+AMD:
   exchange: NASDAQ
   lot_size: 1
   fractional: true
@@ -62,7 +62,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#MU:
+MU:
   exchange: NASDAQ
   lot_size: 1
   fractional: true
@@ -70,7 +70,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#NFLX:
+NFLX:
   exchange: NASDAQ
   lot_size: 1
   fractional: true
@@ -78,7 +78,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#SPY:
+SPY:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -86,7 +86,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#QQQ:
+QQQ:
   exchange: NASDAQ
   lot_size: 1
   fractional: true
@@ -94,7 +94,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#VOO:
+VOO:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -102,7 +102,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#IWM:
+IWM:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -110,7 +110,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#XLF:
+XLF:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -118,7 +118,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#XLE:
+XLE:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -126,7 +126,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#SLV:
+SLV:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -134,7 +134,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#EEM:
+EEM:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -142,7 +142,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#BAC:
+BAC:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -150,7 +150,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#COST:
+COST:
   exchange: NASDAQ
   lot_size: 1
   fractional: true
@@ -158,7 +158,7 @@ GOOGL:
   marginable: true
   trading_hours: "09:30-16:00"
 
-#SPY:
+SPY:
   exchange: ARCA
   lotsize: 1
   fractional: true
@@ -167,7 +167,7 @@ GOOGL:
   tradinghours: "0930-1600"
   sector: INDEX   # S&P 500 proxy
 
-#FXE:
+FXE:
   exchange: ARCA
   lotsize: 1
   fractional: true

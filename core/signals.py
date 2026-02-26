@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import math
 
@@ -45,154 +45,165 @@ class SignalEngine:
         adapter: AlpacaAdapter,
         sentiment: SentimentModule,
         technicalcfg: TechnicalSignalConfig,
-    ) -> None:
+    ):
         self.adapter = adapter
         self.sentiment = sentiment
         self.technicalcfg = technicalcfg
 
-        # Per-symbol cursor for incremental news pulls.
-        self.last_news_timestamp: Dict[str, datetime] = {}
-
-    def _get_news_items(self, symbol: str) -> List[dict]:
-        now = datetime.utcnow()
-        last_ts = self.last_news_timestamp.get(symbol)
-        if last_ts is None:
-            since = now - timedelta(hours=6)
-        else:
-            since = last_ts
-
-        items = self.adapter.get_news(symbol, since=since, limit=20)
-        # Always advance cursor to now; "no new news" will be items == [].
-        self.last_news_timestamp[symbol] = now
-        return items
-
     def _compute_simple_momentum_raw(self, bars: List) -> float:
-        if not bars or len(bars) < 2:
+        """
+        Simple momentum: (Current Close - Close N bars ago) / Close N bars ago
+        """
+        if not bars or len(bars) < 10:
             return 0.0
-        first = float(getattr(bars[0], "c", bars[0].c))
-        last = float(getattr(bars[-1], "c", bars[-1].c))
-        if first <= 0:
+        
+        # fallback if not enough bars for full lookback, just use what we have
+        lookback = min(len(bars) - 1, 10)
+        current = bars[-1].c
+        past = bars[-1 - lookback].c
+        
+        if past == 0:
             return 0.0
-        return (last - first) / first
+        return (current - past) / past
 
     def _compute_trend_signal_raw(self, bars: List) -> float:
-        # Simple slope proxy: last close vs mean close
-        if not bars:
+        """
+        Simple trend proxy: is price above SMA(20)?
+        Returns +1 if > SMA, -1 if < SMA, 0 otherwise.
+        """
+        if len(bars) < 20:
             return 0.0
-        closes = [float(getattr(b, "c", b.c)) for b in bars]
-        mean_c = sum(closes) / max(1, len(closes))
-        last_c = closes[-1]
-        if mean_c <= 0:
-            return 0.0
-        return (last_c - mean_c) / mean_c
+        
+        closes = [b.c for b in bars]
+        # last 20 bars
+        window = closes[-20:]
+        sma = sum(window) / len(window)
+        current = closes[-1]
+        
+        if current > sma:
+            return 1.0
+        elif current < sma:
+            return -1.0
+        return 0.0
 
     def _compute_volatility(self, bars: List) -> float:
-        # Stddev of simple returns (close-to-close)
-        if not bars or len(bars) < 3:
-            return 0.0
-        closes = [float(getattr(b, "c", b.c)) for b in bars]
-        rets = []
+        """
+        ATR-like proxy or simple std dev of last N closes.
+        Let's use a percentage volatility proxy: Stdev(returns) * sqrt(bars)
+        """
+        if len(bars) < 5:
+            return 0.01  # fallback
+        
+        closes = [b.c for b in bars]
+        returns = []
         for i in range(1, len(closes)):
-            prev = closes[i - 1]
-            cur = closes[i]
-            if prev > 0:
-                rets.append((cur - prev) / prev)
-        if len(rets) < 2:
-            return 0.0
-        mean_r = sum(rets) / len(rets)
-        var = sum((r - mean_r) ** 2 for r in rets) / (len(rets) - 1)
-        return math.sqrt(max(0.0, var))
+            r = (closes[i] - closes[i-1]) / closes[i-1]
+            returns.append(r)
+        
+        if not returns:
+            return 0.01
+            
+        mean_ret = sum(returns) / len(returns)
+        sq_diffs = [(r - mean_ret)**2 for r in returns]
+        variance = sum(sq_diffs) / len(returns)
+        std_dev = math.sqrt(variance)
+        
+        # Annualized-ish or per-bar? Just use per-bar std dev as vol proxy
+        return std_dev
 
-    def _compute_rsi(self, bars: List, period: int = 14) -> Optional[float]:
-        if not bars or len(bars) < period + 1:
-            return None
-        closes = [float(getattr(b, "c", b.c)) for b in bars]
-        gains = 0.0
-        losses = 0.0
-        for i in range(-period, 0):
-            delta = closes[i] - closes[i - 1]
-            if delta >= 0:
-                gains += delta
-            else:
-                losses += -delta
-        if gains == 0 and losses == 0:
+    def _compute_rsi(self, bars: List, period: int = 14) -> float:
+        if len(bars) < period + 1:
             return 50.0
-        if losses == 0:
+        
+        closes = [b.c for b in bars]
+        deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+        
+        gains = [d for d in deltas if d > 0]
+        losses = [-d for d in deltas if d < 0]
+        
+        avg_gain = sum(gains) / period if gains else 0.0
+        avg_loss = sum(losses) / period if losses else 0.0
+        
+        if avg_loss == 0:
             return 100.0
-        rs = gains / losses
+        
+        rs = avg_gain / avg_loss
         return 100.0 - (100.0 / (1.0 + rs))
 
-    def _normalize_momentum_trend(self, momentum_raw: float, trend_raw: float) -> float:
-        # Scale and clip to [-1, 1]
-        scale = float(self.technicalcfg.momentum_norm_scale)
-        if scale <= 0:
-            scale = 0.05
-        x = (momentum_raw + trend_raw) / scale
-        return max(-1.0, min(1.0, x))
+    def _normalize_momentum_trend(self, mom_raw: float, trend_raw: float) -> float:
+        # Scale momentum: if mom is 1%, that's huge in 5min bars. 
+        # standardizing roughly: mom / 0.005 -> clamped
+        mom_score = max(-1.0, min(1.0, mom_raw / self.technicalcfg.momentum_norm_scale))
+        
+        # Combine with trend (-1 or 1)
+        # 70% momentum value, 30% trend direction
+        combined = 0.7 * mom_score + 0.3 * trend_raw
+        return combined
 
-    def _normalize_mean_reversion(self, last_price: float, bars: List, rsi: Optional[float]) -> float:
-        if not bars:
-            return 0.0
-        closes = [float(getattr(b, "c", b.c)) for b in bars]
-        ma = sum(closes) / max(1, len(closes))
-        if ma <= 0:
-            return 0.0
-
-        ma_dist = (last_price - ma) / ma  # positive => above MA
-        scale = float(self.technicalcfg.ma_distance_norm_scale)
-        if scale <= 0:
-            scale = 0.05
-
-        # Mean reversion prefers: below MA and oversold => positive score (buy),
-        # above MA and overbought => negative score (sell).
-        score = -(ma_dist / scale)
-
-        if rsi is not None:
-            if rsi >= float(self.technicalcfg.rsi_overbought):
-                score -= 0.3
-            elif rsi <= float(self.technicalcfg.rsi_oversold):
-                score += 0.3
-
-        return max(-1.0, min(1.0, score))
-
-    def _compute_price_action_score(self, bars: List, last_price: float) -> float:
-        if not bars:
-            return 0.0
-
-        lookback = int(self.technicalcfg.breakout_lookback_bars)
-        lookback = max(5, lookback)
-        window = bars[-lookback:] if len(bars) >= lookback else bars
-
-        highs = [float(getattr(b, "h", b.h)) for b in window]
-        lows = [float(getattr(b, "l", b.l)) for b in window]
-        hi = max(highs) if highs else last_price
-        lo = min(lows) if lows else last_price
-
-        breakout_strength = float(self.technicalcfg.breakout_strength)
-        if breakout_strength <= 0:
-            breakout_strength = 1.0
-
-        # Simple breakout score: above range => positive, below range => negative.
-        if last_price > hi:
-            raw = (last_price - hi) / max(1e-9, hi)
-            score = breakout_strength * raw * 10.0
-        elif last_price < lo:
-            raw = (lo - last_price) / max(1e-9, lo)
-            score = -breakout_strength * raw * 10.0
+    def _normalize_mean_reversion(self, current_price: float, bars: List, rsi: float) -> float:
+        """
+        Mean reversion score:
+        High RSI (>70) -> Negative score (expect pullback)
+        Low RSI (<30) -> Positive score (expect bounce)
+        
+        Also distance from MA: if price >> MA, revert down (-).
+        """
+        # RSI component
+        rsi_score = 0.0
+        if rsi > self.technicalcfg.rsi_overbought:
+            # e.g. 75 -> -0.5
+            rsi_score = -1.0 * (rsi - 70) / 30.0
+        elif rsi < self.technicalcfg.rsi_oversold:
+            # e.g. 25 -> +0.5
+            rsi_score = 1.0 * (30 - rsi) / 30.0
+        
+        # MA distance component
+        if len(bars) < 20:
+            ma_score = 0.0
         else:
-            score = 0.0
+            closes = [b.c for b in bars[-20:]]
+            sma = sum(closes) / len(closes)
+            # (price - sma) / sma
+            dist = (current_price - sma) / sma
+            # if dist is +1%, score is negative (revert)
+            # scale: 0.05 (5%) -> full -1.0
+            ma_score = -1.0 * (dist / self.technicalcfg.ma_distance_norm_scale)
+            
+        return max(-1.0, min(1.0, 0.5 * rsi_score + 0.5 * ma_score))
 
+    def _compute_price_action_score(self, bars: List, current_price: float) -> float:
+        """
+        Simple breakout detection:
+        If current price > highest of last N bars -> +1 (Breakout)
+        If current price < lowest of last N bars -> -1 (Breakdown)
+        """
+        if len(bars) < self.technicalcfg.breakout_lookback_bars:
+            return 0.0
+            
+        window = bars[-self.technicalcfg.breakout_lookback_bars:-1] # exclude current
+        highs = [b.h for b in window]
+        lows = [b.l for b in window]
+        
+        recent_high = max(highs)
+        recent_low = min(lows)
+        
+        if current_price > recent_high:
+            return 1.0
+        elif current_price < recent_low:
+            return -1.0
+            
+        return 0.0
+
+    def _combine_technical_scores(self, mom: float, mr: float, pa: float) -> float:
+        # weights from config
+        score = (
+            self.technicalcfg.weight_momentum_trend * mom +
+            self.technicalcfg.weight_mean_reversion * mr +
+            self.technicalcfg.weight_price_action * pa
+        )
         return max(-1.0, min(1.0, score))
 
-    def _combine_technical_scores(self, momentum: float, mean_reversion: float, price_action: float) -> float:
-        w_m = float(self.technicalcfg.weight_momentum_trend)
-        w_r = float(self.technicalcfg.weight_mean_reversion)
-        w_p = float(self.technicalcfg.weight_price_action)
-        denom = max(1e-9, (abs(w_m) + abs(w_r) + abs(w_p)))
-        s = (w_m * momentum + w_r * mean_reversion + w_p * price_action) / denom
-        return max(-1.0, min(1.0, s))
-
-    def _decide_side_and_bands(self, last_price: float, volatility: float, signal_score: float):
+    def _decide_side_and_bands(self, last_price: float, volatility: float, signal_score: float) -> Tuple[str, float, float]:
         long_th = float(self.technicalcfg.long_threshold)
         short_th = float(self.technicalcfg.short_threshold)
 
@@ -228,6 +239,15 @@ class SignalEngine:
 
         return side, float(stop), float(tp)
 
+    def _get_news_items(self, symbol: str) -> List[Dict]:
+        """
+        Fetch news from Alpaca adapter.
+        """
+        # We only want news from last 24h or so?
+        # Adapter handles the 'limit' and 'since' logic if needed.
+        # Here we just ask for latest 10 items.
+        return self.adapter.get_news(symbol, limit=10)
+
     def generate_signal_for_symbol(self, symbol: str) -> Signal:
         last_trade = self.adapter.get_last_quote(symbol)
         bars = self.adapter.get_recent_bars(symbol, timeframe="5Min", lookback_bars=30)
@@ -259,14 +279,14 @@ class SignalEngine:
         elif side == "buy":
             rationale = (
                 f"Long bias from composite technicals: signal_score={signal_score:.3f}, "
-                f"mom={momentum_score:.3f}, mr={mean_reversion_score:.3f}, "
-                f"pa={price_action_score:.3f}."
+                f"momentum={momentum_score:.3f}, mean_reversion={mean_reversion_score:.3f}, "
+                f"price_action={price_action_score:.3f}."
             )
         else:
             rationale = (
                 f"Short bias from composite technicals: signal_score={signal_score:.3f}, "
-                f"mom={momentum_score:.3f}, mr={mean_reversion_score:.3f}, "
-                f"pa={price_action_score:.3f}."
+                f"momentum={momentum_score:.3f}, mean_reversion={mean_reversion_score:.3f}, "
+                f"price_action={price_action_score:.3f}."
             )
 
         # Always log composite and factor scores, regardless of trade decision.
@@ -302,7 +322,7 @@ class SignalEngine:
                 price_action_score=price_action_score,
             )
 
-        # News → sentiment (Suggestions 1, 2, 6 are enforced inside SentimentModule)
+        # News -> sentiment (Suggestions 1, 2, 6 are enforced inside SentimentModule)
         news_items = self._get_news_items(symbol)
         s_result = self.sentiment.scorenewsitems(symbol, news_items)
         log_sentiment_for_symbol(symbol, s_result, ENV_MODE)
@@ -319,4 +339,3 @@ class SignalEngine:
             mean_reversion_score=mean_reversion_score,
             price_action_score=price_action_score,
         )
-
