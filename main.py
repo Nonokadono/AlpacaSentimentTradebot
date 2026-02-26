@@ -111,7 +111,9 @@ def main():
         acct = adapter.get_account()
         positions = pm.get_positions()
         snapshot = get_equity_snapshot_from_account(acct, positions)
-        log_equity_snapshot(snapshot)
+        market_open = adapter.get_market_open()
+        log_equity_snapshot(snapshot, market_open=market_open)
+
 
         ks_state = kill_switch.check(snapshot)
         log_kill_switch_state(ks_state)

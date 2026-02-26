@@ -1,8 +1,12 @@
 # core/sentiment.py
-from dataclasses import dataclass
-from typing import List, Optional
-from ai_client import NewsReasoner
+from __future__ import annotations
 
+import os
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+
+from ai_client import NewsReasoner
 
 
 @dataclass
@@ -30,25 +34,41 @@ class SentimentModule:
     """
     Sentiment engine backed by Perplexity Sonar via NewsReasoner.
 
-    It expects a list of newsitems-style dicts and uses Sonar to produce a discrete
-    sentiment in {-2, -1, 0, 1} with confidence in [0, 1]. That is then mapped into
-    a continuous score in [-1, 1] for the risk engine.
+    Implements cost controls:
+      (1) TTL-based per-symbol cache to reduce AI calls.
+      (2) If no *new* news arrives for a symbol, reuse last-known sentiment (no AI call).
+      (6) If last-known raw_discrete == -2, apply a cooldown window during which we do not
+          call the AI again for that symbol (even if new news arrives).
     """
 
     def __init__(self) -> None:
         self.reasoner = NewsReasoner()
 
+        ttl_min = int(os.getenv("SENTIMENT_CACHE_TTL_MIN", "30"))
+        ttl_min = max(1, ttl_min)
+        self.cache_ttl = timedelta(minutes=ttl_min)
+
+        chaos_cd_min = int(os.getenv("SENTIMENT_CHAOS_COOLDOWN_MIN", "120"))
+        chaos_cd_min = max(0, chaos_cd_min)
+        self.chaos_cooldown = timedelta(minutes=chaos_cd_min)
+
+        # Cache is the single source of truth for last-known sentiment.
+        # symbol -> (SentimentResult, timestamp_utc)
+        self._cache: Dict[str, Tuple[SentimentResult, datetime]] = {}
+
+    def _neutral(self, reason: str, ndocs: int = 0) -> SentimentResult:
+        return SentimentResult(
+            score=0.0,
+            raw_discrete=0,
+            rawcompound=0.0,
+            ndocuments=ndocs,
+            explanation=reason,
+            confidence=0.0,
+        )
+
     def _map_discrete_to_score(self, sdisc: int, confidence: float) -> float:
         """
-        Map discrete sentiment {-2, -1, 0, 1} plus confidence into a continuous
-        score in [-1, 1].
-
-        Rules:
-            -2 : treat as 'do not trade / extremely bad / unstable' => score = -1.0
-                 (risk engine should then enforce zero size or forced close).
-            -1 : clearly negative      => base -1, scaled by confidence
-            0  : neutral or mixed      => base 0, scaled by confidence (≈ 0)
-            1  : clearly positive      => base +1, scaled by confidence
+        Map discrete sentiment {-2, -1, 0, 1} plus confidence into a continuous score in [-1, 1].
         """
         confidence = max(0.0, min(1.0, confidence))
 
@@ -67,14 +87,64 @@ class SentimentModule:
 
         return max(-1.0, min(1.0, base * confidence))
 
+    def get_cached_sentiment(self, symbol: str) -> Optional[SentimentResult]:
+        """
+        (Suggestion 1) TTL cache getter.
+        Returns a cached sentiment only if it is within the TTL window.
+        """
+        now = datetime.utcnow()
+        cached = self._cache.get(symbol)
+        if not cached:
+            return None
+        result, ts = cached
+        if now - ts <= self.cache_ttl:
+            return result
+        return None
+
+    def _get_last_known(self, symbol: str) -> Optional[Tuple[SentimentResult, datetime]]:
+        return self._cache.get(symbol)
+
+    def _set_last_known(self, symbol: str, result: SentimentResult) -> None:
+        self._cache[symbol] = (result, datetime.utcnow())
+
     def scorenewsitems(self, symbol: str, newsitems: List[dict]) -> SentimentResult:
         """
-        newsitems: list of dicts typically from Alpaca's news API,
-                   each with at least 'headline' and/or 'summary'.
+        newsitems: list of dicts (typically *new since last check* from Alpaca news API),
+                  each with at least 'headline' and/or 'summary'.
+
+        Cost controls:
+          - If there are no new news items and we have a last-known sentiment, reuse it. (2)
+          - If cached sentiment is still fresh (TTL), reuse it. (1)
+          - If last-known sentiment is -2 and still within cooldown, reuse it. (6)
         """
+        now = datetime.utcnow()
+        last_known = self._get_last_known(symbol)
+
+        # (6) Chaos cooldown: if we recently deemed the symbol "unstable / -2", don't rescore.
+        if last_known:
+            last_res, last_ts = last_known
+            if last_res.raw_discrete == -2 and (now - last_ts) <= self.chaos_cooldown:
+                return last_res
+
+        # (2) No new news -> do not call AI; just reuse last-known sentiment if available.
+        if not newsitems:
+            if last_known:
+                return last_known[0]
+            return self._neutral("No recent news (no prior sentiment cached).", ndocs=0)
+
+        # (1) TTL cache: if within TTL, reuse cached sentiment even if new news exists.
+        # Rationale: avoids frequent rescores when headlines trickle in; TTL bounds staleness.
+        cached_fresh = self.get_cached_sentiment(symbol)
+        if cached_fresh is not None:
+            return cached_fresh
+
+        # Otherwise, call AI once.
         res = self.reasoner.scorenews(symbol, newsitems)
 
-        sdisc = int(res.get("sentiment", 0))
+        try:
+            sdisc = int(res.get("sentiment", 0))
+        except (TypeError, ValueError):
+            sdisc = 0
         if sdisc not in (-2, -1, 0, 1):
             sdisc = 0
 
@@ -84,17 +154,4 @@ class SentimentModule:
             confidence = 0.0
         confidence = max(0.0, min(1.0, confidence))
 
-        explanation = res.get("explanation", "")
-
-        score = self._map_discrete_to_score(sdisc, confidence)
-
-        return SentimentResult(
-            score=score,
-            raw_discrete=sdisc,
-            rawcompound=score,
-            ndocuments=len(newsitems),
-            explanation=explanation,
-            confidence=confidence,
-        )
-
-
+        explanation = res.get("explanation", "") or ""

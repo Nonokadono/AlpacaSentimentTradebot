@@ -1,3 +1,4 @@
+# adapters/alpaca_adapter.py
 import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
@@ -41,6 +42,19 @@ class AlpacaAdapter:
             return self.rest.get_position(symbol)
         except Exception:
             return None
+
+    # --- Market status ---
+
+    def get_market_open(self) -> bool:
+        """
+        Returns True if the US equity market is currently open, False otherwise.
+        Uses Alpaca's /v2/clock endpoint.
+        """
+        try:
+            clock = self.rest.get_clock()
+            return bool(clock.is_open)
+        except Exception:
+            return False
 
     # --- Market data ---
 
@@ -180,4 +194,5 @@ class AlpacaAdapter:
 
     def list_orders(self, status: str = "open") -> List[Any]:
         return list(self.rest.list_orders(status=status) or [])
+
 
