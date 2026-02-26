@@ -1,3 +1,9 @@
+# CHANGES:
+#   - SentimentConfig: added exit_sentiment_delta_threshold (default 0.7) and
+#     exit_confidence_min (default 0.5).
+#     These gate the sentiment-driven forced-exit logic in main.py.
+#     Both are additive fields with defaults; no existing field touched.
+
 import os
 import yaml
 from pathlib import Path
@@ -28,6 +34,13 @@ class SentimentConfig:
     min_scale: float = 0.2
     max_scale: float = 1.3
     no_trade_negative_threshold: float = -0.4
+    # --- Sentiment-exit thresholds (Feature 1) ---
+    # Minimum absolute shift in sentiment compound score required to trigger a forced exit.
+    # A position opened when compound was +0.8 and now scoring +0.05 yields delta = 0.75 → exit.
+    exit_sentiment_delta_threshold: float = 0.7
+    # Minimum model confidence in the *current* (adverse) sentiment reading before we act on it.
+    # Prevents low-confidence noise from closing profitable positions.
+    exit_confidence_min: float = 0.5
 
 
 @dataclass
@@ -142,3 +155,5 @@ def load_config() -> BotConfig:
 if __name__ == "__main__":
     cfg = load_config()
     print(asdict(cfg))
+
+

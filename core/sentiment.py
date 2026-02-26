@@ -1,4 +1,12 @@
-# core/sentiment.py
+# CHANGES:
+#   - Added force_rescore(symbol, newsitems) method.
+#     This bypasses the TTL cache and chaos cooldown to always call the AI for
+#     open-position sentiment-exit checks. It still writes the result back to the
+#     cache so subsequent normal scoring benefits from it.
+#     The existing scorenewsitems(), get_cached_sentiment(), _neutral(),
+#     _map_discrete_to_score(), _get_last_known(), _set_last_known() methods are
+#     completely untouched. No field renames.
+
 from __future__ import annotations
 
 import os
@@ -89,7 +97,7 @@ class SentimentModule:
 
     def get_cached_sentiment(self, symbol: str) -> Optional[SentimentResult]:
         """
-        (Suggestion 1) TTL cache getter.
+        TTL cache getter.
         Returns a cached sentiment only if it is within the TTL window.
         """
         now = datetime.utcnow()
@@ -106,6 +114,40 @@ class SentimentModule:
 
     def _set_last_known(self, symbol: str, result: SentimentResult) -> None:
         self._cache[symbol] = (result, datetime.utcnow())
+
+    def _call_ai(self, symbol: str, newsitems: List[dict]) -> SentimentResult:
+        """
+        Internal: call the AI, parse the result, update the cache, and return a
+        SentimentResult. Used by both scorenewsitems() and force_rescore().
+        """
+        res = self.reasoner.scorenews(symbol, newsitems)
+
+        try:
+            sdisc = int(res.get("sentiment", 0))
+        except (TypeError, ValueError):
+            sdisc = 0
+        if sdisc not in (-2, -1, 0, 1):
+            sdisc = 0
+
+        try:
+            confidence = float(res.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        confidence = max(0.0, min(1.0, confidence))
+
+        explanation = res.get("explanation", "") or ""
+        score = self._map_discrete_to_score(sdisc, confidence)
+
+        result = SentimentResult(
+            score=score,
+            raw_discrete=sdisc,
+            rawcompound=score,
+            ndocuments=len(newsitems),
+            explanation=explanation,
+            confidence=confidence,
+        )
+        self._set_last_known(symbol, result)
+        return result
 
     def scorenewsitems(self, symbol: str, newsitems: List[dict]) -> SentimentResult:
         """
@@ -138,36 +180,25 @@ class SentimentModule:
         if cached_fresh is not None:
             return cached_fresh
 
-        # Otherwise, call AI once.
-        res = self.reasoner.scorenews(symbol, newsitems)
+        return self._call_ai(symbol, newsitems)
 
-        try:
-            sdisc = int(res.get("sentiment", 0))
-        except (TypeError, ValueError):
-            sdisc = 0
-        if sdisc not in (-2, -1, 0, 1):
-            sdisc = 0
+    def force_rescore(self, symbol: str, newsitems: List[dict]) -> SentimentResult:
+        """
+        Unconditional AI rescore — bypasses TTL cache and chaos cooldown.
 
-        try:
-            confidence = float(res.get("confidence", 0.0))
-        except (TypeError, ValueError):
-            confidence = 0.0
-        confidence = max(0.0, min(1.0, confidence))
+        Use this exclusively for open-position sentiment-exit checks, where stale
+        cached data would cause the exit logic to silently produce delta = 0 and
+        never fire.
 
-        explanation = res.get("explanation", "") or ""
+        If newsitems is empty the AI cannot reason about new information; in that
+        case we fall back to the last-known cached result (if any) or neutral.
+        We do NOT want to exit a position solely because news is thin — the caller
+        must decide what to do with a low-confidence neutral result.
+        """
+        if not newsitems:
+            last_known = self._get_last_known(symbol)
+            if last_known:
+                return last_known[0]
+            return self._neutral("No recent news for forced rescore.", ndocs=0)
 
-        
-        score = self._map_discrete_to_score(sdisc, confidence)
-
-        result = SentimentResult(
-            score=score,
-            raw_discrete=sdisc,
-            rawcompound=score,
-            ndocuments=len(newsitems),
-            explanation=explanation,
-            confidence=confidence,
-        )
-
-        self._set_last_known(symbol, result)
-        return result
-
+        return self._call_ai(symbol, newsitems)

@@ -1,6 +1,4 @@
-# core/risk_engine.py
-
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict
 
 from .sentiment import SentimentResult
@@ -29,6 +27,10 @@ class PositionInfo:
     market_price: float
     side: str  # long/short
     notional: float
+    # Sentiment compound score recorded at entry time (rawcompound from SentimentResult).
+    # Defaults to 0.0 so existing callsites that build PositionInfo without this
+    # field continue to work — main.py patches it in after entry is confirmed.
+    opening_compound: float = 0.0
 
 
 @dataclass
@@ -71,7 +73,7 @@ class RiskEngine:
     def pre_trade_checks(
         self,
         snapshot: EquitySnapshot,
-        positions: Dict[str, PositionInfo],
+        positions: Dict[str, "PositionInfo"],
         symbol: str,
         side: str,
         entry_price: float,
@@ -211,7 +213,6 @@ class RiskEngine:
             projected_notional = qty * entry_price
 
         # 7) Gross exposure / loss / drawdown / position-count rules
-
         projected_gross = snapshot.gross_exposure + abs(projected_notional)
         if projected_gross > snapshot.equity * self.limits.gross_exposure_cap_pct:
             return ProposedTrade(
@@ -296,9 +297,3 @@ class RiskEngine:
             rationale=rationale,
             rejected_reason=None,
         )
-
-
-
-
-
-

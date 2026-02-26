@@ -1,9 +1,8 @@
-# monitoring/monitor.py
 import logging
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
-from core.risk_engine import EquitySnapshot, ProposedTrade
+from core.risk_engine import EquitySnapshot, ProposedTrade, PositionInfo
 from core.sentiment import SentimentResult
 from monitoring.kill_switch import KillSwitchState
 
@@ -224,6 +223,7 @@ def log_portfolio_overview(trades: List[ProposedTrade], env_mode: str) -> None:
         logger.info(f"{line_color}{msg}{RESET}")
     logger.info(separator_line())
 
+
 def log_startup_banner(env_mode: str) -> None:
     logger.info(separator_line())
     logger.info(f"{DEEPBLUE}   TRADE BOT STARTING UP   {RESET}")
@@ -231,22 +231,112 @@ def log_startup_banner(env_mode: str) -> None:
     logger.info(separator_line())
 
 
+# ── NEW: per-instrument sentiment-position-check block ───────────────────────
 
+def log_sentiment_position_check(
+    position: PositionInfo,
+    entry_compound: float,
+    current_sentiment: SentimentResult,
+    delta: float,
+    delta_threshold: float,
+    confidence_min: float,
+    closing: bool,
+    close_reason: str,
+    env_mode: str,
+) -> None:
+    """
+    Emit a fully formatted, visually separated block for a single open position
+    during the per-loop sentiment check.
 
+    Layout (one block per instrument):
 
+    ════════════════════════════════════════════════════════════════════════════════
+     SENTIMENT CHECK  │  AAPL  │  LONG  │  qty=10.0000  │  notional=1820.00
+    ────────────────────────────────────────────────────────────────────────────────
+      Entry compound   :  +0.750
+      Current compound :  -0.200   (raw_discrete=-1  conf=0.85  docs=8)
+      Δ compound       :  +0.950   [threshold ≥ 0.700]  ← TRIGGERED
+      Explanation      :  "Earnings miss, guidance cut ..."
+    ────────────────────────────────────────────────────────────────────────────────
+      Verdict          :  ⛔ CLOSING — sentiment shift exceeds threshold
+    ════════════════════════════════════════════════════════════════════════════════
+    """
+    W = 80  # block width
 
+    # Colour selection: use a fixed line colour per call so the whole block is
+    # visually coherent regardless of the global toggle state.
+    lc = next_line_color()
 
+    thick = f"{SEPCOLOR}" + "═" * W + RESET
+    thin  = f"{SEPCOLOR}" + "─" * W + RESET
 
+    symbol_str   = f"{BRIGHTPURPLE}{position.symbol}{lc}"
+    side_str     = (
+        f"{SIGNALGREEN}{position.side.upper()}{lc}"
+        if position.side == "long"
+        else f"{SIGNALRED}{position.side.upper()}{lc}"
+    )
+    notional_val = abs(position.qty * position.market_price)
+    header_body  = (
+        f" {DEEPBLUE}SENTIMENT CHECK{lc}  │  "
+        f"{symbol_str}  │  {side_str}  │  "
+        f"qty={position.qty:.4f}  │  notional={notional_val:.2f}"
+    )
 
+    # Entry compound colouring
+    ec_color = SIGNALGREEN if entry_compound >= 0 else SIGNALRED
+    ec_str   = f"{ec_color}{entry_compound:+.3f}{lc}"
 
+    # Current compound colouring
+    cc = current_sentiment.rawcompound
+    cc_color = SIGNALGREEN if cc >= 0 else SIGNALRED
+    cc_str   = f"{cc_color}{cc:+.3f}{lc}"
 
+    # Delta colouring: positive delta means sentiment moved against the position
+    delta_color  = SIGNALRED if delta >= delta_threshold else lc
+    triggered_tag = (
+        f"  {SIGNALRED}← TRIGGERED{lc}"
+        if delta >= delta_threshold
+        else ""
+    )
+    delta_str = (
+        f"{delta_color}{delta:+.3f}{lc}   "
+        f"[threshold ≥ {delta_threshold:.3f}]{triggered_tag}"
+    )
 
+    # raw_discrete label
+    rd = current_sentiment.raw_discrete
+    rd_color = SIGNALRED if rd <= -1 else (SIGNALGREEN if rd >= 1 else lc)
+    rd_str   = f"{rd_color}{rd}{lc}"
 
+    # Explanation (sanitised)
+    expl_raw = (current_sentiment.explanation or "").replace("\n", " ").strip()
+    expl_fmt = italicize_technical(expl_raw)
 
+    # Verdict line
+    if closing:
+        if rd == -2:
+            verdict_detail = f"{SIGNALRED}⛔ CLOSING — raw_discrete = -2 (CHAOS / absolute exit){lc}"
+        else:
+            verdict_detail = (
+                f"{SIGNALRED}⛔ CLOSING — sentiment shift Δ={delta:+.3f} "
+                f"≥ threshold {delta_threshold:.3f}{lc}"
+            )
+    else:
+        verdict_detail = f"{SIGNALGREEN}✔  HOLDING — no exit condition met{lc}"
 
-
-
-
-
-
-
+    logger.info(f"{lc}{thick}{RESET}")
+    logger.info(f"{lc}{header_body}{RESET}")
+    logger.info(f"{lc}{thin}{RESET}")
+    logger.info(f"{lc}  Entry compound   :  {ec_str}{RESET}")
+    logger.info(
+        f"{lc}  Current compound :  {cc_str}   "
+        f"(raw_discrete={rd_str}  "
+        f"conf={current_sentiment.confidence:.2f}  "
+        f"docs={current_sentiment.ndocuments}){RESET}"
+    )
+    logger.info(f"{lc}  Δ compound       :  {delta_str}{RESET}")
+    logger.info(f"{lc}  Explanation      :  \"{expl_fmt}\"{RESET}")
+    logger.info(f"{lc}{thin}{RESET}")
+    logger.info(f"{lc}  Verdict          :  {verdict_detail}{RESET}")
+    logger.info(f"{lc}{thick}{RESET}")
