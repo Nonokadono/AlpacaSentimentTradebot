@@ -1,19 +1,3 @@
-# CHANGES:
-#   - Feature 3 — Half-Kelly position sizing:
-#     pre_trade_checks() now accepts two new keyword arguments:
-#       volatility: float = 0.0  — per-symbol return std-dev from SignalEngine._compute_volatility()
-#       sentiment_scale_override: float = -1.0  — allows the caller to pass s_scale
-#         directly; if < 0 (default) it is recomputed internally as before, so all
-#         existing call-sites that omit it continue to work unchanged.
-#     A new private helper _kelly_fraction() computes the Half-Kelly multiplier
-#     from signal_score, s_scale, and volatility and returns a float in [0, 1].
-#     The sizing block (step 4-5) branches on self.limits.enable_kelly_sizing:
-#       False (default) → identical to existing fixed-fractional logic.
-#       True → Half-Kelly: risk_pct is replaced by kelly_fraction * max_risk_per_trade_pct,
-#              then clamped to [min_risk_per_trade_pct, max_risk_per_trade_pct] so
-#              Kelly can never exceed the existing hard caps.
-#     No existing field, variable name, or method signature was renamed.
-
 from dataclasses import dataclass, field
 from typing import Optional, Dict
 
@@ -170,8 +154,8 @@ class RiskEngine:
         """
         Run all pre-trade checks and compute position size.
 
-        New keyword args (Feature 3, both have safe defaults so existing callers
-        are unaffected):
+        New keyword args (both have safe defaults so existing callers are
+        unaffected):
           volatility: per-symbol return std-dev from SignalEngine._compute_volatility().
                       Used only when enable_kelly_sizing is True.
           sentiment_scale_override: if >= 0 the value is used directly as s_scale
@@ -196,7 +180,7 @@ class RiskEngine:
                 rejected_reason="Instrument not whitelisted",
             )
 
-        # 1) hard block for unstable / utterly undesirable sentiment (-2)
+        # 1) Hard block for unstable / utterly undesirable sentiment (-2)
         if getattr(sentiment, "raw_discrete", 0) == -2:
             return ProposedTrade(
                 symbol=symbol,
@@ -261,18 +245,24 @@ class RiskEngine:
         # 4) Risk per trade — fixed-fractional OR Half-Kelly
         if self.limits.enable_kelly_sizing:
             # Feature 3: Half-Kelly fraction scales the max allowable risk %.
-            # The result is still clamped to [min, max] so Kelly can never
-            # override the hard risk caps set by the operator.
+            # Fix 5: use 0.0 as the lower clamp bound (not min_risk_per_trade_pct)
+            # so a genuinely weak Kelly signal can produce qty == 0 and be
+            # rejected in step 5, rather than being silently forced up to the
+            # minimum floor — which would defeat the purpose of Kelly sizing.
             kelly_f = self._kelly_fraction(signal_score, s_scale, volatility)
             raw_risk_pct = kelly_f * self.limits.max_risk_per_trade_pct
+            risk_pct = min(
+                self.limits.max_risk_per_trade_pct,
+                max(0.0, raw_risk_pct),
+            )
         else:
             # Original fixed-fractional path (unchanged)
             raw_risk_pct = self.limits.max_risk_per_trade_pct * s_scale
+            risk_pct = min(
+                self.limits.max_risk_per_trade_pct,
+                max(self.limits.min_risk_per_trade_pct, raw_risk_pct),
+            )
 
-        risk_pct = min(
-            self.limits.max_risk_per_trade_pct,
-            max(self.limits.min_risk_per_trade_pct, raw_risk_pct),
-        )
         risk_amount = snapshot.equity * risk_pct
 
         # 5) Size by risk and force whole-lot qty

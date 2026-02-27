@@ -1,11 +1,3 @@
-# CHANGES:
-#   - log_sentiment_position_check(): fixed broken logger.info line at the
-#     "docs=" row. On-disk line was:
-#         logger.info(f"docs={current_sentiment.ndocuments}){RESET}")
-#     which is missing {lc}, missing the "  " indent, and has a stray literal ")"
-#     inside the string. Fixed to:
-#         logger.info(f"{lc}  docs={current_sentiment.ndocuments}{RESET}")
-
 import logging
 import threading
 from datetime import datetime
@@ -109,43 +101,42 @@ def log_environment_switch(env_mode: str, user: str) -> None:
 # ── Equity snapshot ───────────────────────────────────────────────────────────
 
 def log_equity_snapshot(snapshot: EquitySnapshot, market_open: bool = False) -> None:
-    line_color = next_line_color()
-    market_badge = (
-        f"{MARKETOPEN}[MARKET OPEN]{line_color}"
+    lc = next_line_color()
+    market_tag = (
+        f"{MARKETOPEN}MARKET OPEN{lc}"
         if market_open
-        else f"{MARKETCLOSED}[MARKET CLOSED]{line_color}"
+        else f"{MARKETCLOSED}MARKET CLOSED{lc}"
     )
+    daily_color = SIGNALRED if snapshot.daily_loss_pct < 0 else SIGNALGREEN
+    dd_color    = SIGNALRED if snapshot.drawdown_pct < 0 else SIGNALGREEN
     msg = (
-        f"{datetime.utcnow().isoformat()}Z EquitySnapshot: "
-        f"{market_badge} "
-        f"equity={snapshot.equity:.2f}, "
-        f"cash={snapshot.cash:.2f}, "
-        f"gross_exposure={snapshot.gross_exposure:.2f}, "
-        f"daily_loss_pct={snapshot.daily_loss_pct:.3f}, "
-        f"drawdown_pct={snapshot.drawdown_pct:.3f}"
+        f"{datetime.utcnow().isoformat()}Z  EquitySnapshot  "
+        f"equity={snapshot.equity:.2f}  cash={snapshot.cash:.2f}  "
+        f"portfolio_value={snapshot.portfolio_value:.2f}  "
+        f"gross_exp={snapshot.gross_exposure:.2f}  "
+        f"daily_loss={daily_color}{snapshot.daily_loss_pct:+.3%}{lc}  "
+        f"drawdown={dd_color}{snapshot.drawdown_pct:+.3%}{lc}  "
+        f"{market_tag}"
     )
-    logger.info(f"{line_color}{msg}{RESET}")
+    logger.info(f"{lc}{msg}{RESET}")
     logger.info(separator_line())
 
 
-# ── Kill-switch ───────────────────────────────────────────────────────────────
+# ── Kill switch ───────────────────────────────────────────────────────────────
 
 def log_kill_switch_state(state: KillSwitchState) -> None:
-    """
-    BUG #3 fix: OK-branch was logger.debug() — invisible at INFO level.
-    Now logger.info() so the heartbeat is visible every loop.
-    """
-    line_color = next_line_color()
-    if state.halted:
-        msg = f"{datetime.utcnow().isoformat()}Z KILL-SWITCH ACTIVATED: {state.reason}"
-        logger.error(f"{line_color}{msg}{RESET}")
-    else:
-        msg = f"{datetime.utcnow().isoformat()}Z Kill-switch OK"
-        logger.info(f"{line_color}{msg}{RESET}")
+    if not state.halted:
+        return
+    lc = next_line_color()
+    msg = (
+        f"{datetime.utcnow().isoformat()}Z  "
+        f"{SIGNALRED}KILL SWITCH ACTIVE{lc}  reason={state.reason}"
+    )
+    logger.warning(f"{lc}{msg}{RESET}")
     logger.info(separator_line())
 
 
-# ── Instrument Report ─────────────────────────────────────────────────────────
+# ── Instrument report (Fix 2) ─────────────────────────────────────────────────
 
 def log_instrument_report(
     symbol: str,
@@ -157,95 +148,78 @@ def log_instrument_report(
     env_mode: str,
 ) -> None:
     """
-    Emit a structured Instrument Report block for a single symbol scan.
+    Unified per-symbol evaluation block emitted by SignalEngine for every
+    symbol it processes — both trade (buy/sell) and skip paths.
 
-    ════════════════════════════════════════════════════════════════════════════
-     [PAPER] Instrument Report  │  AAPL  |  value=+0.350
-    Current Sentiment=+0.900
-    reason=Earnings beat, raised guidance; analysts bullish short-term.
-    ────────────────────────────────────────────────────────────────────────────
-    Indicator Listing
-    compound=+0.350   momentum=+0.412   mean_reversion=-0.050   price_action=+0.000
-    ════════════════════════════════════════════════════════════════════════════
+    Renders:
+      • Signal decomposition: momentum, mean_reversion, price_action, composite
+      • Sentiment block: score, discrete, confidence, ndocuments, explanation
+
+    Replaces the two deprecated shims log_signal_score() and
+    log_sentiment_for_symbol() that were previously called separately from
+    signals.py.
     """
-    W  = 80
-    lc = next_line_color()
+    lc  = next_line_color()
+    W   = 80
+    thin = _thin(W)
 
-    thick = _thick(W)
-    thin  = _thin(W)
+    # Signal score colouring
+    if signal_score >= 0.2:
+        sig_color = SIGNALGREEN
+    elif signal_score <= -0.2:
+        sig_color = SIGNALRED
+    else:
+        sig_color = lc
 
-    # ── Header row ────────────────────────────────────────────────────────────
-    env_badge   = f"[{env_mode}] " if env_mode else ""
-    symbol_str  = f"{BRIGHTPURPLE}{symbol}{lc}"
-    val_color   = SIGNALGREEN if signal_score >= 0 else SIGNALRED
-    val_str     = f"{val_color}{signal_score:+.3f}{lc}"
-    header_body = (
-        f" {DEEPBLUE}{env_badge}Instrument Report{lc}  │  "
-        f"{symbol_str}  |  value={val_str}"
-    )
+    # Sentiment score colouring
+    sc = sentiment.score
+    if sc >= 0.5:
+        sc_color = SIGNALGREEN
+    elif sc <= -0.5:
+        sc_color = SIGNALRED
+    else:
+        sc_color = lc
 
-    # ── Current Sentiment row ─────────────────────────────────────────────────
-    sc       = sentiment.score
-    sc_color = SIGNALGREEN if sc >= 0.5 else (SIGNALRED if sc <= -0.5 else lc)
-    sc_str   = f"{sc_color}{sc:+.3f}{lc}"
-    sent_row = f"Current Sentiment={sc_str}"
+    symbol_str = f"{BRIGHTPURPLE}{symbol}{lc}"
+    sig_str    = f"{sig_color}{signal_score:+.3f}{lc}"
+    sc_str     = f"{sc_color}{sc:+.3f}{lc}"
 
-    # ── Reason row ────────────────────────────────────────────────────────────
-    expl_raw   = (sentiment.explanation or "").replace("\n", " ").strip()
-    expl_fmt   = italicize_technical(expl_raw)
-    reason_row = f"reason={expl_fmt}"
+    expl_raw = (sentiment.explanation or "").replace("\n", " ").strip()
+    expl_fmt = italicize_technical(expl_raw)
 
-    # ── Indicator colours ─────────────────────────────────────────────────────
-    # compound = signal_score (weighted technical composite).
-    # This is signal_score, NOT sentiment.rawcompound (which is the AI score).
-    cp       = signal_score
-    cp_color = SIGNALGREEN if cp >= 0 else SIGNALRED
-    cp_str   = f"{cp_color}{cp:+.3f}{lc}"
-
-    mom_color = SIGNALGREEN if momentum_score >= 0 else SIGNALRED
-    mom_str   = f"{mom_color}{momentum_score:+.3f}{lc}"
-
-    mr_color  = SIGNALGREEN if mean_reversion_score >= 0 else SIGNALRED
-    mr_str    = f"{mr_color}{mean_reversion_score:+.3f}{lc}"
-
-    pa_color  = SIGNALGREEN if price_action_score >= 0 else SIGNALRED
-    pa_str    = f"{pa_color}{price_action_score:+.3f}{lc}"
-
-    # ── Indicator Listing — all four on one line ───────────────────────────────
-    ind_row = (
-        f"compound={cp_str}   "
-        f"momentum={mom_str}   "
-        f"mean_reversion={mr_str}   "
-        f"price_action={pa_str}"
-    )
-
-    # ── Formula row — italicised factor breakdown ──────────────────────────────
-    formula_row = (
-        f"  Compound Score={cp_str}   "
-        f"{ITALICON}momentum={mom_color}{momentum_score:+.3f}{lc}{ITALICOFF}   "
-        f"{ITALICON}mean_reversion={mr_color}{mean_reversion_score:+.3f}{lc}{ITALICOFF}   "
-        f"{ITALICON}price_action={pa_color}{price_action_score:+.3f}{lc}{ITALICOFF}"
-    )
-
-    logger.info(f"{lc}{thick}{RESET}")
-    logger.info(f"{lc}{header_body}{RESET}")
-    logger.info(f"{lc}{sent_row}{RESET}")
-    logger.info(f"{lc}{reason_row}{RESET}")
     logger.info(f"{lc}{thin}{RESET}")
-    logger.info(f"{lc}Indicator Listing{RESET}")
-    logger.info(f"{lc}{ind_row}{RESET}")
+    logger.info(
+        f"{lc}  {env_mode}  {DEEPBLUE}SIGNAL{lc}  │  "
+        f"symbol={symbol_str}  │  composite={sig_str}{RESET}"
+    )
+    logger.info(
+        f"{lc}    momentum={momentum_score:+.3f}  "
+        f"mean_rev={mean_reversion_score:+.3f}  "
+        f"price_action={price_action_score:+.3f}{RESET}"
+    )
+    logger.info(
+        f"{lc}    sentiment={sc_str}  "
+        f"discrete={sentiment.raw_discrete}  "
+        f"conf={sentiment.confidence:.2f}  "
+        f"docs={sentiment.ndocuments}{RESET}"
+    )
+    if expl_fmt:
+        logger.info(f"{lc}    {expl_fmt}{RESET}")
     logger.info(f"{lc}{thin}{RESET}")
-    logger.info(f"{lc}{formula_row}{RESET}")
-    logger.info(f"{lc}{thick}{RESET}")
 
 
-# ── Deprecated shims ──────────────────────────────────────────────────────────
-# These exist only so any OTHER file that still imports them doesn't crash.
-# core/signals.py no longer calls them. Do NOT add logger.warning() here —
-# the warnings were the user-visible noise we're eliminating.
+# ── Sentiment for symbol (legacy shim — kept for main.py import) ──────────────
 
-def log_sentiment_for_symbol(symbol: str, sentiment: SentimentResult, env_mode: str) -> None:
-    """Deprecated shim — preserved for import compatibility only."""
+def log_sentiment_for_symbol(
+    symbol: str,
+    sentiment: SentimentResult,
+    env_mode: str,
+) -> None:
+    """
+    Legacy shim retained because main.py imports this function by name.
+    Delegates to log_instrument_report() with zeroed technical scores so
+    any remaining callers continue to work without error.
+    """
     log_instrument_report(
         symbol=symbol,
         signal_score=0.0,
@@ -257,36 +231,12 @@ def log_sentiment_for_symbol(symbol: str, sentiment: SentimentResult, env_mode: 
     )
 
 
-def log_signal_score(
-    symbol: str,
-    signal_score: float,
-    momentum_score: float,
-    mean_reversion_score: float,
-    price_action_score: float,
-    env_mode: str,
-) -> None:
-    """Deprecated shim — preserved for import compatibility only."""
-    from core.sentiment import SentimentResult  # local import avoids circular at module load
-    log_instrument_report(
-        symbol=symbol,
-        signal_score=signal_score,
-        sentiment=SentimentResult(
-            score=0.0, raw_discrete=0, rawcompound=0.0,
-            ndocuments=0, explanation=None, confidence=0.0,
-        ),
-        momentum_score=momentum_score,
-        mean_reversion_score=mean_reversion_score,
-        price_action_score=price_action_score,
-        env_mode=env_mode,
-    )
-
-
 # ── Proposed trade ────────────────────────────────────────────────────────────
 
 def log_proposed_trade(trade: ProposedTrade, env_mode: str) -> None:
     """
-    BUG #5 fix: unexpected trade.side now emits logger.warning() instead of
-    silently producing an empty action_tag.
+    Unexpected trade.side emits logger.warning() instead of silently
+    producing an empty action_tag.
     """
     line_color     = next_line_color()
     sentiment_part = sentiment_score_fragment(trade.sentiment_score, line_color)
@@ -393,15 +343,12 @@ def log_sentiment_position_check(
     take_profit_price: Optional[float] = None,
 ) -> None:
     """
-    BUG #2 fix: triggered_tag and delta_color are also set when raw_discrete == -2
-    (chaos exit), regardless of numeric delta, so the delta row is always visually
-    consistent with the Verdict.
+    Chaos exit (raw_discrete == -2) also marks triggered_tag and delta_color
+    so the delta row is visually consistent with the Verdict.
 
-    BUG #4 fix: thick/thin carry no embedded RESET — callers wrap in lc/RESET.
+    thick/thin carry no embedded RESET — callers wrap in lc/RESET.
 
-    Current compound now uses current_sentiment.score (not .rawcompound).
-    rawcompound == score always (set identically in _call_ai); using .score is
-    semantically correct and consistent with how delta is computed in main.py.
+    Current compound uses current_sentiment.score (not .rawcompound).
     """
     W  = 80
     lc = next_line_color()
@@ -446,7 +393,7 @@ def log_sentiment_position_check(
     # ── Entry compound ────────────────────────────────────────────────────────
     ec_str2 = f"{ec_color}{entry_compound:+.3f}{lc}"
 
-    # ── Delta — BUG #2 fix: chaos exit also marks delta as triggered ──────────
+    # ── Delta — chaos exit also marks delta as triggered ─────────────────────
     chaos_exit    = (rd == -2)
     delta_trigger = (delta >= delta_threshold)
     show_trigger  = delta_trigger or chaos_exit
@@ -493,6 +440,7 @@ def log_sentiment_position_check(
     logger.info("")
     logger.info(f"{lc}  Explanation      :  {expl_fmt}{RESET}")
     logger.info("")
+    logger.info(f"{lc}  docs={current_sentiment.ndocuments}{RESET}")
     logger.info(f"{lc}{thin}{RESET}")
     logger.info("")
     logger.info(f"{lc}  Verdict          :  {verdict_detail}{RESET}")

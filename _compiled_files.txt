@@ -5,12 +5,14 @@ adapters\__init__.py
 
 -----------
 adapters\alpaca_adapter.py
-# adapters/alpaca_adapter.py
+import logging
 import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import alpaca_trade_api as tradeapi
+
+logger = logging.getLogger("tradebot")
 
 
 class AlpacaAdapter:
@@ -100,8 +102,22 @@ class AlpacaAdapter:
         timeframe: str = "5Min",
         lookback_bars: int = 30,
     ) -> List[Any]:
+        """
+        Fetch up to `lookback_bars` recent bars for `symbol`.
+
+        Fix 7: The start timestamp is now anchored 3 calendar days back
+        (previously lookback_bars * 5 + 30 minutes).  This ensures the
+        request window covers weekends, holidays, and pre/post-market gaps
+        so the API always has enough trading bars to fill the limit.
+        The Alpaca API `limit` parameter caps the returned count at
+        `lookback_bars` regardless of how wide the window is.
+
+        A WARNING is emitted if fewer bars than requested are returned, so
+        under-fill is never silent downstream (RSI fallback to 50.0 etc.).
+        """
         end = datetime.utcnow()
-        start = end - timedelta(minutes=lookback_bars * 5 + 30)
+        # 3-day window: survives any weekend + holiday combination.
+        start = end - timedelta(days=3)
         try:
             bars = self.rest.get_bars(
                 symbol,
@@ -111,9 +127,23 @@ class AlpacaAdapter:
                 limit=lookback_bars,
             )
         except Exception as e:
-            print(f"get_recent_bars error for {symbol}: {e}")
+            logger.warning(
+                f"get_recent_bars error for {symbol} "
+                f"(timeframe={timeframe}, lookback={lookback_bars}): {e}"
+            )
             bars = []
-        return list(bars or [])
+
+        result = list(bars or [])
+
+        # Fix 7: warn explicitly when under-filled so issues are visible in logs.
+        if len(result) < lookback_bars:
+            logger.warning(
+                f"get_recent_bars [{symbol}]: requested {lookback_bars} bars, "
+                f"received {len(result)} — signal quality may be degraded "
+                f"(RSI/momentum may fall back to neutral defaults)."
+            )
+
+        return result
 
     # --- News / sentiment inputs ---
 
@@ -201,7 +231,6 @@ class AlpacaAdapter:
 
     def list_orders(self, status: str = "open") -> List[Any]:
         return list(self.rest.list_orders(status=status) or [])
-
 
 
 -----------
@@ -373,12 +402,6 @@ config\__init__.py
 
 -----------
 config\config.py
-# CHANGES:
-#   - SentimentConfig: added exit_sentiment_delta_threshold (default 0.7) and
-#     exit_confidence_min (default 0.5).
-#     These gate the sentiment-driven forced-exit logic in main.py.
-#     Both are additive fields with defaults; no existing field touched.
-
 import os
 import yaml
 from pathlib import Path
@@ -395,12 +418,16 @@ LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "tr
 
 @dataclass
 class RiskLimits:
-    max_risk_per_trade_pct: float = 0.03     # 3% of equity (was 1%)
+    max_risk_per_trade_pct: float = 0.03     # 3% of equity
     min_risk_per_trade_pct: float = 0.005    # 0.5% of equity
     gross_exposure_cap_pct: float = 0.90     # 90% of equity
     daily_loss_limit_pct: float = 0.04       # 4% of start-of-day equity
     max_drawdown_pct: float = 0.09           # 9% from high watermark
     max_open_positions: int = 15
+    # Fix 1: gate for Half-Kelly position sizing in RiskEngine.
+    # False (default) → existing fixed-fractional sizing path unchanged.
+    # Set True only after back-testing the Kelly calibration.
+    enable_kelly_sizing: bool = False
 
 
 @dataclass
@@ -409,12 +436,10 @@ class SentimentConfig:
     min_scale: float = 0.2
     max_scale: float = 1.3
     no_trade_negative_threshold: float = -0.4
-    # --- Sentiment-exit thresholds (Feature 1) ---
+    # --- Sentiment-exit thresholds ---
     # Minimum absolute shift in sentiment compound score required to trigger a forced exit.
-    # A position opened when compound was +0.8 and now scoring +0.05 yields delta = 0.75 → exit.
     exit_sentiment_delta_threshold: float = 0.7
     # Minimum model confidence in the *current* (adverse) sentiment reading before we act on it.
-    # Prevents low-confidence noise from closing profitable positions.
     exit_confidence_min: float = 0.5
 
 
@@ -463,6 +488,10 @@ class InstrumentMeta:
 class PortfolioConfig:
     enable_portfolio_veto: bool = False
     max_candidates_per_loop: int = 50
+    # Fix 4: maximum positions allowed per sector in the selection loop.
+    # Prevents the portfolio from being overweight in a single sector
+    # (e.g. all 10 TECH symbols selected when only 3 are desired).
+    max_positions_per_sector: int = 3
 
 
 @dataclass
@@ -530,17 +559,11 @@ def load_config() -> BotConfig:
 if __name__ == "__main__":
     cfg = load_config()
     print(asdict(cfg))
-
-
-
 -----------
 
 -----------
 config\instrument_whitelist.yaml
-# CHANGES:
-# - Feature 2: Added `sector` label to every instrument.
-#   Labels: TECH, ETF_INDEX, ETF_SECTOR, FINANCE, CONSUMER, ENERGY, FX.
-#   No existing keys renamed or removed.
+# ── Active symbols (debugging set) ───────────────────────────────────────────
 
 AAPL:
   exchange: NASDAQ
@@ -551,6 +574,9 @@ AAPL:
   trading_hours: "0930-1600"
   sector: TECH
 
+# ── Disabled symbols — uncomment ALL lines of a block to re-enable ────────────
+
+
 MSFT:
   exchange: NASDAQ
   lot_size: 1
@@ -559,6 +585,7 @@ MSFT:
   marginable: true
   trading_hours: "0930-1600"
   sector: TECH
+
 
 GOOGL:
   exchange: NASDAQ
@@ -569,6 +596,7 @@ GOOGL:
   trading_hours: "0930-1600"
   sector: TECH
 
+
 AMZN:
   exchange: NASDAQ
   lot_size: 1
@@ -577,6 +605,7 @@ AMZN:
   marginable: true
   trading_hours: "0930-1600"
   sector: TECH
+
 
 NVDA:
   exchange: NASDAQ
@@ -587,6 +616,7 @@ NVDA:
   trading_hours: "0930-1600"
   sector: TECH
 
+
 META:
   exchange: NASDAQ
   lot_size: 1
@@ -595,6 +625,7 @@ META:
   marginable: true
   trading_hours: "0930-1600"
   sector: TECH
+
 
 TSLA:
   exchange: NASDAQ
@@ -605,6 +636,7 @@ TSLA:
   trading_hours: "0930-1600"
   sector: TECH
 
+
 AMD:
   exchange: NASDAQ
   lot_size: 1
@@ -614,123 +646,135 @@ AMD:
   trading_hours: "0930-1600"
   sector: TECH
 
-MU:
-  exchange: NASDAQ
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: TECH
+# DISABLED: MU
+# MU:
+#   exchange: NASDAQ
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: TECH
 
-NFLX:
-  exchange: NASDAQ
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: TECH
+# DISABLED: NFLX
+# NFLX:
+#   exchange: NASDAQ
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: TECH
 
-#SPY:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_INDEX
+# DISABLED: SPY
+# SPY:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_INDEX
 
-#QQQ:
-  exchange: NASDAQ
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_INDEX
+# DISABLED: QQQ
+# QQQ:
+#   exchange: NASDAQ
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_INDEX
 
-#VOO:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_INDEX
+# DISABLED: VOO
+# VOO:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_INDEX
 
-#IWM:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_INDEX
+# DISABLED: IWM
+# IWM:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_INDEX
 
-#XLF:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_SECTOR
+# DISABLED: XLF
+# XLF:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_SECTOR
 
-#XLE:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_SECTOR
+# DISABLED: XLE
+# XLE:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_SECTOR
 
-#SLV:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_SECTOR
+# DISABLED: SLV
+# SLV:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_SECTOR
 
-#EEM:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_INDEX
+# DISABLED: EEM
+# EEM:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_INDEX
 
-#BAC:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: FINANCE
+# DISABLED: BAC
+# BAC:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: FINANCE
 
-#COST:
-  exchange: NASDAQ
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: CONSUMER
+# DISABLED: COST
+# COST:
+#   exchange: NASDAQ
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: CONSUMER
 
-#FXE:
-  exchange: ARCA
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: FX  # EUR vs USD proxy
-
+# DISABLED: FXE
+# FXE:
+#   exchange: ARCA
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: FX
 -----------
 
 -----------
@@ -1047,22 +1091,6 @@ class PortfolioVeto:
 
 -----------
 core\risk_engine.py
-# CHANGES:
-#   - Feature 3 — Half-Kelly position sizing:
-#     pre_trade_checks() now accepts two new keyword arguments:
-#       volatility: float = 0.0  — per-symbol return std-dev from SignalEngine._compute_volatility()
-#       sentiment_scale_override: float = -1.0  — allows the caller to pass s_scale
-#         directly; if < 0 (default) it is recomputed internally as before, so all
-#         existing call-sites that omit it continue to work unchanged.
-#     A new private helper _kelly_fraction() computes the Half-Kelly multiplier
-#     from signal_score, s_scale, and volatility and returns a float in [0, 1].
-#     The sizing block (step 4-5) branches on self.limits.enable_kelly_sizing:
-#       False (default) → identical to existing fixed-fractional logic.
-#       True → Half-Kelly: risk_pct is replaced by kelly_fraction * max_risk_per_trade_pct,
-#              then clamped to [min_risk_per_trade_pct, max_risk_per_trade_pct] so
-#              Kelly can never exceed the existing hard caps.
-#     No existing field, variable name, or method signature was renamed.
-
 from dataclasses import dataclass, field
 from typing import Optional, Dict
 
@@ -1219,8 +1247,8 @@ class RiskEngine:
         """
         Run all pre-trade checks and compute position size.
 
-        New keyword args (Feature 3, both have safe defaults so existing callers
-        are unaffected):
+        New keyword args (both have safe defaults so existing callers are
+        unaffected):
           volatility: per-symbol return std-dev from SignalEngine._compute_volatility().
                       Used only when enable_kelly_sizing is True.
           sentiment_scale_override: if >= 0 the value is used directly as s_scale
@@ -1245,7 +1273,7 @@ class RiskEngine:
                 rejected_reason="Instrument not whitelisted",
             )
 
-        # 1) hard block for unstable / utterly undesirable sentiment (-2)
+        # 1) Hard block for unstable / utterly undesirable sentiment (-2)
         if getattr(sentiment, "raw_discrete", 0) == -2:
             return ProposedTrade(
                 symbol=symbol,
@@ -1310,18 +1338,24 @@ class RiskEngine:
         # 4) Risk per trade — fixed-fractional OR Half-Kelly
         if self.limits.enable_kelly_sizing:
             # Feature 3: Half-Kelly fraction scales the max allowable risk %.
-            # The result is still clamped to [min, max] so Kelly can never
-            # override the hard risk caps set by the operator.
+            # Fix 5: use 0.0 as the lower clamp bound (not min_risk_per_trade_pct)
+            # so a genuinely weak Kelly signal can produce qty == 0 and be
+            # rejected in step 5, rather than being silently forced up to the
+            # minimum floor — which would defeat the purpose of Kelly sizing.
             kelly_f = self._kelly_fraction(signal_score, s_scale, volatility)
             raw_risk_pct = kelly_f * self.limits.max_risk_per_trade_pct
+            risk_pct = min(
+                self.limits.max_risk_per_trade_pct,
+                max(0.0, raw_risk_pct),
+            )
         else:
             # Original fixed-fractional path (unchanged)
             raw_risk_pct = self.limits.max_risk_per_trade_pct * s_scale
+            risk_pct = min(
+                self.limits.max_risk_per_trade_pct,
+                max(self.limits.min_risk_per_trade_pct, raw_risk_pct),
+            )
 
-        risk_pct = min(
-            self.limits.max_risk_per_trade_pct,
-            max(self.limits.min_risk_per_trade_pct, raw_risk_pct),
-        )
         risk_amount = snapshot.equity * risk_pct
 
         # 5) Size by risk and force whole-lot qty
@@ -1454,7 +1488,6 @@ class RiskEngine:
             rationale=rationale,
             rejected_reason=None,
         )
-
 -----------
 
 -----------
@@ -2085,8 +2118,6 @@ execution\__init__.py
 
 -----------
 execution\order_executor.py
-# execution/order_executor.py
-
 import logging
 import time
 from typing import Optional
@@ -2139,6 +2170,38 @@ class OrderExecutor:
             time.sleep(1)
         return None
 
+    def _cancel_leg(self, order_id: Optional[str], label: str, symbol: str) -> None:
+        """
+        Cancel a single named exit leg by order_id.  Swallows errors so a
+        failed cancel never aborts the main execution path.
+        """
+        if not order_id:
+            return
+        try:
+            self.adapter.cancel_order(order_id)
+            logger.info(
+                f"OrderExecutor [{symbol}]: cancelled {label} leg order_id={order_id}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"OrderExecutor [{symbol}]: failed to cancel {label} "
+                f"leg order_id={order_id}: {e}"
+            )
+
+    def cancel_exit_legs(
+        self,
+        symbol: str,
+        tp_order_id: Optional[str],
+        ts_order_id: Optional[str],
+    ) -> None:
+        """
+        Cancel both exit legs for a symbol.  Call this when one leg fills or
+        when the position is being closed via a sentiment exit so orphaned
+        orders do not persist.
+        """
+        self._cancel_leg(tp_order_id, "take-profit", symbol)
+        self._cancel_leg(ts_order_id, "trailing-stop", symbol)
+
     def execute_proposed_trade(self, trade: ProposedTrade):
         # Log the proposed trade with environment mode
         log_proposed_trade(trade, self.env_mode)
@@ -2147,13 +2210,39 @@ class OrderExecutor:
         if trade.rejected_reason is not None or trade.qty <= 0:
             return None
 
-        # LIVE dry‑run protection
+        # LIVE dry-run protection
         if not self._can_place_orders():
             return None
 
         side = trade.side
         if side not in ("buy", "sell"):
             raise ValueError("side must be 'buy' or 'sell'")
+
+        # Fix 8a: cancel any orphaned open orders for this symbol BEFORE
+        # entering a new position.  This handles the race condition where a
+        # prior cycle's trailing stop or take-profit is still resting on the
+        # book after the position was flat.  Swallow errors so a stale-order
+        # cleanup failure never blocks a new entry.
+        try:
+            existing_orders = self.adapter.list_orders(status="open")
+            for o in existing_orders:
+                if getattr(o, "symbol", None) == trade.symbol:
+                    try:
+                        self.adapter.cancel_order(o.id)
+                        logger.info(
+                            f"OrderExecutor [{trade.symbol}]: cancelled orphaned "
+                            f"open order id={o.id} before new entry."
+                        )
+                    except Exception as ce:
+                        logger.warning(
+                            f"OrderExecutor [{trade.symbol}]: could not cancel "
+                            f"orphaned order id={o.id}: {ce}"
+                        )
+        except Exception as e:
+            logger.warning(
+                f"OrderExecutor [{trade.symbol}]: failed to list open orders "
+                f"for orphan cleanup: {e}"
+            )
 
         try:
             # 1) Entry: market order
@@ -2173,7 +2262,8 @@ class OrderExecutor:
 
         pos = self._wait_for_position(trade.symbol, self.execution_cfg.post_entry_fill_timeout_sec)
         if pos is None:
-            # Position not visible yet; next loop can protect it via monitoring logic if you add it later.
+            # Position not visible yet; next loop will manage it via the
+            # position sentinel exit logic.
             return entry_order
 
         try:
@@ -2187,32 +2277,49 @@ class OrderExecutor:
         # Determine exit side opposite of entry
         exit_side = "sell" if side == "buy" else "buy"
 
+        # Attach exit order IDs to the entry_order object so main.py can
+        # forward them to cancel_exit_legs() when a sentiment exit fires.
+        tp_order_id: Optional[str] = None
+        ts_order_id: Optional[str] = None
+
         # Place Take Profit limit (optional)
         if self.execution_cfg.enable_take_profit:
             tp_price = round(float(trade.take_profit_price), 2)
             try:
-                self.adapter.submit_take_profit_limit_order(
+                tp_order = self.adapter.submit_take_profit_limit_order(
                     symbol=trade.symbol,
                     qty=pos_qty,
                     side=exit_side,
                     limit_price=tp_price,
                     time_in_force=self.execution_cfg.exit_time_in_force,
                 )
+                tp_order_id = getattr(tp_order, "id", None)
             except APIError as e:
                 logger.error(f"Take profit placement failed for {trade.symbol}: {e}")
 
         # Place Trailing Stop (5% trail by default)
         if self.execution_cfg.enable_trailing_stop:
             try:
-                self.adapter.submit_trailing_stop_order(
+                ts_order = self.adapter.submit_trailing_stop_order(
                     symbol=trade.symbol,
                     qty=pos_qty,
                     side=exit_side,
                     trail_percent=float(self.execution_cfg.trailing_stop_percent),
                     time_in_force=self.execution_cfg.exit_time_in_force,
                 )
+                ts_order_id = getattr(ts_order, "id", None)
             except APIError as e:
                 logger.error(f"Trailing stop placement failed for {trade.symbol}: {e}")
+
+        # Attach exit order IDs to the entry order as plain attributes so
+        # the caller can persist and later cancel the surviving leg.
+        try:
+            entry_order.tp_order_id = tp_order_id
+            entry_order.ts_order_id = ts_order_id
+        except Exception:
+            # Alpaca REST objects may not support arbitrary attribute assignment
+            # in all SDK versions.  This is best-effort; not fatal.
+            pass
 
         return entry_order
 
@@ -2227,6 +2334,10 @@ class OrderExecutor:
 
         For a long position, we submit a sell market order of full qty.
         For a short position, we submit a buy market order of full qty.
+
+        Fix 8b: routes through self.adapter.submit_market_order() instead of
+        self.adapter.rest.submit_order() directly — restores adapter abstraction
+        and makes this path testable via adapter mocking.
         """
         log_sentiment_close_decision(
             symbol=position.symbol,
@@ -2253,19 +2364,17 @@ class OrderExecutor:
             raise ValueError(f"Unexpected position side {position.side}")
 
         try:
-            order = self.adapter.rest.submit_order(
+            # Fix 8b: use adapter method, not bare REST call.
+            order = self.adapter.submit_market_order(
                 symbol=position.symbol,
-                side=side,
-                type="market",
                 qty=abs(position.qty),
+                side=side,
                 time_in_force="day",
             )
             return order
         except APIError as e:
             logger.error(f"Close position failed for {position.symbol}: {e}")
             return None
-
-
 -----------
 
 -----------
@@ -2663,14 +2772,6 @@ class KillSwitch:
 
 -----------
 monitoring\monitor.py
-# CHANGES:
-#   - log_sentiment_position_check(): fixed broken logger.info line at the
-#     "docs=" row. On-disk line was:
-#         logger.info(f"docs={current_sentiment.ndocuments}){RESET}")
-#     which is missing {lc}, missing the "  " indent, and has a stray literal ")"
-#     inside the string. Fixed to:
-#         logger.info(f"{lc}  docs={current_sentiment.ndocuments}{RESET}")
-
 import logging
 import threading
 from datetime import datetime
@@ -2774,43 +2875,42 @@ def log_environment_switch(env_mode: str, user: str) -> None:
 # ── Equity snapshot ───────────────────────────────────────────────────────────
 
 def log_equity_snapshot(snapshot: EquitySnapshot, market_open: bool = False) -> None:
-    line_color = next_line_color()
-    market_badge = (
-        f"{MARKETOPEN}[MARKET OPEN]{line_color}"
+    lc = next_line_color()
+    market_tag = (
+        f"{MARKETOPEN}MARKET OPEN{lc}"
         if market_open
-        else f"{MARKETCLOSED}[MARKET CLOSED]{line_color}"
+        else f"{MARKETCLOSED}MARKET CLOSED{lc}"
     )
+    daily_color = SIGNALRED if snapshot.daily_loss_pct < 0 else SIGNALGREEN
+    dd_color    = SIGNALRED if snapshot.drawdown_pct < 0 else SIGNALGREEN
     msg = (
-        f"{datetime.utcnow().isoformat()}Z EquitySnapshot: "
-        f"{market_badge} "
-        f"equity={snapshot.equity:.2f}, "
-        f"cash={snapshot.cash:.2f}, "
-        f"gross_exposure={snapshot.gross_exposure:.2f}, "
-        f"daily_loss_pct={snapshot.daily_loss_pct:.3f}, "
-        f"drawdown_pct={snapshot.drawdown_pct:.3f}"
+        f"{datetime.utcnow().isoformat()}Z  EquitySnapshot  "
+        f"equity={snapshot.equity:.2f}  cash={snapshot.cash:.2f}  "
+        f"portfolio_value={snapshot.portfolio_value:.2f}  "
+        f"gross_exp={snapshot.gross_exposure:.2f}  "
+        f"daily_loss={daily_color}{snapshot.daily_loss_pct:+.3%}{lc}  "
+        f"drawdown={dd_color}{snapshot.drawdown_pct:+.3%}{lc}  "
+        f"{market_tag}"
     )
-    logger.info(f"{line_color}{msg}{RESET}")
+    logger.info(f"{lc}{msg}{RESET}")
     logger.info(separator_line())
 
 
-# ── Kill-switch ───────────────────────────────────────────────────────────────
+# ── Kill switch ───────────────────────────────────────────────────────────────
 
 def log_kill_switch_state(state: KillSwitchState) -> None:
-    """
-    BUG #3 fix: OK-branch was logger.debug() — invisible at INFO level.
-    Now logger.info() so the heartbeat is visible every loop.
-    """
-    line_color = next_line_color()
-    if state.halted:
-        msg = f"{datetime.utcnow().isoformat()}Z KILL-SWITCH ACTIVATED: {state.reason}"
-        logger.error(f"{line_color}{msg}{RESET}")
-    else:
-        msg = f"{datetime.utcnow().isoformat()}Z Kill-switch OK"
-        logger.info(f"{line_color}{msg}{RESET}")
+    if not state.halted:
+        return
+    lc = next_line_color()
+    msg = (
+        f"{datetime.utcnow().isoformat()}Z  "
+        f"{SIGNALRED}KILL SWITCH ACTIVE{lc}  reason={state.reason}"
+    )
+    logger.warning(f"{lc}{msg}{RESET}")
     logger.info(separator_line())
 
 
-# ── Instrument Report ─────────────────────────────────────────────────────────
+# ── Instrument report (Fix 2) ─────────────────────────────────────────────────
 
 def log_instrument_report(
     symbol: str,
@@ -2822,95 +2922,78 @@ def log_instrument_report(
     env_mode: str,
 ) -> None:
     """
-    Emit a structured Instrument Report block for a single symbol scan.
+    Unified per-symbol evaluation block emitted by SignalEngine for every
+    symbol it processes — both trade (buy/sell) and skip paths.
 
-    ════════════════════════════════════════════════════════════════════════════
-     [PAPER] Instrument Report  │  AAPL  |  value=+0.350
-    Current Sentiment=+0.900
-    reason=Earnings beat, raised guidance; analysts bullish short-term.
-    ────────────────────────────────────────────────────────────────────────────
-    Indicator Listing
-    compound=+0.350   momentum=+0.412   mean_reversion=-0.050   price_action=+0.000
-    ════════════════════════════════════════════════════════════════════════════
+    Renders:
+      • Signal decomposition: momentum, mean_reversion, price_action, composite
+      • Sentiment block: score, discrete, confidence, ndocuments, explanation
+
+    Replaces the two deprecated shims log_signal_score() and
+    log_sentiment_for_symbol() that were previously called separately from
+    signals.py.
     """
-    W  = 80
-    lc = next_line_color()
+    lc  = next_line_color()
+    W   = 80
+    thin = _thin(W)
 
-    thick = _thick(W)
-    thin  = _thin(W)
+    # Signal score colouring
+    if signal_score >= 0.2:
+        sig_color = SIGNALGREEN
+    elif signal_score <= -0.2:
+        sig_color = SIGNALRED
+    else:
+        sig_color = lc
 
-    # ── Header row ────────────────────────────────────────────────────────────
-    env_badge   = f"[{env_mode}] " if env_mode else ""
-    symbol_str  = f"{BRIGHTPURPLE}{symbol}{lc}"
-    val_color   = SIGNALGREEN if signal_score >= 0 else SIGNALRED
-    val_str     = f"{val_color}{signal_score:+.3f}{lc}"
-    header_body = (
-        f" {DEEPBLUE}{env_badge}Instrument Report{lc}  │  "
-        f"{symbol_str}  |  value={val_str}"
-    )
+    # Sentiment score colouring
+    sc = sentiment.score
+    if sc >= 0.5:
+        sc_color = SIGNALGREEN
+    elif sc <= -0.5:
+        sc_color = SIGNALRED
+    else:
+        sc_color = lc
 
-    # ── Current Sentiment row ─────────────────────────────────────────────────
-    sc       = sentiment.score
-    sc_color = SIGNALGREEN if sc >= 0.5 else (SIGNALRED if sc <= -0.5 else lc)
-    sc_str   = f"{sc_color}{sc:+.3f}{lc}"
-    sent_row = f"Current Sentiment={sc_str}"
+    symbol_str = f"{BRIGHTPURPLE}{symbol}{lc}"
+    sig_str    = f"{sig_color}{signal_score:+.3f}{lc}"
+    sc_str     = f"{sc_color}{sc:+.3f}{lc}"
 
-    # ── Reason row ────────────────────────────────────────────────────────────
-    expl_raw   = (sentiment.explanation or "").replace("\n", " ").strip()
-    expl_fmt   = italicize_technical(expl_raw)
-    reason_row = f"reason={expl_fmt}"
+    expl_raw = (sentiment.explanation or "").replace("\n", " ").strip()
+    expl_fmt = italicize_technical(expl_raw)
 
-    # ── Indicator colours ─────────────────────────────────────────────────────
-    # compound = signal_score (weighted technical composite).
-    # This is signal_score, NOT sentiment.rawcompound (which is the AI score).
-    cp       = signal_score
-    cp_color = SIGNALGREEN if cp >= 0 else SIGNALRED
-    cp_str   = f"{cp_color}{cp:+.3f}{lc}"
-
-    mom_color = SIGNALGREEN if momentum_score >= 0 else SIGNALRED
-    mom_str   = f"{mom_color}{momentum_score:+.3f}{lc}"
-
-    mr_color  = SIGNALGREEN if mean_reversion_score >= 0 else SIGNALRED
-    mr_str    = f"{mr_color}{mean_reversion_score:+.3f}{lc}"
-
-    pa_color  = SIGNALGREEN if price_action_score >= 0 else SIGNALRED
-    pa_str    = f"{pa_color}{price_action_score:+.3f}{lc}"
-
-    # ── Indicator Listing — all four on one line ───────────────────────────────
-    ind_row = (
-        f"compound={cp_str}   "
-        f"momentum={mom_str}   "
-        f"mean_reversion={mr_str}   "
-        f"price_action={pa_str}"
-    )
-
-    # ── Formula row — italicised factor breakdown ──────────────────────────────
-    formula_row = (
-        f"  Compound Score={cp_str}   "
-        f"{ITALICON}momentum={mom_color}{momentum_score:+.3f}{lc}{ITALICOFF}   "
-        f"{ITALICON}mean_reversion={mr_color}{mean_reversion_score:+.3f}{lc}{ITALICOFF}   "
-        f"{ITALICON}price_action={pa_color}{price_action_score:+.3f}{lc}{ITALICOFF}"
-    )
-
-    logger.info(f"{lc}{thick}{RESET}")
-    logger.info(f"{lc}{header_body}{RESET}")
-    logger.info(f"{lc}{sent_row}{RESET}")
-    logger.info(f"{lc}{reason_row}{RESET}")
     logger.info(f"{lc}{thin}{RESET}")
-    logger.info(f"{lc}Indicator Listing{RESET}")
-    logger.info(f"{lc}{ind_row}{RESET}")
+    logger.info(
+        f"{lc}  {env_mode}  {DEEPBLUE}SIGNAL{lc}  │  "
+        f"symbol={symbol_str}  │  composite={sig_str}{RESET}"
+    )
+    logger.info(
+        f"{lc}    momentum={momentum_score:+.3f}  "
+        f"mean_rev={mean_reversion_score:+.3f}  "
+        f"price_action={price_action_score:+.3f}{RESET}"
+    )
+    logger.info(
+        f"{lc}    sentiment={sc_str}  "
+        f"discrete={sentiment.raw_discrete}  "
+        f"conf={sentiment.confidence:.2f}  "
+        f"docs={sentiment.ndocuments}{RESET}"
+    )
+    if expl_fmt:
+        logger.info(f"{lc}    {expl_fmt}{RESET}")
     logger.info(f"{lc}{thin}{RESET}")
-    logger.info(f"{lc}{formula_row}{RESET}")
-    logger.info(f"{lc}{thick}{RESET}")
 
 
-# ── Deprecated shims ──────────────────────────────────────────────────────────
-# These exist only so any OTHER file that still imports them doesn't crash.
-# core/signals.py no longer calls them. Do NOT add logger.warning() here —
-# the warnings were the user-visible noise we're eliminating.
+# ── Sentiment for symbol (legacy shim — kept for main.py import) ──────────────
 
-def log_sentiment_for_symbol(symbol: str, sentiment: SentimentResult, env_mode: str) -> None:
-    """Deprecated shim — preserved for import compatibility only."""
+def log_sentiment_for_symbol(
+    symbol: str,
+    sentiment: SentimentResult,
+    env_mode: str,
+) -> None:
+    """
+    Legacy shim retained because main.py imports this function by name.
+    Delegates to log_instrument_report() with zeroed technical scores so
+    any remaining callers continue to work without error.
+    """
     log_instrument_report(
         symbol=symbol,
         signal_score=0.0,
@@ -2922,36 +3005,12 @@ def log_sentiment_for_symbol(symbol: str, sentiment: SentimentResult, env_mode: 
     )
 
 
-def log_signal_score(
-    symbol: str,
-    signal_score: float,
-    momentum_score: float,
-    mean_reversion_score: float,
-    price_action_score: float,
-    env_mode: str,
-) -> None:
-    """Deprecated shim — preserved for import compatibility only."""
-    from core.sentiment import SentimentResult  # local import avoids circular at module load
-    log_instrument_report(
-        symbol=symbol,
-        signal_score=signal_score,
-        sentiment=SentimentResult(
-            score=0.0, raw_discrete=0, rawcompound=0.0,
-            ndocuments=0, explanation=None, confidence=0.0,
-        ),
-        momentum_score=momentum_score,
-        mean_reversion_score=mean_reversion_score,
-        price_action_score=price_action_score,
-        env_mode=env_mode,
-    )
-
-
 # ── Proposed trade ────────────────────────────────────────────────────────────
 
 def log_proposed_trade(trade: ProposedTrade, env_mode: str) -> None:
     """
-    BUG #5 fix: unexpected trade.side now emits logger.warning() instead of
-    silently producing an empty action_tag.
+    Unexpected trade.side emits logger.warning() instead of silently
+    producing an empty action_tag.
     """
     line_color     = next_line_color()
     sentiment_part = sentiment_score_fragment(trade.sentiment_score, line_color)
@@ -3058,15 +3117,12 @@ def log_sentiment_position_check(
     take_profit_price: Optional[float] = None,
 ) -> None:
     """
-    BUG #2 fix: triggered_tag and delta_color are also set when raw_discrete == -2
-    (chaos exit), regardless of numeric delta, so the delta row is always visually
-    consistent with the Verdict.
+    Chaos exit (raw_discrete == -2) also marks triggered_tag and delta_color
+    so the delta row is visually consistent with the Verdict.
 
-    BUG #4 fix: thick/thin carry no embedded RESET — callers wrap in lc/RESET.
+    thick/thin carry no embedded RESET — callers wrap in lc/RESET.
 
-    Current compound now uses current_sentiment.score (not .rawcompound).
-    rawcompound == score always (set identically in _call_ai); using .score is
-    semantically correct and consistent with how delta is computed in main.py.
+    Current compound uses current_sentiment.score (not .rawcompound).
     """
     W  = 80
     lc = next_line_color()
@@ -3111,7 +3167,7 @@ def log_sentiment_position_check(
     # ── Entry compound ────────────────────────────────────────────────────────
     ec_str2 = f"{ec_color}{entry_compound:+.3f}{lc}"
 
-    # ── Delta — BUG #2 fix: chaos exit also marks delta as triggered ──────────
+    # ── Delta — chaos exit also marks delta as triggered ─────────────────────
     chaos_exit    = (rd == -2)
     delta_trigger = (delta >= delta_threshold)
     show_trigger  = delta_trigger or chaos_exit
@@ -3158,12 +3214,12 @@ def log_sentiment_position_check(
     logger.info("")
     logger.info(f"{lc}  Explanation      :  {expl_fmt}{RESET}")
     logger.info("")
+    logger.info(f"{lc}  docs={current_sentiment.ndocuments}{RESET}")
     logger.info(f"{lc}{thin}{RESET}")
     logger.info("")
     logger.info(f"{lc}  Verdict          :  {verdict_detail}{RESET}")
     logger.info("")
     logger.info(f"{lc}{thick}{RESET}")
-
 -----------
 
 -----------

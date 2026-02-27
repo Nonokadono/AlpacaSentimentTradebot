@@ -1,9 +1,3 @@
-# CHANGES:
-#   - SentimentConfig: added exit_sentiment_delta_threshold (default 0.7) and
-#     exit_confidence_min (default 0.5).
-#     These gate the sentiment-driven forced-exit logic in main.py.
-#     Both are additive fields with defaults; no existing field touched.
-
 import os
 import yaml
 from pathlib import Path
@@ -20,12 +14,16 @@ LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "tr
 
 @dataclass
 class RiskLimits:
-    max_risk_per_trade_pct: float = 0.03     # 3% of equity (was 1%)
+    max_risk_per_trade_pct: float = 0.03     # 3% of equity
     min_risk_per_trade_pct: float = 0.005    # 0.5% of equity
     gross_exposure_cap_pct: float = 0.90     # 90% of equity
     daily_loss_limit_pct: float = 0.04       # 4% of start-of-day equity
     max_drawdown_pct: float = 0.09           # 9% from high watermark
     max_open_positions: int = 15
+    # Fix 1: gate for Half-Kelly position sizing in RiskEngine.
+    # False (default) → existing fixed-fractional sizing path unchanged.
+    # Set True only after back-testing the Kelly calibration.
+    enable_kelly_sizing: bool = False
 
 
 @dataclass
@@ -34,12 +32,10 @@ class SentimentConfig:
     min_scale: float = 0.2
     max_scale: float = 1.3
     no_trade_negative_threshold: float = -0.4
-    # --- Sentiment-exit thresholds (Feature 1) ---
+    # --- Sentiment-exit thresholds ---
     # Minimum absolute shift in sentiment compound score required to trigger a forced exit.
-    # A position opened when compound was +0.8 and now scoring +0.05 yields delta = 0.75 → exit.
     exit_sentiment_delta_threshold: float = 0.7
     # Minimum model confidence in the *current* (adverse) sentiment reading before we act on it.
-    # Prevents low-confidence noise from closing profitable positions.
     exit_confidence_min: float = 0.5
 
 
@@ -88,6 +84,10 @@ class InstrumentMeta:
 class PortfolioConfig:
     enable_portfolio_veto: bool = False
     max_candidates_per_loop: int = 50
+    # Fix 4: maximum positions allowed per sector in the selection loop.
+    # Prevents the portfolio from being overweight in a single sector
+    # (e.g. all 10 TECH symbols selected when only 3 are desired).
+    max_positions_per_sector: int = 3
 
 
 @dataclass
@@ -155,5 +155,3 @@ def load_config() -> BotConfig:
 if __name__ == "__main__":
     cfg = load_config()
     print(asdict(cfg))
-
-

@@ -1,7 +1,4 @@
-# CHANGES:
-# - Feature 2: Added `sector` label to every instrument.
-#   Labels: TECH, ETF_INDEX, ETF_SECTOR, FINANCE, CONSUMER, ENERGY, FX.
-#   No existing keys renamed or removed.
+# ── Active symbols (debugging set) ───────────────────────────────────────────
 
 AAPL:
   exchange: NASDAQ
@@ -12,6 +9,9 @@ AAPL:
   trading_hours: "0930-1600"
   sector: TECH
 
+# ── Disabled symbols — uncomment ALL lines of a block to re-enable ────────────
+
+
 MSFT:
   exchange: NASDAQ
   lot_size: 1
@@ -20,6 +20,7 @@ MSFT:
   marginable: true
   trading_hours: "0930-1600"
   sector: TECH
+
 
 GOOGL:
   exchange: NASDAQ
@@ -30,6 +31,7 @@ GOOGL:
   trading_hours: "0930-1600"
   sector: TECH
 
+
 AMZN:
   exchange: NASDAQ
   lot_size: 1
@@ -38,6 +40,7 @@ AMZN:
   marginable: true
   trading_hours: "0930-1600"
   sector: TECH
+
 
 NVDA:
   exchange: NASDAQ
@@ -48,6 +51,7 @@ NVDA:
   trading_hours: "0930-1600"
   sector: TECH
 
+
 META:
   exchange: NASDAQ
   lot_size: 1
@@ -56,6 +60,7 @@ META:
   marginable: true
   trading_hours: "0930-1600"
   sector: TECH
+
 
 TSLA:
   exchange: NASDAQ
@@ -66,6 +71,7 @@ TSLA:
   trading_hours: "0930-1600"
   sector: TECH
 
+
 AMD:
   exchange: NASDAQ
   lot_size: 1
@@ -75,119 +81,132 @@ AMD:
   trading_hours: "0930-1600"
   sector: TECH
 
-MU:
-  exchange: NASDAQ
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: TECH
+# DISABLED: MU
+# MU:
+#   exchange: NASDAQ
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: TECH
 
-NFLX:
-  exchange: NASDAQ
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: TECH
+# DISABLED: NFLX
+# NFLX:
+#   exchange: NASDAQ
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: TECH
 
-#SPY:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_INDEX
+# DISABLED: SPY
+# SPY:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_INDEX
 
-#QQQ:
-  exchange: NASDAQ
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_INDEX
+# DISABLED: QQQ
+# QQQ:
+#   exchange: NASDAQ
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_INDEX
 
-#VOO:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_INDEX
+# DISABLED: VOO
+# VOO:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_INDEX
 
-#IWM:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_INDEX
+# DISABLED: IWM
+# IWM:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_INDEX
 
-#XLF:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_SECTOR
+# DISABLED: XLF
+# XLF:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_SECTOR
 
-#XLE:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_SECTOR
+# DISABLED: XLE
+# XLE:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_SECTOR
 
-#SLV:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_SECTOR
+# DISABLED: SLV
+# SLV:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_SECTOR
 
-#EEM:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: ETF_INDEX
+# DISABLED: EEM
+# EEM:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: ETF_INDEX
 
-#BAC:
-  exchange: NYSE
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: FINANCE
+# DISABLED: BAC
+# BAC:
+#   exchange: NYSE
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: FINANCE
 
-#COST:
-  exchange: NASDAQ
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: CONSUMER
+# DISABLED: COST
+# COST:
+#   exchange: NASDAQ
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: CONSUMER
 
-#FXE:
-  exchange: ARCA
-  lot_size: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  trading_hours: "0930-1600"
-  sector: FX  # EUR vs USD proxy
+# DISABLED: FXE
+# FXE:
+#   exchange: ARCA
+#   lot_size: 1
+#   fractional: true
+#   shortable: true
+#   marginable: true
+#   trading_hours: "0930-1600"
+#   sector: FX

@@ -1,31 +1,3 @@
-# CHANGES:
-#   - Feature 4 — Proper Wilder's RSI:
-#     _compute_rsi() replaces the incorrect simple-average implementation with
-#     the canonical Wilder's EMA-smoothed RSI:
-#       • Seed: compute a plain SMA of gains and losses over the first `period` deltas.
-#       • Subsequent bars: apply Wilder's smoothing formula
-#           avg_gain = (prev_avg_gain * (period - 1) + current_gain) / period
-#       • Returns 50.0 when insufficient bars are available (unchanged guard).
-#     The method name _compute_rsi and its signature (bars, period=14) are
-#     completely unchanged.
-#   - Feature 3 wiring: generate_signal_for_symbol() now passes `volatility` and
-#     `sentiment_scale_override` into risk_engine.pre_trade_checks() via
-#     portfolio_builder → this file does NOT call pre_trade_checks directly, so
-#     the wiring is done in portfolio_builder.py (see that file).
-#     Here we ensure `volatility` is accessible on the Signal dataclass so
-#     PortfolioBuilder can forward it.  A new field `volatility: float = 0.0` is
-#     added to Signal (additive, default 0.0 — no existing consumer breaks).
-#   - Import: removed `log_sentiment_for_symbol, log_signal_score` (both
-#     deprecated shims). Replaced with a direct import of `log_instrument_report`
-#     from monitoring.monitor.
-#   - generate_signal_for_symbol(): replaced the call to log_signal_score() with
-#     a single log_instrument_report() call placed AFTER the sentiment fetch.
-#     The separate log_sentiment_for_symbol() call that followed has been removed
-#     because log_instrument_report already renders the full sentiment block.
-#   - The skip-branch now also calls log_instrument_report() with the neutral
-#     sentinel SentimentResult so every symbol gets a report regardless of trade
-#     decision.
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -251,14 +223,46 @@ class SignalEngine:
 
         return 0.0
 
-    def _combine_technical_scores(self, mom: float, mr: float, pa: float) -> float:
-        # weights from config
-        score = (
-            self.technicalcfg.weight_momentum_trend * mom +
-            self.technicalcfg.weight_mean_reversion * mr +
-            self.technicalcfg.weight_price_action * pa
+    def _combine_technical_scores(
+        self, mom: float, mr: float, pa: float
+    ) -> Tuple[float, bool]:
+        """
+        Compute the weighted composite signal score and flag whether the
+        momentum/mean-reversion conflict dampener was applied.
+
+        Weights from config (unchanged):
+            weight_momentum_trend  * mom
+            weight_mean_reversion  * mr
+            weight_price_action    * pa
+
+        Conflict dampener:
+            When momentum_score (mom) and mean_reversion_score (mr) have
+            OPPOSITE signs their product is negative, indicating the move is
+            already extended (momentum maxed) while mean-reversion pushes back.
+            In that case the raw weighted sum is multiplied by
+            `conflict_dampener_penalty` (default 0.6), reducing apparent
+            conviction by 40 %.
+
+            Same-sign or zero sub-signals (product >= 0) are NOT penalised —
+            existing behaviour for clean / aligned setups is fully preserved.
+
+        Returns:
+            (signal_score: float, dampened: bool)
+        """
+        raw = (
+            self.technicalcfg.weight_momentum_trend * mom
+            + self.technicalcfg.weight_mean_reversion * mr
+            + self.technicalcfg.weight_price_action * pa
         )
-        return max(-1.0, min(1.0, score))
+
+        # Apply dampener only when momentum and mean-reversion actively conflict.
+        dampened = False
+        if mom * mr < 0:
+            penalty = float(getattr(self.technicalcfg, "conflict_dampener_penalty", 0.6))
+            raw = raw * penalty
+            dampened = True
+
+        return max(-1.0, min(1.0, raw)), dampened
 
     def _decide_side_and_bands(self, last_price: float, volatility: float, signal_score: float) -> Tuple[str, float, float]:
         long_th = float(self.technicalcfg.long_threshold)
@@ -316,7 +320,7 @@ class SignalEngine:
         mean_reversion_score = self._normalize_mean_reversion(last_trade, bars, rsi)
         price_action_score = self._compute_price_action_score(bars, last_trade)
 
-        signal_score = self._combine_technical_scores(
+        signal_score, dampened = self._combine_technical_scores(
             momentum_score, mean_reversion_score, price_action_score
         )
 
@@ -326,20 +330,22 @@ class SignalEngine:
             signal_score=signal_score,
         )
 
+        dampener_tag = " [CONFLICT DAMPENED]" if dampened else ""
+
         if side == "skip":
             rationale = (
-                f"Composite technical signal_score={signal_score:.3f} "
+                f"Composite technical signal_score={signal_score:.3f}{dampener_tag} "
                 f"within neutral band; no trade."
             )
         elif side == "buy":
             rationale = (
-                f"Long bias from composite technicals: signal_score={signal_score:.3f}, "
+                f"Long bias from composite technicals: signal_score={signal_score:.3f}{dampener_tag}, "
                 f"momentum={momentum_score:.3f}, mean_reversion={mean_reversion_score:.3f}, "
                 f"price_action={price_action_score:.3f}."
             )
         else:
             rationale = (
-                f"Short bias from composite technicals: signal_score={signal_score:.3f}, "
+                f"Short bias from composite technicals: signal_score={signal_score:.3f}{dampener_tag}, "
                 f"momentum={momentum_score:.3f}, mean_reversion={mean_reversion_score:.3f}, "
                 f"price_action={price_action_score:.3f}."
             )

@@ -1,9 +1,11 @@
-# adapters/alpaca_adapter.py
+import logging
 import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import alpaca_trade_api as tradeapi
+
+logger = logging.getLogger("tradebot")
 
 
 class AlpacaAdapter:
@@ -93,8 +95,22 @@ class AlpacaAdapter:
         timeframe: str = "5Min",
         lookback_bars: int = 30,
     ) -> List[Any]:
+        """
+        Fetch up to `lookback_bars` recent bars for `symbol`.
+
+        Fix 7: The start timestamp is now anchored 3 calendar days back
+        (previously lookback_bars * 5 + 30 minutes).  This ensures the
+        request window covers weekends, holidays, and pre/post-market gaps
+        so the API always has enough trading bars to fill the limit.
+        The Alpaca API `limit` parameter caps the returned count at
+        `lookback_bars` regardless of how wide the window is.
+
+        A WARNING is emitted if fewer bars than requested are returned, so
+        under-fill is never silent downstream (RSI fallback to 50.0 etc.).
+        """
         end = datetime.utcnow()
-        start = end - timedelta(minutes=lookback_bars * 5 + 30)
+        # 3-day window: survives any weekend + holiday combination.
+        start = end - timedelta(days=3)
         try:
             bars = self.rest.get_bars(
                 symbol,
@@ -104,9 +120,23 @@ class AlpacaAdapter:
                 limit=lookback_bars,
             )
         except Exception as e:
-            print(f"get_recent_bars error for {symbol}: {e}")
+            logger.warning(
+                f"get_recent_bars error for {symbol} "
+                f"(timeframe={timeframe}, lookback={lookback_bars}): {e}"
+            )
             bars = []
-        return list(bars or [])
+
+        result = list(bars or [])
+
+        # Fix 7: warn explicitly when under-filled so issues are visible in logs.
+        if len(result) < lookback_bars:
+            logger.warning(
+                f"get_recent_bars [{symbol}]: requested {lookback_bars} bars, "
+                f"received {len(result)} — signal quality may be degraded "
+                f"(RSI/momentum may fall back to neutral defaults)."
+            )
+
+        return result
 
     # --- News / sentiment inputs ---
 
@@ -194,5 +224,4 @@ class AlpacaAdapter:
 
     def list_orders(self, status: str = "open") -> List[Any]:
         return list(self.rest.list_orders(status=status) or [])
-
 

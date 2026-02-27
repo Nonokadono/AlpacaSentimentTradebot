@@ -293,7 +293,14 @@ def main():
             time.sleep(60)
             continue
 
+        # ── *** ADD THIS HERE *** ─────────────────────────────────────────────
+        if not market_open:
+                logger.info("Market closed — skipping portfolio build and new entries.")
+                time.sleep(60)
+                continue
+
         # ── STEP 3: BUILD AND EXECUTE NEW TRADES ─────────────────────────────
+
         open_orders     = adapter.list_orders(status="open")
         proposed_trades = portfolio_builder.build_portfolio(snapshot, positions, open_orders)
 
