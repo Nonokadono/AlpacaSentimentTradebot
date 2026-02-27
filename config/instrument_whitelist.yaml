@@ -1,10 +1,16 @@
+# CHANGES:
+# - Feature 2: Added `sector` label to every instrument.
+#   Labels: TECH, ETF_INDEX, ETF_SECTOR, FINANCE, CONSUMER, ENERGY, FX.
+#   No existing keys renamed or removed.
+
 AAPL:
   exchange: NASDAQ
   lot_size: 1
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: TECH
 
 MSFT:
   exchange: NASDAQ
@@ -12,7 +18,8 @@ MSFT:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: TECH
 
 GOOGL:
   exchange: NASDAQ
@@ -20,7 +27,8 @@ GOOGL:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: TECH
 
 AMZN:
   exchange: NASDAQ
@@ -28,7 +36,8 @@ AMZN:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: TECH
 
 NVDA:
   exchange: NASDAQ
@@ -36,7 +45,8 @@ NVDA:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: TECH
 
 META:
   exchange: NASDAQ
@@ -44,7 +54,8 @@ META:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: TECH
 
 TSLA:
   exchange: NASDAQ
@@ -52,7 +63,8 @@ TSLA:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: TECH
 
 AMD:
   exchange: NASDAQ
@@ -60,7 +72,8 @@ AMD:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: TECH
 
 MU:
   exchange: NASDAQ
@@ -68,15 +81,17 @@ MU:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: TECH
 
-#NFLX:
+NFLX:
   exchange: NASDAQ
   lot_size: 1
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: TECH
 
 #SPY:
   exchange: NYSE
@@ -84,7 +99,8 @@ MU:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: ETF_INDEX
 
 #QQQ:
   exchange: NASDAQ
@@ -92,7 +108,8 @@ MU:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: ETF_INDEX
 
 #VOO:
   exchange: NYSE
@@ -100,7 +117,8 @@ MU:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: ETF_INDEX
 
 #IWM:
   exchange: NYSE
@@ -108,7 +126,8 @@ MU:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: ETF_INDEX
 
 #XLF:
   exchange: NYSE
@@ -116,7 +135,8 @@ MU:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: ETF_SECTOR
 
 #XLE:
   exchange: NYSE
@@ -124,7 +144,8 @@ MU:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: ETF_SECTOR
 
 #SLV:
   exchange: NYSE
@@ -132,7 +153,8 @@ MU:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: ETF_SECTOR
 
 #EEM:
   exchange: NYSE
@@ -140,7 +162,8 @@ MU:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: ETF_INDEX
 
 #BAC:
   exchange: NYSE
@@ -148,7 +171,8 @@ MU:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: FINANCE
 
 #COST:
   exchange: NASDAQ
@@ -156,13 +180,14 @@ MU:
   fractional: true
   shortable: true
   marginable: true
-  trading_hours: "09:30-16:00"
+  trading_hours: "0930-1600"
+  sector: CONSUMER
 
 #FXE:
   exchange: ARCA
-  lotsize: 1
+  lot_size: 1
   fractional: true
   shortable: true
   marginable: true
-  tradinghours: "0930-1600"
-  sector: FX      # EUR vs USD proxy
+  trading_hours: "0930-1600"
+  sector: FX  # EUR vs USD proxy

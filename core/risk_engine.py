@@ -1,3 +1,19 @@
+# CHANGES:
+#   - Feature 3 — Half-Kelly position sizing:
+#     pre_trade_checks() now accepts two new keyword arguments:
+#       volatility: float = 0.0  — per-symbol return std-dev from SignalEngine._compute_volatility()
+#       sentiment_scale_override: float = -1.0  — allows the caller to pass s_scale
+#         directly; if < 0 (default) it is recomputed internally as before, so all
+#         existing call-sites that omit it continue to work unchanged.
+#     A new private helper _kelly_fraction() computes the Half-Kelly multiplier
+#     from signal_score, s_scale, and volatility and returns a float in [0, 1].
+#     The sizing block (step 4-5) branches on self.limits.enable_kelly_sizing:
+#       False (default) → identical to existing fixed-fractional logic.
+#       True → Half-Kelly: risk_pct is replaced by kelly_fraction * max_risk_per_trade_pct,
+#              then clamped to [min_risk_per_trade_pct, max_risk_per_trade_pct] so
+#              Kelly can never exceed the existing hard caps.
+#     No existing field, variable name, or method signature was renamed.
+
 from dataclasses import dataclass, field
 from typing import Optional, Dict
 
@@ -70,6 +86,72 @@ class RiskEngine:
         scaled = self.sentiment_cfg.min_scale + (s + 1) / 2 * span
         return max(self.sentiment_cfg.min_scale, min(self.sentiment_cfg.max_scale, scaled))
 
+    # ── Feature 3: Half-Kelly helper ──────────────────────────────────────────
+
+    def _kelly_fraction(
+        self,
+        signal_score: float,
+        s_scale: float,
+        volatility: float,
+    ) -> float:
+        """
+        Compute a Half-Kelly multiplier in [0.0, 1.0].
+
+        Kelly formula: f* = (p*b - q) / b   where
+          b  = reward/risk ratio proxy derived from |signal_score| and s_scale
+          p  = estimated win probability  (mapped from |signal_score| and s_scale)
+          q  = 1 - p
+
+        Both b and p are estimated from the composite signal rather than from
+        historical trade outcomes (which we do not track here).  The estimates
+        are intentionally conservative:
+
+          conviction = |signal_score| * s_scale  ∈ [0, 1.3]
+            — combines technical edge (|signal_score|) with sentiment
+              confirmation (s_scale ≥ 1 is favourable, < 1 is cautious).
+
+          p = 0.5 + 0.15 * min(conviction, 1.0)
+            — neutral market → p = 0.5; max conviction → p = 0.65.
+            — Keeps us inside the "realistic" win-rate band for short-term equity.
+
+          b = max(1.0, 1.5 * min(conviction, 1.0) + 1.0)
+            — Minimum reward/risk of 1.0; scales with conviction up to ~2.5.
+
+          vol_penalty = 1.0 / (1.0 + vol_factor)
+            — Higher volatility shrinks the Kelly fraction; acts as a
+              volatility-adjusted position sizing damper.
+            — vol_factor normalises raw per-bar std-dev (typically 0.001–0.02)
+              to a meaningful scale.
+
+        The raw Full Kelly is then halved (Half-Kelly) and clamped to [0, 1].
+
+        This approach is intentionally conservative and opinionated.
+        Reference: https://pyquantnews.com/the-pyquant-newsletter/use-kelly-criterion-optimal-position-sizing
+        """
+        conviction = abs(signal_score) * s_scale                   # [0, ~1.3]
+        conviction = min(conviction, 1.0)                          # cap at 1
+
+        p = 0.5 + 0.15 * conviction                                # [0.50, 0.65]
+        q = 1.0 - p
+        b = 1.0 + 1.5 * conviction                                 # [1.0, 2.5]
+
+        if b <= 0:
+            return 0.0
+
+        full_kelly = (p * b - q) / b                               # Kelly criterion
+        half_kelly = full_kelly * 0.5                              # Half-Kelly
+
+        # Volatility penalty: normalise raw per-bar std-dev.
+        # A typical per-bar std-dev of ~0.005 (0.5%) maps to vol_factor ≈ 1.0.
+        vol_factor = volatility / 0.005 if volatility > 0 else 0.0
+        vol_penalty = 1.0 / (1.0 + vol_factor)
+
+        kelly = half_kelly * vol_penalty
+
+        return max(0.0, min(1.0, kelly))
+
+    # ── Main pre-trade check ──────────────────────────────────────────────────
+
     def pre_trade_checks(
         self,
         snapshot: EquitySnapshot,
@@ -82,7 +164,20 @@ class RiskEngine:
         sentiment: SentimentResult,
         signal_score: float = 0.0,
         rationale: Optional[str] = None,
+        volatility: float = 0.0,
+        sentiment_scale_override: float = -1.0,
     ) -> ProposedTrade:
+        """
+        Run all pre-trade checks and compute position size.
+
+        New keyword args (Feature 3, both have safe defaults so existing callers
+        are unaffected):
+          volatility: per-symbol return std-dev from SignalEngine._compute_volatility().
+                      Used only when enable_kelly_sizing is True.
+          sentiment_scale_override: if >= 0 the value is used directly as s_scale
+                      (avoids re-computing when the caller already has it).
+                      Default -1.0 triggers the existing internal computation.
+        """
         # 0) Instrument whitelist
         if symbol not in self.instrument_meta:
             return ProposedTrade(
@@ -122,7 +217,11 @@ class RiskEngine:
         meta = self.instrument_meta[symbol]
 
         # 2) Sentiment-based sizing scale
-        s_scale = self.sentiment_scale(sentiment.score)
+        if sentiment_scale_override >= 0.0:
+            s_scale = sentiment_scale_override
+        else:
+            s_scale = self.sentiment_scale(sentiment.score)
+
         if s_scale == 0.0:
             return ProposedTrade(
                 symbol=symbol,
@@ -159,11 +258,20 @@ class RiskEngine:
                 rejected_reason="Invalid stop distance",
             )
 
-        # 4) Risk per trade, scaled by sentiment (but capped by min/max)
-        base_risk_pct = self.limits.max_risk_per_trade_pct
+        # 4) Risk per trade — fixed-fractional OR Half-Kelly
+        if self.limits.enable_kelly_sizing:
+            # Feature 3: Half-Kelly fraction scales the max allowable risk %.
+            # The result is still clamped to [min, max] so Kelly can never
+            # override the hard risk caps set by the operator.
+            kelly_f = self._kelly_fraction(signal_score, s_scale, volatility)
+            raw_risk_pct = kelly_f * self.limits.max_risk_per_trade_pct
+        else:
+            # Original fixed-fractional path (unchanged)
+            raw_risk_pct = self.limits.max_risk_per_trade_pct * s_scale
+
         risk_pct = min(
             self.limits.max_risk_per_trade_pct,
-            max(self.limits.min_risk_per_trade_pct, base_risk_pct * s_scale),
+            max(self.limits.min_risk_per_trade_pct, raw_risk_pct),
         )
         risk_amount = snapshot.equity * risk_pct
 

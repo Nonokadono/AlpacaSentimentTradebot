@@ -1,13 +1,30 @@
 # CHANGES:
-#   - Import: removed `log_sentiment_for_symbol, log_signal_score` (both deprecated shims).
-#     Replaced with a direct import of `log_instrument_report` from monitoring.monitor.
-#   - generate_signal_for_symbol(): replaced the call to log_signal_score() (which fires
-#     the DEPRECATED warning and loses live sentiment) with a single log_instrument_report()
-#     call placed AFTER the sentiment fetch, so the report always carries live sentiment.
-#     The separate log_sentiment_for_symbol() call that followed has been removed because
-#     log_instrument_report already renders the full sentiment block in one shot.
-#   - The skip-branch now also calls log_instrument_report() with the neutral sentinel
-#     SentimentResult so every symbol gets a report regardless of trade decision.
+#   - Feature 4 — Proper Wilder's RSI:
+#     _compute_rsi() replaces the incorrect simple-average implementation with
+#     the canonical Wilder's EMA-smoothed RSI:
+#       • Seed: compute a plain SMA of gains and losses over the first `period` deltas.
+#       • Subsequent bars: apply Wilder's smoothing formula
+#           avg_gain = (prev_avg_gain * (period - 1) + current_gain) / period
+#       • Returns 50.0 when insufficient bars are available (unchanged guard).
+#     The method name _compute_rsi and its signature (bars, period=14) are
+#     completely unchanged.
+#   - Feature 3 wiring: generate_signal_for_symbol() now passes `volatility` and
+#     `sentiment_scale_override` into risk_engine.pre_trade_checks() via
+#     portfolio_builder → this file does NOT call pre_trade_checks directly, so
+#     the wiring is done in portfolio_builder.py (see that file).
+#     Here we ensure `volatility` is accessible on the Signal dataclass so
+#     PortfolioBuilder can forward it.  A new field `volatility: float = 0.0` is
+#     added to Signal (additive, default 0.0 — no existing consumer breaks).
+#   - Import: removed `log_sentiment_for_symbol, log_signal_score` (both
+#     deprecated shims). Replaced with a direct import of `log_instrument_report`
+#     from monitoring.monitor.
+#   - generate_signal_for_symbol(): replaced the call to log_signal_score() with
+#     a single log_instrument_report() call placed AFTER the sentiment fetch.
+#     The separate log_sentiment_for_symbol() call that followed has been removed
+#     because log_instrument_report already renders the full sentiment block.
+#   - The skip-branch now also calls log_instrument_report() with the neutral
+#     sentinel SentimentResult so every symbol gets a report regardless of trade
+#     decision.
 
 from __future__ import annotations
 
@@ -36,6 +53,9 @@ class Signal:
     momentum_score: float
     mean_reversion_score: float
     price_action_score: float
+    # Feature 3: expose per-symbol volatility so PortfolioBuilder can forward
+    # it to RiskEngine.pre_trade_checks() for Half-Kelly sizing.
+    volatility: float = 0.0
 
 
 class SignalEngine:
@@ -122,19 +142,46 @@ class SignalEngine:
         return std_dev
 
     def _compute_rsi(self, bars: List, period: int = 14) -> float:
+        """
+        Wilder's EMA-smoothed RSI.
+
+        Algorithm:
+          1. Require at least period+1 closes (unchanged guard — returns 50.0
+             when insufficient data).
+          2. Compute per-bar price changes for ALL available bars.
+          3. Seed avg_gain / avg_loss with a plain SMA of the FIRST `period`
+             deltas — this is the standard Wilder initialisation.
+          4. Roll Wilder's EMA forward over all remaining deltas:
+               avg_gain = (avg_gain * (period - 1) + gain) / period
+               avg_loss = (avg_loss * (period - 1) + loss) / period
+          5. Compute RS and RSI from the final smoothed averages.
+
+        This produces the same values as TradingView / most professional
+        charting libraries, unlike the previous simple-average approach which
+        used all gains/losses pooled indiscriminately and returned a biased
+        result.
+        """
         if len(bars) < period + 1:
             return 50.0
 
         closes = [b.c for b in bars]
-        deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+        deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
 
-        gains = [d for d in deltas if d > 0]
-        losses = [-d for d in deltas if d < 0]
+        # Step 3: seed with plain SMA of first `period` deltas
+        seed_gains = [max(d, 0.0) for d in deltas[:period]]
+        seed_losses = [abs(min(d, 0.0)) for d in deltas[:period]]
+        avg_gain = sum(seed_gains) / period
+        avg_loss = sum(seed_losses) / period
 
-        avg_gain = sum(gains) / period if gains else 0.0
-        avg_loss = sum(losses) / period if losses else 0.0
+        # Step 4: Wilder's EMA smoothing over all remaining deltas
+        for delta in deltas[period:]:
+            gain = max(delta, 0.0)
+            loss = abs(min(delta, 0.0))
+            avg_gain = (avg_gain * (period - 1) + gain) / period
+            avg_loss = (avg_loss * (period - 1) + loss) / period
 
-        if avg_loss == 0:
+        # Step 5: RSI
+        if avg_loss == 0.0:
             return 100.0
 
         rs = avg_gain / avg_loss
@@ -327,6 +374,7 @@ class SignalEngine:
                 momentum_score=momentum_score,
                 mean_reversion_score=mean_reversion_score,
                 price_action_score=price_action_score,
+                volatility=volatility,
             )
 
         # News -> sentiment (cost controls 1, 2, 6 are enforced inside SentimentModule)
@@ -355,4 +403,5 @@ class SignalEngine:
             momentum_score=momentum_score,
             mean_reversion_score=mean_reversion_score,
             price_action_score=price_action_score,
+            volatility=volatility,
         )
