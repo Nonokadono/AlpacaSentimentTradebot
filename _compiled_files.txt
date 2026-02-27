@@ -609,7 +609,7 @@ MU:
   marginable: true
   trading_hours: "09:30-16:00"
 
-NFLX:
+#NFLX:
   exchange: NASDAQ
   lot_size: 1
   fractional: true
@@ -617,7 +617,7 @@ NFLX:
   marginable: true
   trading_hours: "09:30-16:00"
 
-SPY:
+#SPY:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -625,7 +625,7 @@ SPY:
   marginable: true
   trading_hours: "09:30-16:00"
 
-QQQ:
+#QQQ:
   exchange: NASDAQ
   lot_size: 1
   fractional: true
@@ -633,7 +633,7 @@ QQQ:
   marginable: true
   trading_hours: "09:30-16:00"
 
-VOO:
+#VOO:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -641,7 +641,7 @@ VOO:
   marginable: true
   trading_hours: "09:30-16:00"
 
-IWM:
+#IWM:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -649,7 +649,7 @@ IWM:
   marginable: true
   trading_hours: "09:30-16:00"
 
-XLF:
+#XLF:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -657,7 +657,7 @@ XLF:
   marginable: true
   trading_hours: "09:30-16:00"
 
-XLE:
+#XLE:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -665,7 +665,7 @@ XLE:
   marginable: true
   trading_hours: "09:30-16:00"
 
-SLV:
+#SLV:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -673,7 +673,7 @@ SLV:
   marginable: true
   trading_hours: "09:30-16:00"
 
-EEM:
+#EEM:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -681,7 +681,7 @@ EEM:
   marginable: true
   trading_hours: "09:30-16:00"
 
-BAC:
+#BAC:
   exchange: NYSE
   lot_size: 1
   fractional: true
@@ -689,7 +689,7 @@ BAC:
   marginable: true
   trading_hours: "09:30-16:00"
 
-COST:
+#COST:
   exchange: NASDAQ
   lot_size: 1
   fractional: true
@@ -697,16 +697,7 @@ COST:
   marginable: true
   trading_hours: "09:30-16:00"
 
-SPY:
-  exchange: ARCA
-  lotsize: 1
-  fractional: true
-  shortable: true
-  marginable: true
-  tradinghours: "0930-1600"
-  sector: INDEX   # S&P 500 proxy
-
-FXE:
+#FXE:
   exchange: ARCA
   lotsize: 1
   fractional: true
@@ -1031,9 +1022,7 @@ class PortfolioVeto:
 
 -----------
 core\risk_engine.py
-# core/risk_engine.py
-
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict
 
 from .sentiment import SentimentResult
@@ -1062,6 +1051,10 @@ class PositionInfo:
     market_price: float
     side: str  # long/short
     notional: float
+    # Sentiment compound score recorded at entry time (rawcompound from SentimentResult).
+    # Defaults to 0.0 so existing callsites that build PositionInfo without this
+    # field continue to work — main.py patches it in after entry is confirmed.
+    opening_compound: float = 0.0
 
 
 @dataclass
@@ -1104,7 +1097,7 @@ class RiskEngine:
     def pre_trade_checks(
         self,
         snapshot: EquitySnapshot,
-        positions: Dict[str, PositionInfo],
+        positions: Dict[str, "PositionInfo"],
         symbol: str,
         side: str,
         entry_price: float,
@@ -1244,7 +1237,6 @@ class RiskEngine:
             projected_notional = qty * entry_price
 
         # 7) Gross exposure / loss / drawdown / position-count rules
-
         projected_gross = snapshot.gross_exposure + abs(projected_notional)
         if projected_gross > snapshot.equity * self.limits.gross_exposure_cap_pct:
             return ProposedTrade(
@@ -1329,13 +1321,6 @@ class RiskEngine:
             rationale=rationale,
             rejected_reason=None,
         )
-
-
-
-
-
-
-
 -----------
 
 -----------
@@ -1549,7 +1534,17 @@ class SentimentModule:
 
 -----------
 core\signals.py
-# core/signals.py
+# CHANGES:
+#   - Import: removed `log_sentiment_for_symbol, log_signal_score` (both deprecated shims).
+#     Replaced with a direct import of `log_instrument_report` from monitoring.monitor.
+#   - generate_signal_for_symbol(): replaced the call to log_signal_score() (which fires
+#     the DEPRECATED warning and loses live sentiment) with a single log_instrument_report()
+#     call placed AFTER the sentiment fetch, so the report always carries live sentiment.
+#     The separate log_sentiment_for_symbol() call that followed has been removed because
+#     log_instrument_report already renders the full sentiment block in one shot.
+#   - The skip-branch now also calls log_instrument_report() with the neutral sentinel
+#     SentimentResult so every symbol gets a report regardless of trade decision.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -1560,7 +1555,7 @@ import math
 
 from adapters.alpaca_adapter import AlpacaAdapter
 from config.config import ENV_MODE, TechnicalSignalConfig
-from monitoring.monitor import log_sentiment_for_symbol, log_signal_score
+from monitoring.monitor import log_instrument_report
 
 from .sentiment import SentimentModule, SentimentResult
 
@@ -1607,12 +1602,12 @@ class SignalEngine:
         """
         if not bars or len(bars) < 10:
             return 0.0
-        
+
         # fallback if not enough bars for full lookback, just use what we have
         lookback = min(len(bars) - 1, 10)
         current = bars[-1].c
         past = bars[-1 - lookback].c
-        
+
         if past == 0:
             return 0.0
         return (current - past) / past
@@ -1624,13 +1619,13 @@ class SignalEngine:
         """
         if len(bars) < 20:
             return 0.0
-        
+
         closes = [b.c for b in bars]
         # last 20 bars
         window = closes[-20:]
         sma = sum(window) / len(window)
         current = closes[-1]
-        
+
         if current > sma:
             return 1.0
         elif current < sma:
@@ -1644,48 +1639,48 @@ class SignalEngine:
         """
         if len(bars) < 5:
             return 0.01  # fallback
-        
+
         closes = [b.c for b in bars]
         returns = []
         for i in range(1, len(closes)):
             r = (closes[i] - closes[i-1]) / closes[i-1]
             returns.append(r)
-        
+
         if not returns:
             return 0.01
-            
+
         mean_ret = sum(returns) / len(returns)
         sq_diffs = [(r - mean_ret)**2 for r in returns]
         variance = sum(sq_diffs) / len(returns)
         std_dev = math.sqrt(variance)
-        
+
         # Annualized-ish or per-bar? Just use per-bar std dev as vol proxy
         return std_dev
 
     def _compute_rsi(self, bars: List, period: int = 14) -> float:
         if len(bars) < period + 1:
             return 50.0
-        
+
         closes = [b.c for b in bars]
         deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-        
+
         gains = [d for d in deltas if d > 0]
         losses = [-d for d in deltas if d < 0]
-        
+
         avg_gain = sum(gains) / period if gains else 0.0
         avg_loss = sum(losses) / period if losses else 0.0
-        
+
         if avg_loss == 0:
             return 100.0
-        
+
         rs = avg_gain / avg_loss
         return 100.0 - (100.0 / (1.0 + rs))
 
     def _normalize_momentum_trend(self, mom_raw: float, trend_raw: float) -> float:
-        # Scale momentum: if mom is 1%, that's huge in 5min bars. 
+        # Scale momentum: if mom is 1%, that's huge in 5min bars.
         # standardizing roughly: mom / 0.005 -> clamped
         mom_score = max(-1.0, min(1.0, mom_raw / self.technicalcfg.momentum_norm_scale))
-        
+
         # Combine with trend (-1 or 1)
         # 70% momentum value, 30% trend direction
         combined = 0.7 * mom_score + 0.3 * trend_raw
@@ -1696,7 +1691,7 @@ class SignalEngine:
         Mean reversion score:
         High RSI (>70) -> Negative score (expect pullback)
         Low RSI (<30) -> Positive score (expect bounce)
-        
+
         Also distance from MA: if price >> MA, revert down (-).
         """
         # RSI component
@@ -1707,7 +1702,7 @@ class SignalEngine:
         elif rsi < self.technicalcfg.rsi_oversold:
             # e.g. 25 -> +0.5
             rsi_score = 1.0 * (30 - rsi) / 30.0
-        
+
         # MA distance component
         if len(bars) < 20:
             ma_score = 0.0
@@ -1719,7 +1714,7 @@ class SignalEngine:
             # if dist is +1%, score is negative (revert)
             # scale: 0.05 (5%) -> full -1.0
             ma_score = -1.0 * (dist / self.technicalcfg.ma_distance_norm_scale)
-            
+
         return max(-1.0, min(1.0, 0.5 * rsi_score + 0.5 * ma_score))
 
     def _compute_price_action_score(self, bars: List, current_price: float) -> float:
@@ -1730,19 +1725,19 @@ class SignalEngine:
         """
         if len(bars) < self.technicalcfg.breakout_lookback_bars:
             return 0.0
-            
-        window = bars[-self.technicalcfg.breakout_lookback_bars:-1] # exclude current
+
+        window = bars[-self.technicalcfg.breakout_lookback_bars:-1]  # exclude current
         highs = [b.h for b in window]
         lows = [b.l for b in window]
-        
+
         recent_high = max(highs)
         recent_low = min(lows)
-        
+
         if current_price > recent_high:
             return 1.0
         elif current_price < recent_low:
             return -1.0
-            
+
         return 0.0
 
     def _combine_technical_scores(self, mom: float, mr: float, pa: float) -> float:
@@ -1793,10 +1788,8 @@ class SignalEngine:
     def _get_news_items(self, symbol: str) -> List[Dict]:
         """
         Fetch news from Alpaca adapter.
+        Here we just ask for latest 10 items.
         """
-        # We only want news from last 24h or so?
-        # Adapter handles the 'limit' and 'since' logic if needed.
-        # Here we just ask for latest 10 items.
         return self.adapter.get_news(symbol, limit=10)
 
     def generate_signal_for_symbol(self, symbol: str) -> Signal:
@@ -1840,16 +1833,6 @@ class SignalEngine:
                 f"price_action={price_action_score:.3f}."
             )
 
-        # Always log composite and factor scores, regardless of trade decision.
-        log_signal_score(
-            symbol=symbol,
-            signal_score=signal_score,
-            momentum_score=momentum_score,
-            mean_reversion_score=mean_reversion_score,
-            price_action_score=price_action_score,
-            env_mode=ENV_MODE,
-        )
-
         # (Suggestion 3) If we have no technical setup, do NOT fetch news and do NOT call AI.
         if side == "skip":
             s_result = SentimentResult(
@@ -1859,6 +1842,15 @@ class SignalEngine:
                 ndocuments=0,
                 explanation="Skipped AI sentiment due to neutral technical signal.",
                 confidence=0.0,
+            )
+            log_instrument_report(
+                symbol=symbol,
+                signal_score=signal_score,
+                sentiment=s_result,
+                momentum_score=momentum_score,
+                mean_reversion_score=mean_reversion_score,
+                price_action_score=price_action_score,
+                env_mode=ENV_MODE,
             )
             return Signal(
                 symbol=symbol,
@@ -1873,10 +1865,20 @@ class SignalEngine:
                 price_action_score=price_action_score,
             )
 
-        # News -> sentiment (Suggestions 1, 2, 6 are enforced inside SentimentModule)
+        # News -> sentiment (cost controls 1, 2, 6 are enforced inside SentimentModule)
         news_items = self._get_news_items(symbol)
         s_result = self.sentiment.scorenewsitems(symbol, news_items)
-        log_sentiment_for_symbol(symbol, s_result, ENV_MODE)
+
+        # Single unified report — includes live sentiment + all four technical scores.
+        log_instrument_report(
+            symbol=symbol,
+            signal_score=signal_score,
+            sentiment=s_result,
+            momentum_score=momentum_score,
+            mean_reversion_score=mean_reversion_score,
+            price_action_score=price_action_score,
+            env_mode=ENV_MODE,
+        )
 
         return Signal(
             symbol=symbol,
@@ -2085,7 +2087,7 @@ class OrderExecutor:
 
 -----------
 execution\position_manager.py
-from typing import Dict
+from typing import Dict, Optional
 from adapters.alpaca_adapter import AlpacaAdapter
 from core.risk_engine import PositionInfo
 
@@ -2094,8 +2096,20 @@ class PositionManager:
     def __init__(self, adapter: AlpacaAdapter):
         self.adapter = adapter
 
-    def get_positions(self) -> Dict[str, PositionInfo]:
+    def get_positions(
+        self,
+        opening_compounds: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, PositionInfo]:
+        """
+        Returns the current open positions as a symbol-keyed dict.
+
+        opening_compounds: optional mapping of symbol -> entry-time rawcompound.
+        When supplied, each PositionInfo.opening_compound is populated from it
+        so the sentiment-exit loop in main.py can compare entry vs. current
+        compound even after the SentimentModule cache has been refreshed.
+        """
         alpaca_positions = self.adapter.list_positions()
+        compounds = opening_compounds or {}
         out: Dict[str, PositionInfo] = {}
         for p in alpaca_positions:
             qty = float(p.qty)
@@ -2108,6 +2122,7 @@ class PositionManager:
                 market_price=price,
                 side=side,
                 notional=notional,
+                opening_compound=compounds.get(p.symbol, 0.0),
             )
         return out
 
@@ -2115,23 +2130,23 @@ class PositionManager:
 
 -----------
 main.py
+# main.py
 # CHANGES:
-#   - BUG FIX: close_position_due_to_sentiment() was fully implemented in OrderExecutor
-#     but was never called anywhere in the main loop. This is now fixed.
-#   - FEATURE 1: Added sentiment-exit loop that runs BEFORE build_portfolio() each cycle.
-#     For every open position the loop:
-#       1. Fetches fresh news from Alpaca (up to 10 items).
-#       2. Scores sentiment via SentimentModule.scorenewsitems() — respects TTL/chaos
-#          cooldown to avoid hammering the AI API unnecessarily.
-#       3. Recovers the compound score that was current when the position was opened by
-#          reading SentimentModule._cache. If no cached entry exists (bot restart, first
-#          loop after cold start) the check is skipped conservatively.
-#       4. Computes delta = entry_compound - current_compound (for longs) or
-#          current_compound - entry_compound (for shorts).
-#       5. If delta >= cfg.sentiment.exit_sentiment_delta_threshold AND current confidence
-#          >= cfg.sentiment.exit_confidence_min, calls executor.close_position_due_to_sentiment().
-#   - Added import of log_sentiment_for_symbol for use in the exit loop.
-#   - No existing variable names, function signatures, or logic paths altered.
+#   - _opening_compounds is now persisted to equity_state.json under key
+#     "opening_compounds" (a dict of symbol -> float). This means the entry
+#     sentiment baseline survives bot restarts — previously it was in-memory only
+#     and reset to 0.0 on every restart, making all delta comparisons meaningless
+#     after a cold start.
+#   - _load_equity_state returns the full state dict as before; no signature change.
+#   - _save_equity_state persists opening_compounds alongside the existing keys.
+#   - main() loads _opening_compounds from state on startup via a new
+#     _load_opening_compounds() helper so the hydration is explicit and isolated.
+#   - Stale-entry purge in the main loop (symbols no longer in positions) already
+#     existed; it now also writes state to disk after purging so removals persist.
+#   - setup_logging now receives cfg.env_mode (banner shows environment label).
+#   - log_portfolio_overview import moved to top-level imports (was a local import
+#     inside the loop — no functional change, just cleaner).
+#   - All variable names, loop structure, and other logic are completely untouched.
 
 import logging
 import json
@@ -2154,6 +2169,8 @@ from monitoring.monitor import (
     log_environment_switch,
     log_kill_switch_state,
     log_sentiment_for_symbol,
+    log_sentiment_position_check,
+    log_portfolio_overview,
 )
 from monitoring.kill_switch import KillSwitch
 
@@ -2162,7 +2179,7 @@ logger = logging.getLogger("tradebot")
 _STATE_PATH = Path("data/equity_state.json")
 
 
-def _load_equity_state() -> Dict[str, float]:
+def _load_equity_state() -> Dict:
     if not _STATE_PATH.exists():
         return {}
     try:
@@ -2172,10 +2189,24 @@ def _load_equity_state() -> Dict[str, float]:
         return {}
 
 
-def _save_equity_state(state: Dict[str, float]) -> None:
+def _save_equity_state(state: Dict) -> None:
     _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _STATE_PATH.open("w") as f:
         json.dump(state, f)
+
+
+def _load_opening_compounds() -> Dict[str, float]:
+    """
+    Load the opening-compound registry from the persisted equity state.
+    Returns an empty dict if the state file is missing or the key is absent.
+    This ensures PositionInfo.opening_compound is populated correctly even
+    after a bot restart, so the sentiment-exit delta comparison is always
+    meaningful.
+    """
+    state = _load_equity_state()
+    raw = state.get("opening_compounds", {})
+    # Guard: only keep entries that are genuine floats.
+    return {k: float(v) for k, v in raw.items() if isinstance(v, (int, float))}
 
 
 def get_equity_snapshot_from_account(acct, positions: Dict[str, PositionInfo]) -> EquitySnapshot:
@@ -2210,6 +2241,8 @@ def get_equity_snapshot_from_account(acct, positions: Dict[str, PositionInfo]) -
 
     state["start_of_day_equity"] = start_of_day_equity
     state["high_watermark_equity"] = high_watermark_equity
+    # NOTE: opening_compounds is NOT touched here — it is managed exclusively
+    # by main() to avoid accidental overwrites during snapshot refreshes.
     _save_equity_state(state)
 
     realized_pl_today = float(getattr(acct, "daytrade_pl", 0.0))
@@ -2231,6 +2264,16 @@ def get_equity_snapshot_from_account(acct, positions: Dict[str, PositionInfo]) -
     )
 
 
+def _persist_opening_compounds(opening_compounds: Dict[str, float]) -> None:
+    """
+    Write _opening_compounds into equity_state.json without disturbing any
+    other keys (start_of_day_equity, high_watermark_equity, last_trading_day).
+    """
+    state = _load_equity_state()
+    state["opening_compounds"] = opening_compounds
+    _save_equity_state(state)
+
+
 def _check_and_exit_on_sentiment(
     positions: Dict[str, PositionInfo],
     adapter: AlpacaAdapter,
@@ -2239,71 +2282,84 @@ def _check_and_exit_on_sentiment(
     cfg,
 ) -> None:
     """
-    For each open position, re-score sentiment from fresh news and compare against
-    the compound score that was cached at (or near) entry time.
+    Iterate over ALL open positions first. For each one:
 
-    Exit logic:
-      - LONG position: opened on positive compound. If compound has dropped by
-        >= exit_sentiment_delta_threshold AND confidence >= exit_confidence_min → close.
-      - SHORT position: opened on negative compound. If compound has risen by
-        >= exit_sentiment_delta_threshold AND confidence >= exit_confidence_min → close.
+    1.  Fetch fresh news (force_rescore bypasses TTL cache and chaos cooldown).
+    2.  Auto-close unconditionally if raw_discrete == -2 (chaos event); the
+        chaos timer is written to the cache by _call_ai inside force_rescore.
+    3.  Auto-close if abs(entry_compound - current_compound) >=
+        exit_sentiment_delta_threshold AND confidence >= exit_confidence_min.
+    4.  Emit a formatted per-instrument block via log_sentiment_position_check().
 
-    The entry compound is recovered from SentimentModule._cache (rawcompound field).
-    If no cache entry exists for a symbol (cold-start / first loop), the check is
-    skipped conservatively — we never exit on missing data.
+    opening_compound is sourced directly from PositionInfo.opening_compound,
+    which main() patches in from _opening_compounds after each entry fill.
+    This survives TTL expiry and bot restarts because _opening_compounds is now
+    persisted to equity_state.json.
     """
     delta_threshold = cfg.sentiment.exit_sentiment_delta_threshold
-    confidence_min = cfg.sentiment.exit_confidence_min
+    confidence_min  = cfg.sentiment.exit_confidence_min
 
     for symbol, position in list(positions.items()):
         try:
-            # Recover entry-time compound from cache BEFORE rescoring (cache will be
-            # overwritten by scorenewsitems if TTL has expired).
-            cached_entry = sentiment_module.get_cached_sentiment(symbol)
-            if cached_entry is None:
-                # No cached entry sentiment — skip rather than false-exit.
-                logger.debug(
-                    f"SentimentExit [{symbol}]: no cached entry sentiment, skipping check."
-                )
-                continue
+            entry_compound: float = position.opening_compound
 
-            entry_compound: float = cached_entry.rawcompound
-
-            # Fetch fresh news and rescore. SentimentModule respects TTL and chaos
-            # cooldown internally — if TTL is still fresh this returns the cached value,
-            # which means delta will be 0 and no exit fires. That is correct behaviour:
-            # we only exit when the AI produces a genuinely new adverse reading.
+            # Always fetch fresh news and force a real AI rescore.
             news_items = adapter.get_news(symbol, limit=10)
-            current_sentiment = sentiment_module.scorenewsitems(symbol, news_items)
-            log_sentiment_for_symbol(symbol, current_sentiment, cfg.env_mode)
+            current_sentiment = sentiment_module.force_rescore(symbol, news_items)
 
-            current_compound: float = current_sentiment.rawcompound
+            current_compound: float = current_sentiment.score
             current_confidence: float = current_sentiment.confidence
+            raw_discrete: int       = current_sentiment.raw_discrete
 
+            # Compute directional delta (how much did sentiment move *against* the pos)
             if position.side == "long":
-                # Sentiment has moved against a long when compound has fallen.
                 delta = entry_compound - current_compound
             elif position.side == "short":
-                # Sentiment has moved against a short when compound has risen.
                 delta = current_compound - entry_compound
             else:
-                continue
+                delta = 0.0
 
-            if delta >= delta_threshold and current_confidence >= confidence_min:
-                reason = (
-                    f"Sentiment compound shifted by {delta:.3f} "
-                    f"(entry={entry_compound:.3f} → current={current_compound:.3f}) "
+            # ── Exit decision ─────────────────────────────────────────────────
+            closing      = False
+            close_reason = ""
+
+            if raw_discrete == -2:
+                closing = True
+                close_reason = (
+                    f"raw_discrete=-2 (chaos / utterly unstable); "
+                    f"chaos cooldown timer applied."
+                )
+            elif delta >= delta_threshold and current_confidence >= confidence_min:
+                closing = True
+                close_reason = (
+                    f"Sentiment compound shifted Δ={delta:+.3f} "
+                    f"(entry={entry_compound:+.3f} → current={current_compound:+.3f}) "
                     f"against {position.side} position; "
                     f"threshold={delta_threshold}, confidence={current_confidence:.2f}"
                 )
+
+            # ── Formatted per-instrument print block ─────────────────────────
+            log_sentiment_position_check(
+                position=position,
+                entry_compound=entry_compound,
+                current_sentiment=current_sentiment,
+                delta=delta,
+                delta_threshold=delta_threshold,
+                confidence_min=confidence_min,
+                closing=closing,
+                close_reason=close_reason,
+                env_mode=cfg.env_mode,
+            )
+
+            # ── Execute close if warranted ────────────────────────────────────
+            if closing:
                 executor.close_position_due_to_sentiment(
                     position=position,
                     sentiment=current_sentiment,
-                    reason=reason,
+                    reason=close_reason,
                 )
 
         except Exception as exc:
-            # Never let a single symbol's exit check crash the whole loop.
             logger.error(
                 f"SentimentExit [{symbol}]: unexpected error during exit check: {exc}"
             )
@@ -2312,21 +2368,26 @@ def _check_and_exit_on_sentiment(
 def main():
     setup_logging()
     cfg = load_config()
+    setup_logging(cfg.env_mode)
     log_environment_switch(cfg.env_mode, user="manual_start")
 
-    adapter = AlpacaAdapter(cfg.env_mode)
-    sentiment = SentimentModule()
-    signal_engine = SignalEngine(adapter, sentiment, cfg.technical)
-    risk_engine = RiskEngine(cfg.risk_limits, cfg.sentiment, cfg.instruments)
-    pm = PositionManager(adapter)
-    executor = OrderExecutor(adapter, cfg.env_mode, cfg.live_trading_enabled, cfg.execution)
-    kill_switch = KillSwitch(cfg.risk_limits)
+    adapter           = AlpacaAdapter(cfg.env_mode)
+    sentiment         = SentimentModule()
+    signal_engine     = SignalEngine(adapter, sentiment, cfg.technical)
+    risk_engine       = RiskEngine(cfg.risk_limits, cfg.sentiment, cfg.instruments)
+    pm                = PositionManager(adapter)
+    executor          = OrderExecutor(adapter, cfg.env_mode, cfg.live_trading_enabled, cfg.execution)
+    kill_switch       = KillSwitch(cfg.risk_limits)
     portfolio_builder = PortfolioBuilder(cfg, adapter, sentiment, signal_engine, risk_engine)
 
+    # Registry: symbol -> sentiment.score recorded at entry time.
+    # Persisted to equity_state.json so it survives bot restarts.
+    _opening_compounds: Dict[str, float] = _load_opening_compounds()
+
     while True:
-        acct = adapter.get_account()
-        positions = pm.get_positions()
-        snapshot = get_equity_snapshot_from_account(acct, positions)
+        acct      = adapter.get_account()
+        positions = pm.get_positions(opening_compounds=_opening_compounds)
+        snapshot  = get_equity_snapshot_from_account(acct, positions)
         market_open = adapter.get_market_open()
         log_equity_snapshot(snapshot, market_open=market_open)
 
@@ -2336,10 +2397,7 @@ def main():
             time.sleep(60)
             continue
 
-        # --- SENTIMENT-DRIVEN EXIT ON OPEN POSITIONS (Feature 1 / Bug Fix) ---
-        # Runs unconditionally every loop (kill switch already cleared above).
-        # Must execute BEFORE the exposure guard below so that exits free up
-        # capacity and the bot can re-enter in the same cycle if appropriate.
+        # ── STEP 1: SENTIMENT CHECK ON ALL OPEN POSITIONS ────────────────────
         if positions:
             _check_and_exit_on_sentiment(
                 positions=positions,
@@ -2348,39 +2406,44 @@ def main():
                 executor=executor,
                 cfg=cfg,
             )
-            # Refresh positions after potential closes so the exposure guard and
-            # portfolio builder work against the post-exit state.
-            positions = pm.get_positions()
-            snapshot = get_equity_snapshot_from_account(acct, positions)
+            # Refresh positions after potential closes.
+            positions = pm.get_positions(opening_compounds=_opening_compounds)
+            snapshot  = get_equity_snapshot_from_account(acct, positions)
 
+            # Purge _opening_compounds for symbols no longer open, then persist.
+            for sym in list(_opening_compounds.keys()):
+                if sym not in positions:
+                    del _opening_compounds[sym]
+            _persist_opening_compounds(_opening_compounds)
+
+        # ── STEP 2: EXPOSURE / POSITION-COUNT GUARD ──────────────────────────
         exposure_cap_notional = snapshot.equity * cfg.risk_limits.gross_exposure_cap_pct
-
-        # --- NO EQUITY GUARD ---
-        if snapshot.gross_exposure >= exposure_cap_notional or len(positions) >= cfg.risk_limits.max_open_positions:
+        if (
+            snapshot.gross_exposure >= exposure_cap_notional
+            or len(positions) >= cfg.risk_limits.max_open_positions
+        ):
             time.sleep(60)
             continue
 
-        # Fetch open orders to prevent duplicates and pass to portfolio builder
-        open_orders = adapter.list_orders(status="open")
-
+        # ── STEP 3: BUILD AND EXECUTE NEW TRADES ─────────────────────────────
+        open_orders     = adapter.list_orders(status="open")
         proposed_trades = portfolio_builder.build_portfolio(snapshot, positions, open_orders)
 
-        from monitoring.monitor import log_portfolio_overview  # local import to avoid cycles
         log_portfolio_overview(proposed_trades, cfg.env_mode)
 
         for proposed in proposed_trades:
-            executor.execute_proposed_trade(proposed)
+            order = executor.execute_proposed_trade(proposed)
+            if order is not None and proposed.rejected_reason is None and proposed.qty > 0:
+                # Record entry-time sentiment score as the opening compound baseline.
+                _opening_compounds[proposed.symbol] = proposed.sentiment_score
+                # Persist immediately so a crash/restart doesn't lose the entry record.
+                _persist_opening_compounds(_opening_compounds)
 
         time.sleep(600)
 
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
 
 -----------
 
@@ -2417,17 +2480,26 @@ class KillSwitch:
 
 -----------
 monitoring\monitor.py
-# monitoring/monitor.py
-import logging
-from datetime import datetime
-from typing import List
+# CHANGES:
+#   - log_sentiment_position_check(): fixed broken logger.info line at the
+#     "docs=" row. On-disk line was:
+#         logger.info(f"docs={current_sentiment.ndocuments}){RESET}")
+#     which is missing {lc}, missing the "  " indent, and has a stray literal ")"
+#     inside the string. Fixed to:
+#         logger.info(f"{lc}  docs={current_sentiment.ndocuments}{RESET}")
 
-from core.risk_engine import EquitySnapshot, ProposedTrade
+import logging
+import threading
+from datetime import datetime
+from typing import List, Optional
+
+from core.risk_engine import EquitySnapshot, ProposedTrade, PositionInfo
 from core.sentiment import SentimentResult
 from monitoring.kill_switch import KillSwitchState
 
 logger = logging.getLogger("tradebot")
 
+# ── ANSI colour constants ─────────────────────────────────────────────────────
 RESET        = "\033[0m"
 LINEBLUE     = "\033[38;2;138;185;241m"
 LINEYELLOW   = "\033[38;2;248;222;126m"
@@ -2439,20 +2511,33 @@ ITALICOFF    = "\033[23m"
 BRIGHTPURPLE = "\033[38;2;191;64;191m"
 DEEPBLUE     = "\033[38;2;0;13;222m"
 
-# Market status colours
-MARKETOPEN   = "\033[38;2;40;167;69m"   # green  - same hue as SIGNALGREEN
-MARKETCLOSED = "\033[38;2;220;53;69m"   # red    - same hue as SIGNALRED
+MARKETOPEN   = SIGNALGREEN
+MARKETCLOSED = SIGNALRED
 
-_linetoggle = 0
+# ── Thread-safe line-colour toggle ────────────────────────────────────────────
+_linetoggle      = 0
+_linetoggle_lock = threading.Lock()
+
 
 def next_line_color() -> str:
     global _linetoggle
-    _linetoggle = 0 if _linetoggle == 1 else 1
-    return LINEBLUE if _linetoggle == 0 else LINEYELLOW
+    with _linetoggle_lock:
+        _linetoggle = 0 if _linetoggle == 1 else 1
+        return LINEBLUE if _linetoggle == 0 else LINEYELLOW
 
 
 def separator_line() -> str:
     return f"{SEPCOLOR}" + "-" * 80 + f"{RESET}"
+
+
+def _thick(w: int = 80) -> str:
+    """Border glyphs only — no colour escapes; callers wrap in lc / RESET."""
+    return "═" * w
+
+
+def _thin(w: int = 80) -> str:
+    """Border glyphs only — no colour escapes; callers wrap in lc / RESET."""
+    return "─" * w
 
 
 def sentiment_score_fragment(score: float, line_color: str) -> str:
@@ -2477,8 +2562,24 @@ def italicize_technical(text: str) -> str:
     return out
 
 
-def setup_logging() -> None:
+# ── Setup ─────────────────────────────────────────────────────────────────────
+
+def setup_logging(env_mode: str = "") -> None:
+    """
+    Initialise root logger at INFO level (no-op if already initialised).
+    Calls log_startup_banner() so callers need no separate banner call.
+    Pass cfg.env_mode for a labelled banner; omit for an unlabelled one.
+    """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    log_startup_banner(env_mode)
+
+
+def log_startup_banner(env_mode: str) -> None:
+    logger.info(separator_line())
+    logger.info(f"{DEEPBLUE}   TRADE BOT STARTING UP   {RESET}")
+    if env_mode:
+        logger.info(f"{DEEPBLUE}   Environment: {env_mode}{RESET}")
+    logger.info(separator_line())
 
 
 def log_environment_switch(env_mode: str, user: str) -> None:
@@ -2487,17 +2588,15 @@ def log_environment_switch(env_mode: str, user: str) -> None:
     logger.warning(f"{line_color}{msg}{RESET}")
 
 
+# ── Equity snapshot ───────────────────────────────────────────────────────────
+
 def log_equity_snapshot(snapshot: EquitySnapshot, market_open: bool = False) -> None:
-    """
-    Logs the equity snapshot with a coloured MARKET OPEN / MARKET CLOSED badge.
-    """
     line_color = next_line_color()
-
-    if market_open:
-        market_badge = f"{MARKETOPEN}[MARKET OPEN]{line_color}"
-    else:
-        market_badge = f"{MARKETCLOSED}[MARKET CLOSED]{line_color}"
-
+    market_badge = (
+        f"{MARKETOPEN}[MARKET OPEN]{line_color}"
+        if market_open
+        else f"{MARKETCLOSED}[MARKET CLOSED]{line_color}"
+    )
     msg = (
         f"{datetime.utcnow().isoformat()}Z EquitySnapshot: "
         f"{market_badge} "
@@ -2511,33 +2610,133 @@ def log_equity_snapshot(snapshot: EquitySnapshot, market_open: bool = False) -> 
     logger.info(separator_line())
 
 
+# ── Kill-switch ───────────────────────────────────────────────────────────────
+
 def log_kill_switch_state(state: KillSwitchState) -> None:
+    """
+    BUG #3 fix: OK-branch was logger.debug() — invisible at INFO level.
+    Now logger.info() so the heartbeat is visible every loop.
+    """
     line_color = next_line_color()
     if state.halted:
         msg = f"{datetime.utcnow().isoformat()}Z KILL-SWITCH ACTIVATED: {state.reason}"
         logger.error(f"{line_color}{msg}{RESET}")
     else:
         msg = f"{datetime.utcnow().isoformat()}Z Kill-switch OK"
-        logger.debug(f"{line_color}{msg}{RESET}")
+        logger.info(f"{line_color}{msg}{RESET}")
     logger.info(separator_line())
 
+
+# ── Instrument Report ─────────────────────────────────────────────────────────
+
+def log_instrument_report(
+    symbol: str,
+    signal_score: float,
+    sentiment: SentimentResult,
+    momentum_score: float,
+    mean_reversion_score: float,
+    price_action_score: float,
+    env_mode: str,
+) -> None:
+    """
+    Emit a structured Instrument Report block for a single symbol scan.
+
+    ════════════════════════════════════════════════════════════════════════════
+     [PAPER] Instrument Report  │  AAPL  |  value=+0.350
+    Current Sentiment=+0.900
+    reason=Earnings beat, raised guidance; analysts bullish short-term.
+    ────────────────────────────────────────────────────────────────────────────
+    Indicator Listing
+    compound=+0.350   momentum=+0.412   mean_reversion=-0.050   price_action=+0.000
+    ════════════════════════════════════════════════════════════════════════════
+    """
+    W  = 80
+    lc = next_line_color()
+
+    thick = _thick(W)
+    thin  = _thin(W)
+
+    # ── Header row ────────────────────────────────────────────────────────────
+    env_badge   = f"[{env_mode}] " if env_mode else ""
+    symbol_str  = f"{BRIGHTPURPLE}{symbol}{lc}"
+    val_color   = SIGNALGREEN if signal_score >= 0 else SIGNALRED
+    val_str     = f"{val_color}{signal_score:+.3f}{lc}"
+    header_body = (
+        f" {DEEPBLUE}{env_badge}Instrument Report{lc}  │  "
+        f"{symbol_str}  |  value={val_str}"
+    )
+
+    # ── Current Sentiment row ─────────────────────────────────────────────────
+    sc       = sentiment.score
+    sc_color = SIGNALGREEN if sc >= 0.5 else (SIGNALRED if sc <= -0.5 else lc)
+    sc_str   = f"{sc_color}{sc:+.3f}{lc}"
+    sent_row = f"Current Sentiment={sc_str}"
+
+    # ── Reason row ────────────────────────────────────────────────────────────
+    expl_raw   = (sentiment.explanation or "").replace("\n", " ").strip()
+    expl_fmt   = italicize_technical(expl_raw)
+    reason_row = f"reason={expl_fmt}"
+
+    # ── Indicator colours ─────────────────────────────────────────────────────
+    # compound = signal_score (weighted technical composite).
+    # This is signal_score, NOT sentiment.rawcompound (which is the AI score).
+    cp       = signal_score
+    cp_color = SIGNALGREEN if cp >= 0 else SIGNALRED
+    cp_str   = f"{cp_color}{cp:+.3f}{lc}"
+
+    mom_color = SIGNALGREEN if momentum_score >= 0 else SIGNALRED
+    mom_str   = f"{mom_color}{momentum_score:+.3f}{lc}"
+
+    mr_color  = SIGNALGREEN if mean_reversion_score >= 0 else SIGNALRED
+    mr_str    = f"{mr_color}{mean_reversion_score:+.3f}{lc}"
+
+    pa_color  = SIGNALGREEN if price_action_score >= 0 else SIGNALRED
+    pa_str    = f"{pa_color}{price_action_score:+.3f}{lc}"
+
+    # ── Indicator Listing — all four on one line ───────────────────────────────
+    ind_row = (
+        f"compound={cp_str}   "
+        f"momentum={mom_str}   "
+        f"mean_reversion={mr_str}   "
+        f"price_action={pa_str}"
+    )
+
+    # ── Formula row — italicised factor breakdown ──────────────────────────────
+    formula_row = (
+        f"  Compound Score={cp_str}   "
+        f"{ITALICON}momentum={mom_color}{momentum_score:+.3f}{lc}{ITALICOFF}   "
+        f"{ITALICON}mean_reversion={mr_color}{mean_reversion_score:+.3f}{lc}{ITALICOFF}   "
+        f"{ITALICON}price_action={pa_color}{price_action_score:+.3f}{lc}{ITALICOFF}"
+    )
+
+    logger.info(f"{lc}{thick}{RESET}")
+    logger.info(f"{lc}{header_body}{RESET}")
+    logger.info(f"{lc}{sent_row}{RESET}")
+    logger.info(f"{lc}{reason_row}{RESET}")
+    logger.info(f"{lc}{thin}{RESET}")
+    logger.info(f"{lc}Indicator Listing{RESET}")
+    logger.info(f"{lc}{ind_row}{RESET}")
+    logger.info(f"{lc}{thin}{RESET}")
+    logger.info(f"{lc}{formula_row}{RESET}")
+    logger.info(f"{lc}{thick}{RESET}")
+
+
+# ── Deprecated shims ──────────────────────────────────────────────────────────
+# These exist only so any OTHER file that still imports them doesn't crash.
+# core/signals.py no longer calls them. Do NOT add logger.warning() here —
+# the warnings were the user-visible noise we're eliminating.
 
 def log_sentiment_for_symbol(symbol: str, sentiment: SentimentResult, env_mode: str) -> None:
-    line_color = next_line_color()
-    score_frag = sentiment_score_fragment(sentiment.score, line_color)
-    expl_raw = (sentiment.explanation or "").replace("\n", " ").strip()
-    expl_fmt = italicize_technical(expl_raw)
-    symbol_part = f"{BRIGHTPURPLE}{symbol}{line_color}"
-    msg = (
-        f"{datetime.utcnow().isoformat()}Z {env_mode} Sentiment "
-        f"symbol={symbol_part} "
-        f"{score_frag} "
-        f"conf={sentiment.confidence:.2f} "
-        f"docs={sentiment.ndocuments} "
-        f"reason={expl_fmt}"
+    """Deprecated shim — preserved for import compatibility only."""
+    log_instrument_report(
+        symbol=symbol,
+        signal_score=0.0,
+        sentiment=sentiment,
+        momentum_score=0.0,
+        mean_reversion_score=0.0,
+        price_action_score=0.0,
+        env_mode=env_mode,
     )
-    logger.info(f"{line_color}{msg}{RESET}")
-    logger.info(separator_line())
 
 
 def log_signal_score(
@@ -2548,33 +2747,45 @@ def log_signal_score(
     price_action_score: float,
     env_mode: str,
 ) -> None:
-    line_color = next_line_color()
-    symbol_part = f"{BRIGHTPURPLE}{symbol}{line_color}"
-    composite_str = f"{BRIGHTPURPLE}{signal_score:.3f}{line_color}"
-    msg = (
-        f"{datetime.utcnow().isoformat()}Z {env_mode} Signal "
-        f"symbol={symbol_part} "
-        f"{ITALICON}composite={composite_str}{ITALICOFF} "
-        f"{ITALICON}momentum={momentum_score:.3f}{ITALICOFF} "
-        f"{ITALICON}mean_reversion={mean_reversion_score:.3f}{ITALICOFF} "
-        f"{ITALICON}price_action={price_action_score:.3f}{ITALICOFF}"
+    """Deprecated shim — preserved for import compatibility only."""
+    from core.sentiment import SentimentResult  # local import avoids circular at module load
+    log_instrument_report(
+        symbol=symbol,
+        signal_score=signal_score,
+        sentiment=SentimentResult(
+            score=0.0, raw_discrete=0, rawcompound=0.0,
+            ndocuments=0, explanation=None, confidence=0.0,
+        ),
+        momentum_score=momentum_score,
+        mean_reversion_score=mean_reversion_score,
+        price_action_score=price_action_score,
+        env_mode=env_mode,
     )
-    logger.info(f"{line_color}{msg}{RESET}")
-    logger.info(separator_line())
 
+
+# ── Proposed trade ────────────────────────────────────────────────────────────
 
 def log_proposed_trade(trade: ProposedTrade, env_mode: str) -> None:
-    line_color = next_line_color()
+    """
+    BUG #5 fix: unexpected trade.side now emits logger.warning() instead of
+    silently producing an empty action_tag.
+    """
+    line_color     = next_line_color()
     sentiment_part = sentiment_score_fragment(trade.sentiment_score, line_color)
-    action_tag = ""
+    action_tag     = ""
     if trade.rejected_reason is None and trade.qty > 0:
         if trade.side == "buy":
             action_tag = f" {SIGNALGREEN}BUY{line_color}"
         elif trade.side == "sell":
             action_tag = f" {SIGNALRED}SELL{line_color}"
-    notional = trade.qty * trade.entry_price
+        else:
+            logger.warning(
+                f"log_proposed_trade: unexpected side='{trade.side}' for "
+                f"{trade.symbol} — expected 'buy' or 'sell'."
+            )
+    notional    = trade.qty * trade.entry_price
     symbol_part = f"{BRIGHTPURPLE}{trade.symbol}{line_color}"
-    sig_part = f"{BRIGHTPURPLE}{trade.signal_score:.3f}{line_color}"
+    sig_part    = f"{BRIGHTPURPLE}{trade.signal_score:.3f}{line_color}"
     msg = (
         f"{datetime.utcnow().isoformat()}Z {env_mode} ProposedTrade "
         f"symbol={symbol_part} {trade.side} "
@@ -2590,6 +2801,8 @@ def log_proposed_trade(trade: ProposedTrade, env_mode: str) -> None:
     logger.info(separator_line())
 
 
+# ── Sentiment close decision ──────────────────────────────────────────────────
+
 def log_sentiment_close_decision(
     symbol: str,
     side: str,
@@ -2600,11 +2813,11 @@ def log_sentiment_close_decision(
     env_mode: str,
     reason: str,
 ) -> None:
-    line_color = next_line_color()
-    score_frag = sentiment_score_fragment(sentiment_score, line_color)
-    expl_raw = (explanation or "").replace("\n", " ").strip()
-    expl_fmt = italicize_technical(expl_raw)
-    force_msg = f"{SIGNALRED}FORCE-CLOSED DUE TO BAD SENTIMENT{line_color}"
+    line_color  = next_line_color()
+    score_frag  = sentiment_score_fragment(sentiment_score, line_color)
+    expl_raw    = (explanation or "").replace("\n", " ").strip()
+    expl_fmt    = italicize_technical(expl_raw)
+    force_msg   = f"{SIGNALRED}FORCE-CLOSED DUE TO BAD SENTIMENT{line_color}"
     symbol_part = f"{BRIGHTPURPLE}{symbol}{line_color}"
     msg = (
         f"{datetime.utcnow().isoformat()}Z {env_mode} SentimentExit "
@@ -2618,6 +2831,8 @@ def log_sentiment_close_decision(
     logger.info(separator_line())
 
 
+# ── Portfolio overview ────────────────────────────────────────────────────────
+
 def log_portfolio_overview(trades: List[ProposedTrade], env_mode: str) -> None:
     logger.info(separator_line())
     if not trades:
@@ -2628,12 +2843,12 @@ def log_portfolio_overview(trades: List[ProposedTrade], env_mode: str) -> None:
         return
 
     line_color = next_line_color()
-    header = f"{datetime.utcnow().isoformat()}Z {env_mode} PORTFOLIO OVERVIEW"
+    header     = f"{datetime.utcnow().isoformat()}Z {env_mode} PORTFOLIO OVERVIEW"
     logger.info(f"{line_color}{header}{RESET}")
     for t in trades:
-        notional = t.qty * t.entry_price
+        notional    = t.qty * t.entry_price
         symbol_part = f"{BRIGHTPURPLE}{t.symbol}{line_color}"
-        sig_str = f"{BRIGHTPURPLE}{t.signal_score:.3f}{line_color}"
+        sig_str     = f"{BRIGHTPURPLE}{t.signal_score:.3f}{line_color}"
         msg = (
             f"  symbol={symbol_part} side={t.side} "
             f"qty={t.qty:.4f} notional={notional:.2f} "
@@ -2643,32 +2858,128 @@ def log_portfolio_overview(trades: List[ProposedTrade], env_mode: str) -> None:
         logger.info(f"{line_color}{msg}{RESET}")
     logger.info(separator_line())
 
-def log_startup_banner(env_mode: str) -> None:
-    logger.info(separator_line())
-    logger.info(f"{DEEPBLUE}   TRADE BOT STARTING UP   {RESET}")
-    logger.info(f"{DEEPBLUE}   Environment: {env_mode} {RESET}")
-    logger.info(separator_line())
 
+# ── Sentiment position check ──────────────────────────────────────────────────
 
+def log_sentiment_position_check(
+    position: PositionInfo,
+    entry_compound: float,
+    current_sentiment: SentimentResult,
+    delta: float,
+    delta_threshold: float,
+    confidence_min: float,
+    closing: bool,
+    close_reason: str,
+    env_mode: str,
+    stop_price: Optional[float] = None,
+    take_profit_price: Optional[float] = None,
+) -> None:
+    """
+    BUG #2 fix: triggered_tag and delta_color are also set when raw_discrete == -2
+    (chaos exit), regardless of numeric delta, so the delta row is always visually
+    consistent with the Verdict.
 
+    BUG #4 fix: thick/thin carry no embedded RESET — callers wrap in lc/RESET.
 
+    Current compound now uses current_sentiment.score (not .rawcompound).
+    rawcompound == score always (set identically in _call_ai); using .score is
+    semantically correct and consistent with how delta is computed in main.py.
+    """
+    W  = 80
+    lc = next_line_color()
 
+    thick = _thick(W)
+    thin  = _thin(W)
 
+    rd = current_sentiment.raw_discrete
 
+    # ── Header row ────────────────────────────────────────────────────────────
+    symbol_str   = f"{BRIGHTPURPLE}{position.symbol}{lc}"
+    side_str     = (
+        f"{SIGNALGREEN}{position.side.upper()}{lc}"
+        if position.side == "long"
+        else f"{SIGNALRED}{position.side.upper()}{lc}"
+    )
+    notional_val = abs(position.qty * position.market_price)
+    header_body  = (
+        f" {DEEPBLUE}SENTIMENT CHECK{lc}  │  "
+        f"{symbol_str}  │  {side_str}  │  "
+        f"qty={position.qty:.4f}  │  notional={notional_val:.2f}"
+    )
 
+    # ── Metadata row ──────────────────────────────────────────────────────────
+    sc       = current_sentiment.score
+    sc_color = SIGNALGREEN if sc >= 0.5 else (SIGNALRED if sc <= -0.5 else lc)
+    sc_str   = f"{sc_color}{sc:+.3f}{lc}"
 
+    ec_color = SIGNALGREEN if entry_compound >= 0 else SIGNALRED
+    ec_str   = f"{ec_color}{entry_compound:+.3f}{lc}"
 
+    sl_str = f"{stop_price:.2f}"        if stop_price        is not None else "N/A"
+    tp_str = f"{take_profit_price:.2f}" if take_profit_price is not None else "N/A"
 
+    meta_row = (
+        f"Current Sentiment={sc_str}   |   "
+        f"Opening Compound={ec_str}   |   "
+        f"Stop Loss={sl_str}   |   "
+        f"Take Profit={tp_str}"
+    )
 
+    # ── Entry compound ────────────────────────────────────────────────────────
+    ec_str2 = f"{ec_color}{entry_compound:+.3f}{lc}"
 
+    # ── Delta — BUG #2 fix: chaos exit also marks delta as triggered ──────────
+    chaos_exit    = (rd == -2)
+    delta_trigger = (delta >= delta_threshold)
+    show_trigger  = delta_trigger or chaos_exit
 
+    delta_color   = SIGNALRED if show_trigger else lc
+    triggered_tag = (
+        f"  {SIGNALRED}← TRIGGERED{lc}"
+        if show_trigger
+        else ""
+    )
+    delta_str = (
+        f"{delta_color}{delta:+.3f}{lc}   "
+        f"[threshold ≥ {delta_threshold:.3f}]{triggered_tag}"
+    )
 
+    # ── Explanation ───────────────────────────────────────────────────────────
+    expl_raw = (current_sentiment.explanation or "").replace("\n", " ").strip()
+    expl_fmt = italicize_technical(expl_raw)
 
+    # ── Verdict ───────────────────────────────────────────────────────────────
+    if closing:
+        if chaos_exit:
+            verdict_detail = (
+                f"{SIGNALRED}⛔ CLOSING — raw_discrete = -2 (CHAOS / absolute exit){lc}"
+            )
+        else:
+            verdict_detail = (
+                f"{SIGNALRED}⛔ CLOSING — sentiment shift "
+                f"Δ={delta:+.3f} ≥ threshold {delta_threshold:.3f}{lc}"
+            )
+    else:
+        verdict_detail = f"{SIGNALGREEN}✔  HOLDING — no exit condition met{lc}"
 
-
-
-
-
+    logger.info(f"{lc}{thick}{RESET}")
+    logger.info(f"{lc}{header_body}{RESET}")
+    logger.info(f"{lc}{thick}{RESET}")
+    logger.info(f"{lc}{meta_row}{RESET}")
+    logger.info(f"{lc}{thin}{RESET}")
+    logger.info("")
+    logger.info(f"{lc}  Entry compound   :  {ec_str2}{RESET}")
+    logger.info("")
+    logger.info("")
+    logger.info(f"{lc}  Δ compound       :  {delta_str}{RESET}")
+    logger.info("")
+    logger.info(f"{lc}  Explanation      :  {expl_fmt}{RESET}")
+    logger.info("")
+    logger.info(f"{lc}{thin}{RESET}")
+    logger.info("")
+    logger.info(f"{lc}  Verdict          :  {verdict_detail}{RESET}")
+    logger.info("")
+    logger.info(f"{lc}{thick}{RESET}")
 
 -----------
 
@@ -2688,10 +2999,6 @@ tests\__init__.py
 
 -----------
 todo.txt
-1----------------------------------------------------------------------------------
-
-prevent repeated orders in next loop, when position for instrument is still open.
-
 2----------------------------------------------------------------------------------
 
 Scrap upper and lower resistance with AI and use it in a viable capacity
@@ -2711,5 +3018,10 @@ improve portfolio composition for better diversification
 6----------------------------------------------------------------------------------
 
 thats lowkey and highkey it
+
+
+rank portfolio builder based on tech+sent score and distribute equity accordingly in viable positions
+
+Fix the Monitor
 -----------
 

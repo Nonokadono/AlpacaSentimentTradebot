@@ -1,7 +1,3 @@
-1----------------------------------------------------------------------------------
-
-prevent repeated orders in next loop, when position for instrument is still open.
-
 2----------------------------------------------------------------------------------
 
 Scrap upper and lower resistance with AI and use it in a viable capacity
@@ -21,3 +17,8 @@ improve portfolio composition for better diversification
 6----------------------------------------------------------------------------------
 
 thats lowkey and highkey it
+
+
+rank portfolio builder based on tech+sent score and distribute equity accordingly in viable positions
+
+Fix the Monitor

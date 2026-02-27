@@ -1,4 +1,14 @@
-# core/signals.py
+# CHANGES:
+#   - Import: removed `log_sentiment_for_symbol, log_signal_score` (both deprecated shims).
+#     Replaced with a direct import of `log_instrument_report` from monitoring.monitor.
+#   - generate_signal_for_symbol(): replaced the call to log_signal_score() (which fires
+#     the DEPRECATED warning and loses live sentiment) with a single log_instrument_report()
+#     call placed AFTER the sentiment fetch, so the report always carries live sentiment.
+#     The separate log_sentiment_for_symbol() call that followed has been removed because
+#     log_instrument_report already renders the full sentiment block in one shot.
+#   - The skip-branch now also calls log_instrument_report() with the neutral sentinel
+#     SentimentResult so every symbol gets a report regardless of trade decision.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,7 +19,7 @@ import math
 
 from adapters.alpaca_adapter import AlpacaAdapter
 from config.config import ENV_MODE, TechnicalSignalConfig
-from monitoring.monitor import log_sentiment_for_symbol, log_signal_score
+from monitoring.monitor import log_instrument_report
 
 from .sentiment import SentimentModule, SentimentResult
 
@@ -56,12 +66,12 @@ class SignalEngine:
         """
         if not bars or len(bars) < 10:
             return 0.0
-        
+
         # fallback if not enough bars for full lookback, just use what we have
         lookback = min(len(bars) - 1, 10)
         current = bars[-1].c
         past = bars[-1 - lookback].c
-        
+
         if past == 0:
             return 0.0
         return (current - past) / past
@@ -73,13 +83,13 @@ class SignalEngine:
         """
         if len(bars) < 20:
             return 0.0
-        
+
         closes = [b.c for b in bars]
         # last 20 bars
         window = closes[-20:]
         sma = sum(window) / len(window)
         current = closes[-1]
-        
+
         if current > sma:
             return 1.0
         elif current < sma:
@@ -93,48 +103,48 @@ class SignalEngine:
         """
         if len(bars) < 5:
             return 0.01  # fallback
-        
+
         closes = [b.c for b in bars]
         returns = []
         for i in range(1, len(closes)):
             r = (closes[i] - closes[i-1]) / closes[i-1]
             returns.append(r)
-        
+
         if not returns:
             return 0.01
-            
+
         mean_ret = sum(returns) / len(returns)
         sq_diffs = [(r - mean_ret)**2 for r in returns]
         variance = sum(sq_diffs) / len(returns)
         std_dev = math.sqrt(variance)
-        
+
         # Annualized-ish or per-bar? Just use per-bar std dev as vol proxy
         return std_dev
 
     def _compute_rsi(self, bars: List, period: int = 14) -> float:
         if len(bars) < period + 1:
             return 50.0
-        
+
         closes = [b.c for b in bars]
         deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-        
+
         gains = [d for d in deltas if d > 0]
         losses = [-d for d in deltas if d < 0]
-        
+
         avg_gain = sum(gains) / period if gains else 0.0
         avg_loss = sum(losses) / period if losses else 0.0
-        
+
         if avg_loss == 0:
             return 100.0
-        
+
         rs = avg_gain / avg_loss
         return 100.0 - (100.0 / (1.0 + rs))
 
     def _normalize_momentum_trend(self, mom_raw: float, trend_raw: float) -> float:
-        # Scale momentum: if mom is 1%, that's huge in 5min bars. 
+        # Scale momentum: if mom is 1%, that's huge in 5min bars.
         # standardizing roughly: mom / 0.005 -> clamped
         mom_score = max(-1.0, min(1.0, mom_raw / self.technicalcfg.momentum_norm_scale))
-        
+
         # Combine with trend (-1 or 1)
         # 70% momentum value, 30% trend direction
         combined = 0.7 * mom_score + 0.3 * trend_raw
@@ -145,7 +155,7 @@ class SignalEngine:
         Mean reversion score:
         High RSI (>70) -> Negative score (expect pullback)
         Low RSI (<30) -> Positive score (expect bounce)
-        
+
         Also distance from MA: if price >> MA, revert down (-).
         """
         # RSI component
@@ -156,7 +166,7 @@ class SignalEngine:
         elif rsi < self.technicalcfg.rsi_oversold:
             # e.g. 25 -> +0.5
             rsi_score = 1.0 * (30 - rsi) / 30.0
-        
+
         # MA distance component
         if len(bars) < 20:
             ma_score = 0.0
@@ -168,7 +178,7 @@ class SignalEngine:
             # if dist is +1%, score is negative (revert)
             # scale: 0.05 (5%) -> full -1.0
             ma_score = -1.0 * (dist / self.technicalcfg.ma_distance_norm_scale)
-            
+
         return max(-1.0, min(1.0, 0.5 * rsi_score + 0.5 * ma_score))
 
     def _compute_price_action_score(self, bars: List, current_price: float) -> float:
@@ -179,19 +189,19 @@ class SignalEngine:
         """
         if len(bars) < self.technicalcfg.breakout_lookback_bars:
             return 0.0
-            
-        window = bars[-self.technicalcfg.breakout_lookback_bars:-1] # exclude current
+
+        window = bars[-self.technicalcfg.breakout_lookback_bars:-1]  # exclude current
         highs = [b.h for b in window]
         lows = [b.l for b in window]
-        
+
         recent_high = max(highs)
         recent_low = min(lows)
-        
+
         if current_price > recent_high:
             return 1.0
         elif current_price < recent_low:
             return -1.0
-            
+
         return 0.0
 
     def _combine_technical_scores(self, mom: float, mr: float, pa: float) -> float:
@@ -242,10 +252,8 @@ class SignalEngine:
     def _get_news_items(self, symbol: str) -> List[Dict]:
         """
         Fetch news from Alpaca adapter.
+        Here we just ask for latest 10 items.
         """
-        # We only want news from last 24h or so?
-        # Adapter handles the 'limit' and 'since' logic if needed.
-        # Here we just ask for latest 10 items.
         return self.adapter.get_news(symbol, limit=10)
 
     def generate_signal_for_symbol(self, symbol: str) -> Signal:
@@ -289,16 +297,6 @@ class SignalEngine:
                 f"price_action={price_action_score:.3f}."
             )
 
-        # Always log composite and factor scores, regardless of trade decision.
-        log_signal_score(
-            symbol=symbol,
-            signal_score=signal_score,
-            momentum_score=momentum_score,
-            mean_reversion_score=mean_reversion_score,
-            price_action_score=price_action_score,
-            env_mode=ENV_MODE,
-        )
-
         # (Suggestion 3) If we have no technical setup, do NOT fetch news and do NOT call AI.
         if side == "skip":
             s_result = SentimentResult(
@@ -308,6 +306,15 @@ class SignalEngine:
                 ndocuments=0,
                 explanation="Skipped AI sentiment due to neutral technical signal.",
                 confidence=0.0,
+            )
+            log_instrument_report(
+                symbol=symbol,
+                signal_score=signal_score,
+                sentiment=s_result,
+                momentum_score=momentum_score,
+                mean_reversion_score=mean_reversion_score,
+                price_action_score=price_action_score,
+                env_mode=ENV_MODE,
             )
             return Signal(
                 symbol=symbol,
@@ -322,10 +329,20 @@ class SignalEngine:
                 price_action_score=price_action_score,
             )
 
-        # News -> sentiment (Suggestions 1, 2, 6 are enforced inside SentimentModule)
+        # News -> sentiment (cost controls 1, 2, 6 are enforced inside SentimentModule)
         news_items = self._get_news_items(symbol)
         s_result = self.sentiment.scorenewsitems(symbol, news_items)
-        log_sentiment_for_symbol(symbol, s_result, ENV_MODE)
+
+        # Single unified report — includes live sentiment + all four technical scores.
+        log_instrument_report(
+            symbol=symbol,
+            signal_score=signal_score,
+            sentiment=s_result,
+            momentum_score=momentum_score,
+            mean_reversion_score=mean_reversion_score,
+            price_action_score=price_action_score,
+            env_mode=ENV_MODE,
+        )
 
         return Signal(
             symbol=symbol,
