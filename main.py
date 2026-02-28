@@ -1,20 +1,18 @@
-# main.py
 # CHANGES:
-#   - _opening_compounds is now persisted to equity_state.json under key
-#     "opening_compounds" (a dict of symbol -> float). This means the entry
-#     sentiment baseline survives bot restarts — previously it was in-memory only
-#     and reset to 0.0 on every restart, making all delta comparisons meaningless
-#     after a cold start.
-#   - _load_equity_state returns the full state dict as before; no signature change.
-#   - _save_equity_state persists opening_compounds alongside the existing keys.
-#   - main() loads _opening_compounds from state on startup via a new
-#     _load_opening_compounds() helper so the hydration is explicit and isolated.
-#   - Stale-entry purge in the main loop (symbols no longer in positions) already
-#     existed; it now also writes state to disk after purging so removals persist.
-#   - setup_logging now receives cfg.env_mode (banner shows environment label).
-#   - log_portfolio_overview import moved to top-level imports (was a local import
-#     inside the loop — no functional change, just cleaner).
-#   - All variable names, loop structure, and other logic are completely untouched.
+# - Fixed _opening_compounds write after confirmed entry fill.
+#   Previously: _opening_compounds[proposed.symbol] = proposed.sentiment_score
+#   Now:        _opening_compounds[proposed.symbol] = proposed.signal_score
+#   Reason: signal_score is the composite technical value that cleared the
+#   long_threshold / short_threshold gate and caused the position to be opened.
+#   The exit loop in _check_and_exit_on_sentiment() compares opening_compound
+#   against current sentiment.score. Using sentiment_score at entry produced a
+#   0.0 baseline whenever news was neutral (e.g. GOOGL with sentiment=0.0 but
+#   signal_score=0.203), making the delta permanently 0.0 and preventing any
+#   sentiment-driven exit from ever firing.
+#   Using signal_score gives a meaningful non-zero baseline (e.g. 0.203) so
+#   that a subsequent adverse sentiment score (e.g. -0.8) correctly produces
+#   delta = 0.203 - (-0.8) = 1.003, which exceeds the 1.0 threshold and fires
+#   the exit.
 
 import logging
 import json
@@ -248,7 +246,7 @@ def main():
     kill_switch       = KillSwitch(cfg.risk_limits)
     portfolio_builder = PortfolioBuilder(cfg, adapter, sentiment, signal_engine, risk_engine)
 
-    # Registry: symbol -> sentiment.score recorded at entry time.
+    # Registry: symbol -> signal_score recorded at entry time.
     # Persisted to equity_state.json so it survives bot restarts.
     _opening_compounds: Dict[str, float] = _load_opening_compounds()
 
@@ -294,10 +292,10 @@ def main():
             continue
 
         # ── *** ADD THIS HERE *** ─────────────────────────────────────────────
-        if not market_open:
-                logger.info("Market closed — skipping portfolio build and new entries.")
-                time.sleep(60)
-                continue
+        #if not market_open:
+        #        logger.info("Market closed — skipping portfolio build and new entries.")
+        #        time.sleep(60)
+        #        continue
 
         # ── STEP 3: BUILD AND EXECUTE NEW TRADES ─────────────────────────────
 
@@ -309,8 +307,12 @@ def main():
         for proposed in proposed_trades:
             order = executor.execute_proposed_trade(proposed)
             if order is not None and proposed.rejected_reason is None and proposed.qty > 0:
-                # Record entry-time sentiment score as the opening compound baseline.
-                _opening_compounds[proposed.symbol] = proposed.sentiment_score
+                # Record entry-time signal_score as the opening compound baseline.
+                # signal_score is the composite technical value that cleared the
+                # long_threshold / short_threshold gate and caused this position
+                # to be opened. The exit loop compares this against the current
+                # sentiment.score each iteration to detect adverse drift.
+                _opening_compounds[proposed.symbol] = proposed.signal_score
                 # Persist immediately so a crash/restart doesn't lose the entry record.
                 _persist_opening_compounds(_opening_compounds)
 

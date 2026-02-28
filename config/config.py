@@ -1,3 +1,11 @@
+# CHANGES:
+# - SentimentConfig.exit_sentiment_delta_threshold changed from 0.7 to 1.0.
+#   Reason: the exit loop compares opening signal_score (typically in [0.2, 1.0])
+#   against current sentiment.score (in [-1, 1]). A threshold of 0.7 was too
+#   sensitive given signal_score values near the long_threshold (0.2) — any
+#   moderate adverse sentiment would fire immediately. 1.0 requires a full-unit
+#   shift, giving positions room to breathe through normal news noise.
+
 import os
 import yaml
 from pathlib import Path
@@ -34,7 +42,7 @@ class SentimentConfig:
     no_trade_negative_threshold: float = -0.4
     # --- Sentiment-exit thresholds ---
     # Minimum absolute shift in sentiment compound score required to trigger a forced exit.
-    exit_sentiment_delta_threshold: float = 0.7
+    exit_sentiment_delta_threshold: float = 1.0
     # Minimum model confidence in the *current* (adverse) sentiment reading before we act on it.
     exit_confidence_min: float = 0.5
 
