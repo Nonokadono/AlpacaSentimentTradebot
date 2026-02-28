@@ -1,22 +1,23 @@
 # CHANGES:
-# Change 3 — Sentiment-adjusted dynamic entry threshold:
-#   _decide_side_and_bands gains optional keyword argument symbol="" and computes
-#   long_th_adj / short_th_adj from the most recently cached sentiment score for
-#   the symbol. Gated behind TechnicalSignalConfig.enable_dynamic_threshold
-#   (default False) — when False, long_th_adj == long_th and short_th_adj ==
-#   short_th, preserving existing behaviour exactly.
-#   generate_signal_for_symbol() threads symbol through to the call site.
-#   No existing variable names renamed.
-# Improvement B — Asymmetric sentiment-adjusted entry thresholds:
-#   Replaced the old symmetric threshold formula (both long_th_adj and
-#   short_th_adj adjusted in the same direction) with asymmetric adjustment:
-#     long_th_adj  = long_th  * (1.0 - sentiment_th_scale * s_adj / 0.5)
-#     short_th_adj = short_th * (1.0 + sentiment_th_scale * s_adj / 0.5)
-#   short_th is negative, so (1.0 + ...) correctly raises the bar (makes it
-#   harder to short) when sentiment is positive and lowers it when negative.
-#   The sign logic is sound: positive s_adj shrinks long_th (easier to go long)
-#   and grows |short_th| (harder to short); negative s_adj does the opposite.
-#   enable_dynamic_threshold gates this; sentiment_th_scale controls the range.
+# Fix M1 — _compute_simple_momentum_raw(): replaced raw 10-bar return with an
+#   EMA-8 vs EMA-21 crossover signal.  Method name and signature unchanged.
+#   EMA seeded with simple average of first period bars; standard recursive
+#   formula ema[i] = price[i]*k + ema[i-1]*(1-k) where k=2/(period+1).
+#   Returns 0.0 if fewer than 22 bars are available.
+#   Output normalised: (ema_fast - ema_slow) / ema_slow, then divided by
+#   momentum_norm_scale and clamped to [-1, 1].  Pure Python — no numpy/pandas.
+# Fix M2 — _compute_volatility(): replaced population variance (/ n) with
+#   sample variance (/ (n-1), Bessel's correction).  Added guard: if
+#   len(returns) < 2, return 0.01 default.
+# Fix M3 — _compute_price_action_score(): added market-status check at the top.
+#   Calls self.adapter.get_market_open(). Returns 0.0 immediately when the
+#   market is closed, preventing the permanent -1.0 artifact outside RTH.
+#   SignalEngine already holds self.adapter so no injection is needed.
+# Fix L3 — _combine_technical_scores(): replaced getattr fallback for
+#   conflict_dampener_penalty with direct attribute access
+#   self.technicalcfg.conflict_dampener_penalty (now an explicit field in
+#   TechnicalSignalConfig — see config/config.py Fix L3).
+# All prior changes (Change 3, Improvement B, Wilder's RSI) are preserved.
 
 from __future__ import annotations
 
@@ -74,19 +75,43 @@ class SignalEngine:
 
     def _compute_simple_momentum_raw(self, bars: List) -> float:
         """
-        Simple momentum: (Current Close - Close N bars ago) / Close N bars ago
+        EMA-8 vs EMA-21 crossover signal, normalised to [-1, 1].
+
+        Fix M1: replaced the raw 10-bar return with a fast/slow EMA crossover.
+        - Requires at least 22 bars; returns 0.0 if fewer are available.
+        - EMA seeded with simple average of first `period` closes.
+        - Recursive formula: ema = price * k + ema_prev * (1 - k), k = 2/(period+1).
+        - Signal = (ema_fast - ema_slow) / ema_slow, then / momentum_norm_scale, clamped.
+        Method name and signature are unchanged.
         """
-        if not bars or len(bars) < 10:
+        fast_period = 8
+        slow_period = 21
+        min_bars = slow_period + 1  # need at least 22 closes
+
+        if not bars or len(bars) < min_bars:
             return 0.0
 
-        # fallback if not enough bars for full lookback, just use what we have
-        lookback = min(len(bars) - 1, 10)
-        current = bars[-1].c
-        past = bars[-1 - lookback].c
+        closes = [b.c for b in bars]
 
-        if past == 0:
+        k_fast = 2.0 / (fast_period + 1)
+        k_slow = 2.0 / (slow_period + 1)
+
+        # Seed fast EMA with SMA of first fast_period bars
+        ema_fast = sum(closes[:fast_period]) / fast_period
+        for price in closes[fast_period:]:
+            ema_fast = price * k_fast + ema_fast * (1.0 - k_fast)
+
+        # Seed slow EMA with SMA of first slow_period bars
+        ema_slow = sum(closes[:slow_period]) / slow_period
+        for price in closes[slow_period:]:
+            ema_slow = price * k_slow + ema_slow * (1.0 - k_slow)
+
+        if ema_slow == 0.0:
             return 0.0
-        return (current - past) / past
+
+        raw_crossover = (ema_fast - ema_slow) / ema_slow
+        norm = raw_crossover / self.technicalcfg.momentum_norm_scale
+        return max(-1.0, min(1.0, norm))
 
     def _compute_trend_signal_raw(self, bars: List) -> float:
         """
@@ -111,7 +136,10 @@ class SignalEngine:
     def _compute_volatility(self, bars: List) -> float:
         """
         ATR-like proxy or simple std dev of last N closes.
-        Let's use a percentage volatility proxy: Stdev(returns) * sqrt(bars)
+        Uses percentage volatility proxy: Stdev(returns) with Bessel's correction.
+
+        Fix M2: replaced population variance (/ n) with sample variance (/ (n-1)).
+        Added guard: if len(returns) < 2, return 0.01 default.
         """
         if len(bars) < 5:
             return 0.01  # fallback
@@ -122,15 +150,17 @@ class SignalEngine:
             r = (closes[i] - closes[i-1]) / closes[i-1]
             returns.append(r)
 
-        if not returns:
+        # Fix M2: guard for insufficient data
+        if len(returns) < 2:
             return 0.01
 
         mean_ret = sum(returns) / len(returns)
         sq_diffs = [(r - mean_ret)**2 for r in returns]
-        variance = sum(sq_diffs) / len(returns)
+        # Fix M2: Bessel's correction — divide by (n-1) not n
+        variance = sum(sq_diffs) / (len(returns) - 1)
         std_dev = math.sqrt(variance)
 
-        # Annualized-ish or per-bar? Just use per-bar std dev as vol proxy
+        # Per-bar std dev as vol proxy
         return std_dev
 
     def _compute_rsi(self, bars: List, period: int = 14) -> float:
@@ -225,7 +255,16 @@ class SignalEngine:
         Simple breakout detection:
         If current price > highest of last N bars -> +1 (Breakout)
         If current price < lowest of last N bars -> -1 (Breakdown)
+
+        Fix M3: returns 0.0 immediately when the market is closed to prevent
+        the permanent -1.0 artifact that appears outside regular trading hours
+        (when the current bar's price equals the most recent close and sits
+        below the historical high of the lookback window).
         """
+        # Fix M3: suppress price action score when market is closed.
+        if not self.adapter.get_market_open():
+            return 0.0
+
         if len(bars) < self.technicalcfg.breakout_lookback_bars:
             return 0.0
 
@@ -278,7 +317,8 @@ class SignalEngine:
         # Apply dampener only when momentum and mean-reversion actively conflict.
         dampened = False
         if mom * mr < 0:
-            penalty = float(getattr(self.technicalcfg, "conflict_dampener_penalty", 0.6))
+            # Fix L3: direct attribute access — field is now explicit in TechnicalSignalConfig.
+            penalty = float(self.technicalcfg.conflict_dampener_penalty)
             raw = raw * penalty
             dampened = True
 

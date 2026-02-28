@@ -1,4 +1,15 @@
-# core/portfolio_builder.py
+# CHANGES:
+# Fix C4 — Enforce max_positions_per_sector in build_portfolio() selection loop.
+#   sector_counts: Dict[str, int] is initialised to {} before the for t in
+#   feasible loop.  Before appending t to selected, the symbol's sector is
+#   looked up from self.cfg.instruments (defaulting to "UNKNOWN" if missing).
+#   If sector_counts.get(sector, 0) >= self.cfg.portfolio.max_positions_per_sector,
+#   the candidate is skipped via continue.  Otherwise sector_counts[sector] is
+#   incremented.  No variable renames.
+# Fix H4 — Added volatility=sig.volatility as a named keyword argument to the
+#   self.risk_engine.pre_trade_checks() call in _build_candidate_for_symbol().
+#   Previously this was omitted, so the Kelly path always received volatility=0.0
+#   (the default), making the adaptive vol_norm history useless for new trades.
 
 from typing import Dict, List, Any
 
@@ -41,7 +52,7 @@ class PortfolioBuilder:
         positions: Dict[str, PositionInfo],
         pending_symbols: set,
     ) -> ProposedTrade:
-        
+
         # --- DUPLICATE-ORDER & NO EQUITY GUARD ---
         # If we already hold a position in this symbol, skip immediately (no AI API calls).
         if symbol in positions:
@@ -60,7 +71,7 @@ class PortfolioBuilder:
                 rationale="Position already open for this symbol",
                 rejected_reason="Position already open; skipping to prevent duplicate order and save API calls",
             )
-            
+
         # If an order is already pending, skip immediately (no AI API calls).
         if symbol in pending_symbols:
             return ProposedTrade(
@@ -112,6 +123,7 @@ class PortfolioBuilder:
             sentiment=sig.sentiment_result,
             signal_score=sig.signal_score,
             rationale=sig.rationale,
+            volatility=sig.volatility,  # Fix H4: was previously omitted
         )
         return proposed
 
@@ -121,7 +133,7 @@ class PortfolioBuilder:
         positions: Dict[str, PositionInfo],
         open_orders: List[Any],
     ) -> List[ProposedTrade]:
-        
+
         # Defense-in-depth: if fully allocated globally, skip all portfolio generation.
         exposure_cap_notional = snapshot.equity * self.cfg.risk_limits.gross_exposure_cap_pct
         if snapshot.gross_exposure >= exposure_cap_notional or len(positions) >= self.cfg.risk_limits.max_open_positions:
@@ -150,6 +162,8 @@ class PortfolioBuilder:
         selected: List[ProposedTrade] = []
         current_gross = snapshot.gross_exposure
         current_open_positions = len(positions)
+        # Fix C4: per-sector position counter initialised before the loop.
+        sector_counts: Dict[str, int] = {}
 
         for t in feasible:
             # Secondary guard (defensive): never select a symbol already in positions.
@@ -167,10 +181,18 @@ class PortfolioBuilder:
             if projected_positions > self.cfg.risk_limits.max_open_positions:
                 continue
 
+            # Fix C4: enforce max_positions_per_sector.
+            meta = self.cfg.instruments.get(t.symbol)
+            sector = meta.sector if meta is not None else "UNKNOWN"
+            if sector_counts.get(sector, 0) >= self.cfg.portfolio.max_positions_per_sector:
+                continue
+
             selected.append(t)
             current_gross = projected_gross
             if new_symbol:
                 current_open_positions = projected_positions
+            # Fix C4: increment sector counter after selection.
+            sector_counts[sector] = sector_counts.get(sector, 0) + 1
 
         if not selected:
             return []
@@ -179,4 +201,3 @@ class PortfolioBuilder:
             selected = self.veto.apply_veto(selected)
 
         return selected
-

@@ -1,20 +1,25 @@
 # CHANGES:
-# - Added force_rescore(symbol, newsitems) method (existing).
-# Change 5 — Add adaptive_rescore_interval(max_abs_s: float) -> int method to
-#   SentimentModule. Returns a sleep duration in seconds based on the highest
-#   absolute sentiment score across open positions.
-# Change 6 — _map_discrete_to_score: explicit unconditional -1.0 return for
-#   s_disc == -2, removing silent reliance on clamping and preserving full
-#   resolution for the disc=-1 arm. No variable renames.
+# Fix C2 — _map_discrete_to_score() now applies confidence_gamma from
+#   SentimentConfig.  The formula changes from base * confidence (linear) to
+#   base * (confidence ** gamma) where gamma = clamp(self.cfg.confidence_gamma,
+#   1.0, 4.0).  The SentimentModule.__init__ now accepts an optional
+#   SentimentConfig parameter (cfg) with a default of None; when None a default
+#   SentimentConfig() is used.  The special case s_disc == -2 returning hard
+#   -1.0 is unchanged.  No variable renames.
+# Fix M6 — In _call_ai(), added the same int(round(float(...))) coercion to the
+#   raw sentiment value before the membership check, matching the fix applied in
+#   ai_client.py scorenews().
+# All prior changes (Change 5, Change 6) are preserved unchanged.
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from ai_client import NewsReasoner
+from config.config import SentimentConfig
 
 
 @dataclass
@@ -49,8 +54,12 @@ class SentimentModule:
           call the AI again for that symbol (even if new news arrives).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, cfg: Optional[SentimentConfig] = None) -> None:
         self.reasoner = NewsReasoner()
+        # Fix C2: store SentimentConfig so _map_discrete_to_score can read
+        # confidence_gamma.  Default to a fresh SentimentConfig() if not supplied
+        # so all existing call sites (which pass no argument) remain unchanged.
+        self.cfg: SentimentConfig = cfg if cfg is not None else SentimentConfig()
 
         ttl_min = int(os.getenv("SENTIMENT_CACHE_TTL_MIN", "30"))
         ttl_min = max(1, ttl_min)
@@ -78,12 +87,16 @@ class SentimentModule:
         """
         Map discrete sentiment {-2, -1, 0, 1} plus confidence into a continuous score in [-1, 1].
 
-        Change 6: s_disc == -2 now returns -1.0 explicitly and unconditionally.
+        Fix C2: applies confidence_gamma from SentimentConfig.
+          gamma = clamp(self.cfg.confidence_gamma, 1.0, 4.0)
+          score = base * (confidence ** gamma)
+        gamma=1.0 reproduces the previous linear behaviour.
+        gamma=2.0 (default) applies convex weighting: high-confidence scores are
+        amplified relative to low-confidence ones.
+
+        Change 6: s_disc == -2 returns -1.0 explicitly and unconditionally.
         Confidence is irrelevant for the chaos case — the score is used as a
-        sizing input and -1.0 is already the semantic floor. This removes the
-        silent dependency on clamping that previously made disc=-2 at any
-        confidence indistinguishable from disc=-1 at full confidence via
-        max(-1.0, min(1.0, -2.0 * 1.0)).
+        sizing input and -1.0 is already the semantic floor.
         """
         confidence = max(0.0, min(1.0, confidence))
 
@@ -99,7 +112,9 @@ class SentimentModule:
         else:
             base = 0.0
 
-        return max(-1.0, min(1.0, base * confidence))
+        # Fix C2: power-law confidence weighting.
+        gamma = max(1.0, min(4.0, float(self.cfg.confidence_gamma)))
+        return max(-1.0, min(1.0, base * (confidence ** gamma)))
 
     def get_cached_sentiment(self, symbol: str) -> Optional[SentimentResult]:
         """
@@ -128,8 +143,9 @@ class SentimentModule:
         """
         res = self.reasoner.scorenews(symbol, newsitems)
 
+        # Fix M6: coerce raw sentiment to int before membership check.
         try:
-            sdisc = int(res.get("sentiment", 0))
+            sdisc = int(round(float(res.get("sentiment", 0))))
         except (TypeError, ValueError):
             sdisc = 0
         if sdisc not in (-2, -1, 0, 1):

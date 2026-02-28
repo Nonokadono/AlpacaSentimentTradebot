@@ -1,3 +1,12 @@
+# CHANGES:
+# Fix M6 — In scorenews(), added type-coercion for the sentiment field before
+#   the membership check.  After sentiment = result.get("sentiment", 0), we now
+#   apply: try: sentiment = int(round(float(sentiment))) except (TypeError,
+#   ValueError): sentiment = 0.  This handles model responses that return the
+#   value as a float string (e.g. "-1.0") or a bare float, which would
+#   previously fall through the `if sentiment not in (-2,-1,0,1)` guard and
+#   silently become 0.  No variable renames.
+
 # aiclient.py
 import json
 import os
@@ -126,6 +135,12 @@ class NewsReasoner:
                     }
 
             sentiment = result.get("sentiment", 0)
+            # Fix M6: coerce to int before membership check so float strings
+            # like "-1.0" or bare floats from the model are handled correctly.
+            try:
+                sentiment = int(round(float(sentiment)))
+            except (TypeError, ValueError):
+                sentiment = 0
             # Normalize sentiment to allowed set {-2, -1, 0, 1}
             if sentiment not in (-2, -1, 0, 1):
                 sentiment = 0
@@ -152,4 +167,3 @@ class NewsReasoner:
                 "confidence": 0.0,
                 "explanation": "Exception in sentiment analysis, treating as neutral.",
             }
-

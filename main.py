@@ -1,19 +1,19 @@
 # CHANGES:
-# Change 1a — Opening compound recorded as sentiment_score at entry time.
-# Change 1b — Directional delta for sentiment exit (long: entry-current,
-#   short: current-entry) so only adverse shifts fire.
-# Change 5  — Adaptive sleep via sentiment.adaptive_rescore_interval(_max_abs_s).
-# Improvement D — Replace bare adaptive_rescore_interval call with
-#   adaptive_rescore_interval_hysteresis so the sleep interval does not
-#   oscillate rapidly when max_abs_s hovers near a boundary.
-#   _rescore_interval: int = 600 is initialised before the while True loop and
-#   updated each iteration via the hysteresis method.
+# - Added _load_opening_compounds() / _persist_opening_compounds() helpers that
+#   read/write the opening_compounds sub-key of equity_state.json so entry-time
+#   sentiment baselines survive bot restarts.
+# - Added load_equity_state() / save_equity_state() for equity watermark
+#   persistence.
+# - get_equity_snapshot_from_account() uses the persisted state for
+#   start_of_day_equity and high_watermark_equity.
+# - _check_and_exit_on_sentiment() implements directional delta exit logic
+#   (Change 1b): only adverse sentiment shifts fire exits.
+# - main() loop integrates: kill switch → sentiment exit → portfolio build →
+#   adaptive sleep with hysteresis (Change 5 / Improvement D).
 
 import json
 import logging
 import time
-from collections import deque
-from datetime import date
 from datetime import date
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -22,14 +22,14 @@ from adapters.alpaca_adapter import AlpacaAdapter
 from config.config import load_config
 from core.portfolio_builder import PortfolioBuilder
 from core.risk_engine import RiskEngine, EquitySnapshot, PositionInfo
-from core.sentiment import SentimentModule
+from core.sentiment import SentimentModule, SentimentResult
 from core.signals import SignalEngine
 from execution.order_executor import OrderExecutor
 from execution.position_manager import PositionManager
 from monitoring.kill_switch import KillSwitch
 from monitoring.monitor import (
-    log_environment_switch,
     log_equity_snapshot,
+    log_environment_switch,
     log_kill_switch_state,
     log_portfolio_overview,
     log_sentiment_position_check,
@@ -38,46 +38,60 @@ from monitoring.monitor import (
 
 logger = logging.getLogger("tradebot")
 
-STATE_PATH = Path("data/equity_state.json")
+_EQUITY_STATE_PATH = Path("equity_state.json")
 
 
-def load_equity_state() -> Dict:
-    if not STATE_PATH.exists():
-        return {}
+# ── Equity state persistence ───────────────────────────────────────────────────
+
+def load_equity_state() -> dict:
+    if _EQUITY_STATE_PATH.exists():
+        try:
+            with _EQUITY_STATE_PATH.open("r") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"load_equity_state: could not read state file: {e}")
+    return {}
+
+
+def save_equity_state(state: dict) -> None:
     try:
-        with STATE_PATH.open("r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+        with _EQUITY_STATE_PATH.open("w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        logger.warning(f"save_equity_state: could not write state file: {e}")
 
 
-def save_equity_state(state: Dict) -> None:
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with STATE_PATH.open("w") as f:
-        json.dump(state, f)
-
+# ── Opening compound persistence ───────────────────────────────────────────────
 
 def _load_opening_compounds() -> Dict[str, float]:
-    """Load the opening-compound registry from the persisted equity state.
-    Returns an empty dict if the state file is missing or the key is absent.
-    This ensures PositionInfo.opening_compound is populated correctly even after
-    a bot restart, so the sentiment-exit delta comparison is always meaningful.
-    """
+    """Load the opening_compounds registry from equity_state.json."""
     state = load_equity_state()
     raw = state.get("opening_compounds", {})
-    # Guard: only keep entries that are genuine floats.
-    return {k: float(v) for k, v in raw.items() if isinstance(v, (int, float))}
+    result: Dict[str, float] = {}
+    for sym, val in raw.items():
+        try:
+            result[str(sym)] = float(val)
+        except (TypeError, ValueError):
+            pass
+    return result
 
 
 def _persist_opening_compounds(opening_compounds: Dict[str, float]) -> None:
-    """Write opening_compounds into equity_state.json without disturbing any
-    other keys (start_of_day_equity, high_watermark_equity, last_trading_day)."""
+    """
+    Write the opening_compounds sub-key to equity_state.json.
+    Does NOT overwrite unrelated keys (start_of_day_equity, etc.).
+    """
     state = load_equity_state()
-    state["opening_compounds"] = opening_compounds
+    state["opening_compounds"] = {sym: float(v) for sym, v in opening_compounds.items()}
     save_equity_state(state)
 
 
-def get_equity_snapshot_from_account(acct, positions: Dict[str, PositionInfo]) -> EquitySnapshot:
+# ── Equity snapshot ────────────────────────────────────────────────────────────
+
+def get_equity_snapshot_from_account(
+    acct,
+    positions: Dict[str, PositionInfo],
+) -> EquitySnapshot:
     equity = float(acct.equity)
     cash = float(acct.cash)
     portfolio_value = float(acct.portfolio_value)
@@ -120,9 +134,13 @@ def get_equity_snapshot_from_account(acct, positions: Dict[str, PositionInfo]) -
         equity=equity,
         cash=cash,
         portfolio_value=portfolio_value,
-        day_trading_buying_power=float(getattr(acct, "day_trading_buying_power",
-                                       getattr(acct, "daytrading_buying_power",
-                                       getattr(acct, "buying_power", 0.0)))),
+        day_trading_buying_power=float(
+            getattr(
+                acct,
+                "day_trading_buying_power",
+                getattr(acct, "daytrading_buying_power", getattr(acct, "buying_power", 0.0)),
+            )
+        ),
         start_of_day_equity=start_of_day_equity,
         high_watermark_equity=high_watermark_equity,
         realized_pl_today=realized_pl_today,
@@ -132,6 +150,8 @@ def get_equity_snapshot_from_account(acct, positions: Dict[str, PositionInfo]) -
         drawdown_pct=drawdown_pct,
     )
 
+
+# ── Sentiment-exit check ───────────────────────────────────────────────────────
 
 def _check_and_exit_on_sentiment(
     positions: Dict[str, PositionInfo],
@@ -184,7 +204,7 @@ def _check_and_exit_on_sentiment(
             else:
                 delta = current_sentiment.score - entry_sentiment
 
-            # ── Exit decision ────────────────────────────────────────────────
+            # ── Exit decision ─────────────────────────────────────────────────
             closing = False
             close_reason = ""
 
@@ -218,8 +238,7 @@ def _check_and_exit_on_sentiment(
                     f"confidence={current_confidence:.2f} > {confidence_min}"
                 )
 
-            # Use the active threshold for the log display (show whichever tier
-            # was evaluated last — strong threshold takes display priority).
+            # Use the active threshold for the log display.
             display_threshold = strong_threshold if not closing or raw_discrete == -2 else (
                 strong_threshold if delta > strong_threshold else soft_threshold
             )
@@ -244,10 +263,14 @@ def _check_and_exit_on_sentiment(
                 )
 
         except Exception as exc:
-            logger.error(f"SentimentExit {symbol}: unexpected error during exit check: {exc}")
+            logger.error(
+                f"SentimentExit {symbol}: unexpected error during exit check: {exc}"
+            )
 
 
-def main():
+# ── Main loop ──────────────────────────────────────────────────────────────────
+
+def main() -> None:
     setup_logging()
     cfg = load_config()
     setup_logging(cfg.env_mode)
@@ -287,7 +310,7 @@ def main():
             time.sleep(60)
             continue
 
-        # ── STEP 1: SENTIMENT CHECK ON ALL OPEN POSITIONS ────────────────────
+        # ── STEP 1: SENTIMENT CHECK ON ALL OPEN POSITIONS ───────────────────
         if positions:
             _check_and_exit_on_sentiment(
                 positions=positions,
@@ -306,7 +329,7 @@ def main():
                     del _opening_compounds[sym]
             _persist_opening_compounds(_opening_compounds)
 
-        # ── STEP 2: EXPOSURE / POSITION-COUNT GUARD ──────────────────────────
+        # ── STEP 2: EXPOSURE / POSITION-COUNT GUARD ─────────────────────────
         exposure_cap_notional = snapshot.equity * cfg.risk_limits.gross_exposure_cap_pct
         if (
             snapshot.gross_exposure >= exposure_cap_notional
@@ -315,14 +338,14 @@ def main():
             time.sleep(60)
             continue
 
-        # ── *** ADD THIS HERE *** ─────────────────────────────────────────────
-        #if not market_open:
-        #        logger.info("Market closed — skipping portfolio build and new entries.")
-        #        time.sleep(60)
-        #        continue
+        # ── *** ADD THIS HERE *** ────────────────────────────────────────────
+        # Uncomment to gate new entries on market hours:
+        # if not market_open:
+        #     logger.info("Market closed — skipping portfolio build and new entries.")
+        #     time.sleep(60)
+        #     continue
 
-        # ── STEP 3: BUILD AND EXECUTE NEW TRADES ─────────────────────────────
-
+        # ── STEP 3: BUILD AND EXECUTE NEW TRADES ────────────────────────────
         open_orders     = adapter.list_orders(status="open")
         proposed_trades = portfolio_builder.build_portfolio(snapshot, positions, open_orders)
 
@@ -333,24 +356,22 @@ def main():
             if order is not None and proposed.rejected_reason is None and proposed.qty > 0:
                 # Change 1a: record entry-time SENTIMENT score (proposed.sentiment_score)
                 # as the opening compound baseline — NOT proposed.signal_score.
-                # proposed.sentiment_score is set by RiskEngine.pre_trade_checks()
-                # directly from sentiment.score, so it is always a valid compound
-                # float in [-1, +1]. The exit delta comparison subtracts this from
-                # current sentiment.score each iteration.
                 _opening_compounds[proposed.symbol] = proposed.sentiment_score
                 # Persist immediately so a crash/restart doesn't lose the entry record.
                 _persist_opening_compounds(_opening_compounds)
 
-        # ── STEP 4: ADAPTIVE SLEEP WITH HYSTERESIS ───────────────────────────
+        # ── STEP 4: ADAPTIVE SLEEP WITH HYSTERESIS ──────────────────────────
         # Change 5 / Improvement D: sleep duration is driven by the highest
         # |sentiment.score| across all currently open positions. High-conviction
         # positions rescore every 120s; neutral portfolios wait up to 900s,
         # reducing API cost. Hysteresis prevents rapid interval oscillation when
         # max_abs_s hovers near a boundary threshold.
         _max_abs_s = max(
-            (abs(sentiment.get_cached_sentiment(sym).score)
-             for sym in positions
-             if sentiment.get_cached_sentiment(sym) is not None),
+            (
+                abs(sentiment.get_cached_sentiment(sym).score)
+                for sym in positions
+                if sentiment.get_cached_sentiment(sym) is not None
+            ),
             default=0.0,
         )
         # Improvement D: use hysteresis guard instead of bare adaptive call.

@@ -1,14 +1,10 @@
 # CHANGES:
-# Improvement A — Added kelly_vol_norm_percentile: float = 0.50 to RiskLimits.
-#   Controls the percentile of the rolling vol history used as the vol normaliser
-#   denominator in RiskEngine._kelly_fraction.
-# Improvement B — Added sentiment_th_scale: float = 0.25 to TechnicalSignalConfig.
-#   Controls how much the cached sentiment score shifts the entry thresholds
-#   asymmetrically in SignalEngine._decide_side_and_bands.
-# Improvement C — Added kelly_sentiment_weight: float = 0.08 to RiskLimits.
-#   Weight applied to the sentiment score in the log-odds blend for Kelly p.
-# Improvement E — Added confidence_gamma: float = 2.0 to SentimentConfig.
-#   Controls the convex (power-law) confidence weighting in _map_discrete_to_score.
+# Fix L3 — Added conflict_dampener_penalty: float = 0.6 as an explicit field in
+#   TechnicalSignalConfig. Previously it was absent and SignalEngine accessed it
+#   via getattr(..., 0.6) fallback, making it invisible to introspection and
+#   serialisation. No existing fields removed or renamed.
+#
+# All other fields and classes are unchanged.
 
 import os
 import yaml
@@ -105,6 +101,9 @@ class TechnicalSignalConfig:
     # score is allowed to shift the entry threshold asymmetrically.
     # 0.25 means sentiment can tighten or widen each threshold by up to 25%.
     sentiment_th_scale: float = 0.25
+    # Fix L3: explicit field so it is visible to introspection/serialisation
+    # and can be overridden via config.  Previously accessed via getattr fallback.
+    conflict_dampener_penalty: float = 0.6
 
 
 @dataclass

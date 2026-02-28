@@ -1,23 +1,14 @@
 # CHANGES:
-# Change 2 — Kelly volfactor constant: 0.005 → 0.002 so that typical intraday
-#   per-bar volatility (0.001–0.003) produces a vol_penalty in a useful range
-#   rather than squashing kelly to near-zero.
-# Change 4 — Separate technical p from sentiment p in kelly_fraction: add
-#   optional parameter s: float = 0.0 (raw sentiment score in [-1,+1]). p is
-#   now computed as 0.5 + 0.15*tech_conviction + 0.05*s, separating the two
-#   signals. b uses only tech_conviction. The old conviction variable is removed
-#   from kelly_fraction; s_scale is kept as a parameter for backward compat but
-#   used only in the fixed-fractional path. Call site in pre_trade_checks passes
-#   s=sentiment.score. No renames.
-# Improvement A — Adaptive Kelly vol normalisation: self._vol_history (deque,
-#   maxlen=200) accumulates per-call volatility values. Once 20+ samples exist,
-#   the kelly_vol_norm_percentile-th percentile of the history is used as
-#   vol_norm (denominator) instead of the fixed 0.002 constant. This makes the
-#   vol penalty self-calibrate to the instrument's recent volatility regime.
-# Improvement C — Log-odds sentiment blending for Kelly p: replaced the additive
-#   p formula with a log-odds blend. p_tech is derived from tech_conviction;
-#   the log-odds are shifted by kelly_sentiment_weight * clamp(s, -1, 1); the
-#   result is squashed back to probability space and clamped to [0.35, 0.75].
+# Fix M5 — In pre_trade_checks(), after computing kelly_f via _kelly_fraction(),
+#   multiply the result by s_scale before computing raw_risk_pct:
+#   kelly_f = kelly_f * s_scale.  This ensures a neutral-sentiment trade
+#   (s_scale ≈ 1.0) is unaffected, a high-confidence positive trade
+#   (s_scale = 1.3) receives proportionally larger sizing, and a no-trade
+#   negative threshold (s_scale = 0.0) zeroes out Kelly sizing without relying
+#   on the upstream s_scale == 0.0 guard alone.  No variable renames.
+#
+# All prior changes (Change 2, Change 4, Improvement A, Improvement C) are
+# preserved unchanged.
 
 import math
 from collections import deque
@@ -248,6 +239,9 @@ class RiskEngine:
             # from sentiment and apply log-odds blending.
             kelly_f = self._kelly_fraction(signal_score, s_scale, volatility,
                                            s=sentiment.score)
+            # Fix M5: apply s_scale as a multiplier so sentiment strength
+            # differentiates sizing within the Kelly path.
+            kelly_f = kelly_f * s_scale
             raw_risk_pct = kelly_f * self.limits.max_risk_per_trade_pct
             risk_pct = min(
                 self.limits.max_risk_per_trade_pct,
