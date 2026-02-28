@@ -1,11 +1,3 @@
-# CHANGES:
-# - SentimentConfig.exit_sentiment_delta_threshold changed from 0.7 to 1.0.
-#   Reason: the exit loop compares opening signal_score (typically in [0.2, 1.0])
-#   against current sentiment.score (in [-1, 1]). A threshold of 0.7 was too
-#   sensitive given signal_score values near the long_threshold (0.2) — any
-#   moderate adverse sentiment would fire immediately. 1.0 requires a full-unit
-#   shift, giving positions room to breathe through normal news noise.
-
 import os
 import yaml
 from pathlib import Path
@@ -28,10 +20,11 @@ class RiskLimits:
     daily_loss_limit_pct: float = 0.04       # 4% of start-of-day equity
     max_drawdown_pct: float = 0.09           # 9% from high watermark
     max_open_positions: int = 15
-    # Fix 1: gate for Half-Kelly position sizing in RiskEngine.
-    # False (default) → existing fixed-fractional sizing path unchanged.
-    # Set True only after back-testing the Kelly calibration.
-    enable_kelly_sizing: bool = False
+    # Task 4: Half-Kelly position sizing is now the VALIDATED DEFAULT.
+    # Set to False ONLY for emergency rollback to fixed-fractional sizing.
+    # Override via environment config or load_config() — do not change this line
+    # without re-running the Kelly calibration tests.
+    enable_kelly_sizing: bool = True
 
 
 @dataclass
@@ -41,10 +34,28 @@ class SentimentConfig:
     max_scale: float = 1.3
     no_trade_negative_threshold: float = -0.4
     # --- Sentiment-exit thresholds ---
-    # Minimum absolute shift in sentiment compound score required to trigger a forced exit.
-    exit_sentiment_delta_threshold: float = 1.0
-    # Minimum model confidence in the *current* (adverse) sentiment reading before we act on it.
+    # Hard exit: raw_discrete == -2 → always close, no delta check (unchanged).
+    #
+    # Soft exit: fires when delta > soft_exit_delta_threshold AND
+    #            confidence > exit_confidence_min.
+    #            Catches partial deterioration (e.g. +0.7 → 0.0, delta=0.70).
+    soft_exit_delta_threshold: float = 0.6
+    #
+    # Strong exit: fires when delta > strong_exit_delta_threshold AND
+    #              confidence > strong_exit_confidence_min.
+    #              Lower confidence bar because a large delta is self-confirming.
+    strong_exit_delta_threshold: float = 1.0
+    strong_exit_confidence_min: float = 0.4
+    #
+    # Minimum model confidence for the soft exit tier.
     exit_confidence_min: float = 0.5
+    #
+    # Legacy alias kept for any downstream code that reads this field directly.
+    # Points at the strong threshold so behaviour is unchanged if old code path
+    # is ever re-activated.  Do not remove.
+    @property
+    def exit_sentiment_delta_threshold(self) -> float:
+        return self.strong_exit_delta_threshold
 
 
 @dataclass

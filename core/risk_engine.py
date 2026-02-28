@@ -62,13 +62,38 @@ class RiskEngine:
         self.instrument_meta = instrument_meta
 
     def sentiment_scale(self, s: float) -> float:
-        if s < self.sentiment_cfg.no_trade_negative_threshold:
+        """
+        Continuous piecewise-linear sentiment scale with no discontinuities.
+
+        Regions:
+          s < no_trade_negative_threshold         → 0.0  (hard block)
+          no_trade_negative_threshold <= s <= 0   → linear 0.0 → min_scale
+          0 < s <= 1                               → linear min_scale → max_scale
+
+        Key invariants:
+          sentiment_scale(0.0)  == min_scale  (no signal → minimum sizing)
+          sentiment_scale(+1.0) == max_scale  (maximum conviction → max sizing)
+          sentiment_scale(no_trade_negative_threshold) == 0.0  (boundary is zero)
+          No jump at any point in [-1, +1].
+
+        The neutral_band config field is preserved for backward compatibility
+        but is no longer used in this calculation.
+        """
+        no_trade_neg = self.sentiment_cfg.no_trade_negative_threshold
+        min_sc = self.sentiment_cfg.min_scale
+        max_sc = self.sentiment_cfg.max_scale
+
+        if s < no_trade_neg:
             return 0.0
-        if abs(s) <= self.sentiment_cfg.neutral_band:
-            return 1.0
-        span = self.sentiment_cfg.max_scale - self.sentiment_cfg.min_scale
-        scaled = self.sentiment_cfg.min_scale + (s + 1) / 2 * span
-        return max(self.sentiment_cfg.min_scale, min(self.sentiment_cfg.max_scale, scaled))
+
+        if s <= 0.0:
+            # Linear ramp: 0.0 at no_trade_neg → min_scale at s=0
+            band_width = 0.0 - no_trade_neg  # positive (e.g. 0.4)
+            return min_sc * (s - no_trade_neg) / band_width
+
+        # s > 0: linear ramp from min_scale at 0 to max_scale at +1
+        span = max_sc - min_sc
+        return min(max_sc, min_sc + span * s)
 
     # ── Feature 3: Half-Kelly helper ──────────────────────────────────────────
 
