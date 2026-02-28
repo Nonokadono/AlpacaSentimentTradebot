@@ -1,32 +1,49 @@
-import logging
+# CHANGES:
+# Change 1a — Fix opening_compounds semantic error: store proposed.sentiment_score
+#   (the compound sentiment float) instead of proposed.signal_score (the technical
+#   composite) after a confirmed entry fill. The exit delta check subtracts this
+#   value from current sentiment.score, so storing a technical score here produced
+#   a semantically invalid cross-space delta.
+# Change 1b — Directional delta in _check_and_exit_on_sentiment:
+#   LONG  position: delta = entry_sentiment - current_sentiment.score
+#                   (fires when sentiment has deteriorated since entry)
+#   SHORT position: delta = current_sentiment.score - entry_sentiment
+#                   (fires when sentiment has improved against the short)
+#   All existing variable names preserved: entry_sentiment, delta,
+#   soft_exit_delta_threshold, strong_exit_delta_threshold,
+#   strong_exit_confidence_min, exit_confidence_min.
+# Change 5 — Replace hardcoded time.sleep(600) with adaptive_rescore_interval()
+#   driven by the highest |sentiment.score| across open positions. Falls back to
+#   900s (neutral band) when no cached sentiment is available.
+
 import json
-from pathlib import Path
-from datetime import datetime, date
+import logging
 import time
+from datetime import date
 from typing import Dict
 
-from config.config import load_config
 from adapters.alpaca_adapter import AlpacaAdapter
+from config.config import load_config
+from core.portfolio_builder import PortfolioBuilder
+from core.risk_engine import RiskEngine, EquitySnapshot, PositionInfo
 from core.sentiment import SentimentModule
 from core.signals import SignalEngine
-from core.risk_engine import RiskEngine, EquitySnapshot, PositionInfo
-from core.portfolio_builder import PortfolioBuilder
-from execution.position_manager import PositionManager
 from execution.order_executor import OrderExecutor
-from monitoring.monitor import (
-    setup_logging,
-    log_equity_snapshot,
-    log_environment_switch,
-    log_kill_switch_state,
-    log_sentiment_for_symbol,
-    log_sentiment_position_check,
-    log_portfolio_overview,
-)
+from execution.position_manager import PositionManager
 from monitoring.kill_switch import KillSwitch
+from monitoring.monitor import (
+    log_environment_switch,
+    log_equity_snapshot,
+    log_kill_switch_state,
+    log_portfolio_overview,
+    log_sentiment_position_check,
+    setup_logging,
+)
+from pathlib import Path
 
 logger = logging.getLogger("tradebot")
 
-STATE_PATH = Path("data/equity_state.json")
+STATE_PATH = Path("equity_state.json")
 
 
 def load_equity_state() -> Dict:
@@ -108,7 +125,9 @@ def get_equity_snapshot_from_account(acct, positions: Dict[str, PositionInfo]) -
         equity=equity,
         cash=cash,
         portfolio_value=portfolio_value,
-        day_trading_buying_power=float(getattr(acct, "day_trading_buying_power",getattr(acct, "daytrading_buying_power",getattr(acct, "buying_power", 0.0)))),
+        day_trading_buying_power=float(getattr(acct, "day_trading_buying_power",
+                                       getattr(acct, "daytrading_buying_power",
+                                       getattr(acct, "buying_power", 0.0)))),
         start_of_day_equity=start_of_day_equity,
         high_watermark_equity=high_watermark_equity,
         realized_pl_today=realized_pl_today,
@@ -140,6 +159,13 @@ def _check_and_exit_on_sentiment(
     which main patches in from _opening_compounds after each entry fill.
     This survives TTL expiry and bot restarts because opening_compounds is
     persisted to equity_state.json.
+
+    Change 1b: delta is now directional so only adverse sentiment shifts fire:
+      LONG  position: delta = entry_sentiment - current_sentiment.score
+                      A positive delta means sentiment has dropped since entry.
+      SHORT position: delta = current_sentiment.score - entry_sentiment
+                      A positive delta means sentiment has risen against the short.
+    Absolute threshold comparisons are applied to this signed directional value.
     """
     soft_threshold = cfg.sentiment.soft_exit_delta_threshold
     strong_threshold = cfg.sentiment.strong_exit_delta_threshold
@@ -148,16 +174,20 @@ def _check_and_exit_on_sentiment(
 
     for symbol, position in list(positions.items()):
         try:
-            entry_compound = float(position.opening_compound)
+            entry_sentiment = float(position.opening_compound)
 
             # Always fetch fresh news and force a real AI rescore.
             news_items = adapter.get_news(symbol, limit=10)
             current_sentiment = sentiment_module.force_rescore(symbol, news_items)
-            current_compound = float(current_sentiment.score)
             current_confidence = float(current_sentiment.confidence)
             raw_discrete = int(current_sentiment.raw_discrete)
 
-            delta = abs(entry_compound - current_compound)
+            # Change 1b: directional delta — only adverse shifts produce a
+            # positive delta that can breach the exit thresholds.
+            if position.side == "long":
+                delta = entry_sentiment - current_sentiment.score
+            else:
+                delta = current_sentiment.score - entry_sentiment
 
             # ── Exit decision ────────────────────────────────────────────────
             closing = False
@@ -177,7 +207,7 @@ def _check_and_exit_on_sentiment(
                 close_reason = (
                     f"STRONG sentiment exit: "
                     f"Δ={delta:+.3f} > {strong_threshold} "
-                    f"(entry={entry_compound:.3f} → current={current_compound:.3f}) "
+                    f"(entry={entry_sentiment:.3f} → current={current_sentiment.score:.3f}) "
                     f"against {position.side} position; "
                     f"confidence={current_confidence:.2f} > {strong_confidence_min}"
                 )
@@ -188,7 +218,7 @@ def _check_and_exit_on_sentiment(
                 close_reason = (
                     f"SOFT sentiment exit: "
                     f"Δ={delta:+.3f} > {soft_threshold} "
-                    f"(entry={entry_compound:.3f} → current={current_compound:.3f}) "
+                    f"(entry={entry_sentiment:.3f} → current={current_sentiment.score:.3f}) "
                     f"against {position.side} position; "
                     f"confidence={current_confidence:.2f} > {confidence_min}"
                 )
@@ -201,7 +231,7 @@ def _check_and_exit_on_sentiment(
 
             log_sentiment_position_check(
                 position=position,
-                entry_compound=entry_compound,
+                entry_compound=entry_sentiment,
                 current_sentiment=current_sentiment,
                 delta=delta,
                 delta_threshold=display_threshold,
@@ -237,14 +267,18 @@ def main():
     kill_switch       = KillSwitch(cfg.risk_limits)
     portfolio_builder = PortfolioBuilder(cfg, adapter, sentiment, signal_engine, risk_engine)
 
-    # Registry: symbol -> signal_score recorded at entry time.
+    # Registry: symbol -> sentiment_score recorded at entry time.
+    # Change 1a: stores proposed.sentiment_score (compound sentiment float) —
+    # NOT proposed.signal_score (technical composite). The exit delta check
+    # subtracts this from current sentiment.score; mixing a technical score here
+    # produced a semantically invalid cross-space comparison.
     # Persisted to equity_state.json so it survives bot restarts.
     _opening_compounds: Dict[str, float] = _load_opening_compounds()
 
     while True:
-        acct      = adapter.get_account()
-        positions = pm.get_positions(opening_compounds=_opening_compounds)
-        snapshot  = get_equity_snapshot_from_account(acct, positions)
+        acct        = adapter.get_account()
+        positions   = pm.get_positions(opening_compounds=_opening_compounds)
+        snapshot    = get_equity_snapshot_from_account(acct, positions)
         market_open = adapter.get_market_open()
         log_equity_snapshot(snapshot, market_open=market_open)
 
@@ -298,16 +332,27 @@ def main():
         for proposed in proposed_trades:
             order = executor.execute_proposed_trade(proposed)
             if order is not None and proposed.rejected_reason is None and proposed.qty > 0:
-                # Record entry-time signal_score as the opening compound baseline.
-                # signal_score is the composite technical value that cleared the
-                # long_threshold / short_threshold gate and caused this position
-                # to be opened. The exit loop compares this against the current
-                # sentiment.score each iteration to detect adverse drift.
-                _opening_compounds[proposed.symbol] = proposed.signal_score
+                # Change 1a: record entry-time SENTIMENT score (proposed.sentiment_score)
+                # as the opening compound baseline — NOT proposed.signal_score.
+                # proposed.sentiment_score is set by RiskEngine.pre_trade_checks()
+                # directly from sentiment.score, so it is always a valid compound
+                # float in [-1, +1]. The exit delta comparison subtracts this from
+                # current sentiment.score each iteration.
+                _opening_compounds[proposed.symbol] = proposed.sentiment_score
                 # Persist immediately so a crash/restart doesn't lose the entry record.
                 _persist_opening_compounds(_opening_compounds)
 
-        time.sleep(600)
+        # ── STEP 4: ADAPTIVE SLEEP ────────────────────────────────────────────
+        # Change 5: sleep duration is driven by the highest |sentiment.score|
+        # across all currently open positions. High-conviction positions rescore
+        # every 120s; neutral portfolios wait up to 900s, reducing API cost.
+        _max_abs_s = max(
+            (abs(sentiment.get_cached_sentiment(sym).score)
+             for sym in positions
+             if sentiment.get_cached_sentiment(sym) is not None),
+            default=0.0,
+        )
+        time.sleep(sentiment.adaptive_rescore_interval(_max_abs_s))
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
 # CHANGES:
-#   - Added force_rescore(symbol, newsitems) method.
-#     This bypasses the TTL cache and chaos cooldown to always call the AI for
-#     open-position sentiment-exit checks. It still writes the result back to the
-#     cache so subsequent normal scoring benefits from it.
-#     The existing scorenewsitems(), get_cached_sentiment(), _neutral(),
-#     _map_discrete_to_score(), _get_last_known(), _set_last_known() methods are
-#     completely untouched. No field renames.
+# - Added force_rescore(symbol, newsitems) method (existing).
+# Change 5 — Add adaptive_rescore_interval(max_abs_s: float) -> int method to
+#   SentimentModule. Returns a sleep duration in seconds based on the highest
+#   absolute sentiment score across open positions.
+# Change 6 — _map_discrete_to_score: explicit unconditional -1.0 return for
+#   s_disc == -2, removing silent reliance on clamping and preserving full
+#   resolution for the disc=-1 arm. No variable renames.
 
 from __future__ import annotations
 
@@ -74,21 +74,27 @@ class SentimentModule:
             confidence=0.0,
         )
 
-    def _map_discrete_to_score(self, sdisc: int, confidence: float) -> float:
+    def _map_discrete_to_score(self, s_disc: int, confidence: float) -> float:
         """
         Map discrete sentiment {-2, -1, 0, 1} plus confidence into a continuous score in [-1, 1].
+
+        Change 6: s_disc == -2 now returns -1.0 explicitly and unconditionally.
+        Confidence is irrelevant for the chaos case — the score is used as a
+        sizing input and -1.0 is already the semantic floor. This removes the
+        silent dependency on clamping that previously made disc=-2 at any
+        confidence indistinguishable from disc=-1 at full confidence via
+        max(-1.0, min(1.0, -2.0 * 1.0)).
         """
         confidence = max(0.0, min(1.0, confidence))
 
-        if sdisc == -2:
-            # Hard floor at -1 to signal "utterly undesirable / unstable".
-            return -1.0
+        if s_disc == -2:
+            return -1.0          # chaos: always floor, confidence irrelevant
 
-        if sdisc == -1:
+        if s_disc == -1:
             base = -1.0
-        elif sdisc == 0:
+        elif s_disc == 0:
             base = 0.0
-        elif sdisc == 1:
+        elif s_disc == 1:
             base = 1.0
         else:
             base = 0.0
@@ -202,3 +208,21 @@ class SentimentModule:
             return self._neutral("No recent news for forced rescore.", ndocs=0)
 
         return self._call_ai(symbol, newsitems)
+
+    def adaptive_rescore_interval(self, max_abs_s: float) -> int:
+        """
+        Return a rescore sleep interval in seconds based on the highest
+        absolute sentiment score across open positions.
+        Thresholds:
+            |s| >= 0.8  -> 120s   (high conviction / high risk)
+            |s| >= 0.5  -> 300s   (strong signal)
+            |s| >= 0.2  -> 600s   (current default)
+            |s| <  0.2  -> 900s   (neutral band, minimal alpha)
+        """
+        if max_abs_s >= 0.8:
+            return 120
+        if max_abs_s >= 0.5:
+            return 300
+        if max_abs_s >= 0.2:
+            return 600
+        return 900

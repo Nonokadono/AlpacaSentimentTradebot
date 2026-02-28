@@ -1,3 +1,13 @@
+# CHANGES:
+# Change 3 — Sentiment-adjusted dynamic entry threshold:
+#   _decide_side_and_bands gains optional keyword argument symbol="" and computes
+#   long_th_adj / short_th_adj from the most recently cached sentiment score for
+#   the symbol. Gated behind TechnicalSignalConfig.enable_dynamic_threshold
+#   (default False) — when False, long_th_adj == long_th and short_th_adj ==
+#   short_th, preserving existing behaviour exactly.
+#   generate_signal_for_symbol() threads symbol through to the call site.
+#   No existing variable names renamed.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -241,7 +251,7 @@ class SignalEngine:
             already extended (momentum maxed) while mean-reversion pushes back.
             In that case the raw weighted sum is multiplied by
             `conflict_dampener_penalty` (default 0.6), reducing apparent
-            conviction by 40 %.
+            conviction by 40%.
 
             Same-sign or zero sub-signals (product >= 0) are NOT penalised —
             existing behaviour for clean / aligned setups is fully preserved.
@@ -264,14 +274,44 @@ class SignalEngine:
 
         return max(-1.0, min(1.0, raw)), dampened
 
-    def _decide_side_and_bands(self, last_price: float, volatility: float, signal_score: float) -> Tuple[str, float, float]:
+    def _decide_side_and_bands(
+        self,
+        last_price: float,
+        volatility: float,
+        signal_score: float,
+        symbol: str = "",
+    ) -> Tuple[str, float, float]:
+        """
+        Determine the trade side and compute stop/take-profit price bands.
+
+        Change 3: When TechnicalSignalConfig.enable_dynamic_threshold is True,
+        the raw long_th and short_th values are adjusted by the most recently
+        cached sentiment for `symbol` before the comparison against signal_score.
+        When enable_dynamic_threshold is False (the default), long_th_adj ==
+        long_th and short_th_adj == short_th, preserving existing behaviour
+        exactly.
+
+        The config object is NEVER mutated — adjustments are local variables only.
+        """
         long_th = float(self.technicalcfg.long_threshold)
         short_th = float(self.technicalcfg.short_threshold)
 
+        # Change 3: sentiment-adjusted thresholds (local only, config not mutated).
+        # When enable_dynamic_threshold is False (default), adj == raw threshold.
+        if getattr(self.technicalcfg, "enable_dynamic_threshold", False) and symbol:
+            cached_s_result = self.sentiment.get_cached_sentiment(symbol)
+            cached_s = cached_s_result.score if cached_s_result is not None else 0.0
+            s_adj = max(-0.5, min(0.5, cached_s))
+            long_th_adj  = long_th  * (1.0 - 0.35 * s_adj / 0.5)
+            short_th_adj = short_th * (1.0 - 0.35 * s_adj / 0.5)
+        else:
+            long_th_adj  = long_th
+            short_th_adj = short_th
+
         side = "skip"
-        if signal_score >= long_th:
+        if signal_score >= long_th_adj:
             side = "buy"
-        elif signal_score <= short_th:
+        elif signal_score <= short_th_adj:
             side = "sell"
 
         # Use price-based volatility proxy for bands.
@@ -281,7 +321,6 @@ class SignalEngine:
         stop_mult = float(self.technicalcfg.base_stop_vol_mult)
         tp_mult = float(self.technicalcfg.base_tp_vol_mult)
 
-        tp_scale = 1.0
         # Scale TP slightly with conviction but clamp.
         min_tp_scale = float(self.technicalcfg.min_tp_scale_from_signal)
         max_tp_scale = float(self.technicalcfg.max_tp_scale_from_signal)
@@ -324,10 +363,13 @@ class SignalEngine:
             momentum_score, mean_reversion_score, price_action_score
         )
 
+        # Change 3: thread symbol through so _decide_side_and_bands can look up
+        # the cached sentiment for the dynamic threshold adjustment.
         side, stop_price, take_profit_price = self._decide_side_and_bands(
             last_price=last_trade,
             volatility=volatility,
             signal_score=signal_score,
+            symbol=symbol,
         )
 
         dampener_tag = " [CONFLICT DAMPENED]" if dampened else ""
