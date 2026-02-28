@@ -12,13 +12,133 @@ tweak lot size based on weights
 
 5----------------------------------------------------------------------------------
 
-improve portfolio composition for better diversification
+stop loss tp stuff
 
 6----------------------------------------------------------------------------------
 
-thats lowkey and highkey it
+Close all positions one iteration before market closure
 
+7----------------------------------------------------------------------------------
+The trailing stop loss doesnt work
+2026-02-27T16:07:03.659109Z PAPER PORTFOLIO OVERVIEW
+  symbol=GOOGL side=sell qty=132.0000 notional=40670.52 signal_score=-0.203 rejected=None
+--------------------------------------------------------------------------------
+2026-02-27T16:07:03.659415Z PAPER ProposedTrade symbol=GOOGL sell qty=132.0000 notional=40670.52 entry=308.1100 stop=309.6970 tp=306.0853 risk_amt=3057.75 risk_pct=0.0300 sentiment=0.000 scale=1.000 rejected=None  SELL -0.203   
+--------------------------------------------------------------------------------
+Trailing stop placement failed for GOOGL: insufficient qty available for order (requested: 132, available: 0)
 
+8----------------------------------------------------------------------------------
 rank portfolio builder based on tech+sent score and distribute equity accordingly in viable positions
 
-Fix the Monitor
+9----------------------------------------------------------------------------------
+kelly sizing needs to become default mode!
+
+
+
+
+
+
+
+You are an expert Python quant-systems auditor. I will provide you the full 
+source code of my Alpaca-based automated swing trading bot. Your task is to 
+perform a rigorous, empirical audit across the following 8 dimensions. Be 
+exhaustive, cite specific file names, line-level locations, and exact variable 
+or method names for every finding. Do not generalise.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 1 — CORRECTNESS (Simulate execution)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Trace one full main() loop iteration step by step, as if you are the Python 
+interpreter. Identify any line that would raise an exception, return a 
+wrong value, or silently produce incorrect behaviour. Classify each finding as:
+  [CRASH]   — raises an unhandled exception
+  [WRONG]   — executes but produces an incorrect result
+  [SILENT]  — fails silently with no log or fallback
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 2 — SIGNAL MATH INTEGRITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Verify the correctness of every quantitative formula in core/signals.py:
+- RSI: confirm Wilder's EMA seeding and rolling method
+- Momentum: confirm the return calculation and normalisation
+- MA distance: confirm the formula and scale
+- Conflict dampener: verify the condition (mom * mr < 0) fires correctly and 
+  the penalty is applied to signal_score, not just flagged
+- combine_technical_scores(): confirm weights sum to 1.0 and output is in [-1, 1]
+Report any deviation from standard quant definitions.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 3 — RISK ENGINE INTEGRITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Manually compute the following for a hypothetical trade:
+  equity = $10,000 | signal_score = 0.60 | sentiment = +0.3 | 
+  entry = $150 | stop = $144 | tp = $162 | volatility = 0.008
+Compute:
+  1. sentiment_scale(0.3)
+  2. _kelly_fraction(0.60, sentiment_scale, 0.008) [if enable_kelly_sizing=True]
+  3. risk_amount (both fixed-fractional and Kelly paths)
+  4. qty = floor(risk_amount / stop_distance)
+  5. notional = qty * entry_price
+  6. gross_exposure check against 90% cap
+Confirm the code produces these exact values. Flag any discrepancy.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 4 — EXECUTION SAFETY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Verify:
+- LIVE_TRADING_ENABLED gate is checked before ANY order submission
+- Orphaned open orders are cancelled before re-entry (Fix 8)
+- _wait_for_position() times out correctly and does NOT proceed if fill fails
+- Trailing stop and take-profit are only submitted after confirmed fill
+- cancel_all_orders() and close_all_positions() are never called on the LIVE 
+  path without an explicit kill-switch trigger
+Flag any path where a live order could be submitted accidentally.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 5 — SENTIMENT PIPELINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Confirm TTL cache prevents redundant API calls within the cache window
+- Confirm chaos_cooldown blocks trades after a -2 discrete rating
+- Confirm force_rescore() bypasses TTL only on exit path, not entry path
+- Confirm sentiment_scale() returns 0.0 for scores below no_trade_negative_threshold
+- Confirm delta-exit logic uses opening_compound correctly for both long and short
+- Identify any symbol that could receive s_scale=1.0 (neutral band) and be 
+  sized at maximum — flag whether this is intentional or a risk
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 6 — STATE & PERSISTENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Confirm equity_state.json is read and written atomically (no partial writes)
+- Confirm _opening_compounds survives a bot restart correctly
+- Confirm high_watermark_equity is updated monotonically (never decreases)
+- Confirm start_of_day_equity resets at midnight UTC (or market open), not mid-loop
+- Flag any state that is held only in memory and lost on crash
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 7 — SECTOR DIVERSIFICATION & PORTFOLIO LOGIC
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Count active symbols per sector in instrument_whitelist.yaml
+- Confirm max_positions_per_sector is actually enforced in build_portfolio() 
+  selection loop (not just declared in config)
+- Identify how many simultaneous TECH positions are possible given current 
+  whitelist and config values
+- Flag if the portfolio can become 100% TECH and under what conditions
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 8 — PRODUCTION READINESS GAPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+List every item that must be resolved before switching APCA_API_ENV=LIVE:
+  Priority 🔴 BLOCKER  — will cause incorrect live trades or crashes
+  Priority 🟠 HIGH     — significant risk of loss or misbehaviour
+  Priority 🟡 MEDIUM   — silent degradation, suboptimal sizing
+  Priority 🟢 LOW      — cleanup, dead code, minor inefficiency
+For each item: file, location, description, and recommended fix.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT FORMAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- One section per dimension with a header
+- Findings as numbered lists with severity tags
+- Inline computed values for Dimension 3
+- A final OVERALL READINESS SCORE: X/10 with one-line justification
+- End with a prioritised fix queue: fix these in this order before going live

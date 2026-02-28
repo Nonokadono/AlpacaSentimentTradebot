@@ -186,6 +186,38 @@ class AlpacaAdapter:
             time_in_force=time_in_force,
         )
 
+    def submit_bracket_order(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        stop_price: float,
+        take_profit_price: float,
+        time_in_force: str = "day",
+    ) -> Any:
+        """
+        Submit an entry market order with an attached TP limit + fixed stop-loss
+        as a single Alpaca bracket order (order_class='bracket').
+
+        Alpaca manages the two exit legs as an internal OCO pair, so there is
+        never a qty-reservation conflict between TP and stop orders.
+
+        Direction is inferred automatically from `side`:
+          - buy  bracket: TP limit above entry, stop below entry.
+          - sell bracket: TP limit below entry, stop above entry.
+        Both prices are computed correctly by SignalEngine._decide_side_and_bands().
+        """
+        return self.rest.submit_order(
+            symbol=symbol,
+            side=side,
+            type="market",
+            qty=qty,
+            time_in_force=time_in_force,
+            order_class="bracket",
+            take_profit={"limit_price": str(round(take_profit_price, 2))},
+            stop_loss={"stop_price": str(round(stop_price, 2))},
+        )
+
     def submit_take_profit_limit_order(
         self,
         symbol: str,
@@ -200,6 +232,28 @@ class AlpacaAdapter:
             type="limit",
             qty=qty,
             limit_price=limit_price,
+            time_in_force=time_in_force,
+        )
+
+    def submit_stop_order(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        stop_price: float,
+        time_in_force: str = "day",
+    ) -> Any:
+        """
+        Submit a plain stop-market order.  Used as the fallback single-exit
+        path when only enable_trailing_stop is True (no TP configured).
+        stop_price is the ATR-based level computed by SignalEngine.
+        """
+        return self.rest.submit_order(
+            symbol=symbol,
+            side=side,
+            type="stop",
+            qty=qty,
+            stop_price=stop_price,
             time_in_force=time_in_force,
         )
 
@@ -1701,34 +1755,6 @@ class SentimentModule:
 
 -----------
 core\signals.py
-# CHANGES:
-#   - Feature 4 — Proper Wilder's RSI:
-#     _compute_rsi() replaces the incorrect simple-average implementation with
-#     the canonical Wilder's EMA-smoothed RSI:
-#       • Seed: compute a plain SMA of gains and losses over the first `period` deltas.
-#       • Subsequent bars: apply Wilder's smoothing formula
-#           avg_gain = (prev_avg_gain * (period - 1) + current_gain) / period
-#       • Returns 50.0 when insufficient bars are available (unchanged guard).
-#     The method name _compute_rsi and its signature (bars, period=14) are
-#     completely unchanged.
-#   - Feature 3 wiring: generate_signal_for_symbol() now passes `volatility` and
-#     `sentiment_scale_override` into risk_engine.pre_trade_checks() via
-#     portfolio_builder → this file does NOT call pre_trade_checks directly, so
-#     the wiring is done in portfolio_builder.py (see that file).
-#     Here we ensure `volatility` is accessible on the Signal dataclass so
-#     PortfolioBuilder can forward it.  A new field `volatility: float = 0.0` is
-#     added to Signal (additive, default 0.0 — no existing consumer breaks).
-#   - Import: removed `log_sentiment_for_symbol, log_signal_score` (both
-#     deprecated shims). Replaced with a direct import of `log_instrument_report`
-#     from monitoring.monitor.
-#   - generate_signal_for_symbol(): replaced the call to log_signal_score() with
-#     a single log_instrument_report() call placed AFTER the sentiment fetch.
-#     The separate log_sentiment_for_symbol() call that followed has been removed
-#     because log_instrument_report already renders the full sentiment block.
-#   - The skip-branch now also calls log_instrument_report() with the neutral
-#     sentinel SentimentResult so every symbol gets a report regardless of trade
-#     decision.
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -1954,14 +1980,46 @@ class SignalEngine:
 
         return 0.0
 
-    def _combine_technical_scores(self, mom: float, mr: float, pa: float) -> float:
-        # weights from config
-        score = (
-            self.technicalcfg.weight_momentum_trend * mom +
-            self.technicalcfg.weight_mean_reversion * mr +
-            self.technicalcfg.weight_price_action * pa
+    def _combine_technical_scores(
+        self, mom: float, mr: float, pa: float
+    ) -> Tuple[float, bool]:
+        """
+        Compute the weighted composite signal score and flag whether the
+        momentum/mean-reversion conflict dampener was applied.
+
+        Weights from config (unchanged):
+            weight_momentum_trend  * mom
+            weight_mean_reversion  * mr
+            weight_price_action    * pa
+
+        Conflict dampener:
+            When momentum_score (mom) and mean_reversion_score (mr) have
+            OPPOSITE signs their product is negative, indicating the move is
+            already extended (momentum maxed) while mean-reversion pushes back.
+            In that case the raw weighted sum is multiplied by
+            `conflict_dampener_penalty` (default 0.6), reducing apparent
+            conviction by 40 %.
+
+            Same-sign or zero sub-signals (product >= 0) are NOT penalised —
+            existing behaviour for clean / aligned setups is fully preserved.
+
+        Returns:
+            (signal_score: float, dampened: bool)
+        """
+        raw = (
+            self.technicalcfg.weight_momentum_trend * mom
+            + self.technicalcfg.weight_mean_reversion * mr
+            + self.technicalcfg.weight_price_action * pa
         )
-        return max(-1.0, min(1.0, score))
+
+        # Apply dampener only when momentum and mean-reversion actively conflict.
+        dampened = False
+        if mom * mr < 0:
+            penalty = float(getattr(self.technicalcfg, "conflict_dampener_penalty", 0.6))
+            raw = raw * penalty
+            dampened = True
+
+        return max(-1.0, min(1.0, raw)), dampened
 
     def _decide_side_and_bands(self, last_price: float, volatility: float, signal_score: float) -> Tuple[str, float, float]:
         long_th = float(self.technicalcfg.long_threshold)
@@ -2019,7 +2077,7 @@ class SignalEngine:
         mean_reversion_score = self._normalize_mean_reversion(last_trade, bars, rsi)
         price_action_score = self._compute_price_action_score(bars, last_trade)
 
-        signal_score = self._combine_technical_scores(
+        signal_score, dampened = self._combine_technical_scores(
             momentum_score, mean_reversion_score, price_action_score
         )
 
@@ -2029,20 +2087,22 @@ class SignalEngine:
             signal_score=signal_score,
         )
 
+        dampener_tag = " [CONFLICT DAMPENED]" if dampened else ""
+
         if side == "skip":
             rationale = (
-                f"Composite technical signal_score={signal_score:.3f} "
+                f"Composite technical signal_score={signal_score:.3f}{dampener_tag} "
                 f"within neutral band; no trade."
             )
         elif side == "buy":
             rationale = (
-                f"Long bias from composite technicals: signal_score={signal_score:.3f}, "
+                f"Long bias from composite technicals: signal_score={signal_score:.3f}{dampener_tag}, "
                 f"momentum={momentum_score:.3f}, mean_reversion={mean_reversion_score:.3f}, "
                 f"price_action={price_action_score:.3f}."
             )
         else:
             rationale = (
-                f"Short bias from composite technicals: signal_score={signal_score:.3f}, "
+                f"Short bias from composite technicals: signal_score={signal_score:.3f}{dampener_tag}, "
                 f"momentum={momentum_score:.3f}, mean_reversion={mean_reversion_score:.3f}, "
                 f"price_action={price_action_score:.3f}."
             )
@@ -2108,7 +2168,6 @@ class SignalEngine:
             price_action_score=price_action_score,
             volatility=volatility,
         )
-
 -----------
 
 -----------
@@ -2188,19 +2247,55 @@ class OrderExecutor:
                 f"leg order_id={order_id}: {e}"
             )
 
+    def _cancel_all_open_orders_for_symbol(self, symbol: str) -> None:
+        """
+        Cancel every open order for `symbol`.
+
+        Called before a sentiment-exit market order so that any resting bracket
+        legs (TP child, SL child) do not attempt to close the position a second
+        time after the market order fills.
+        """
+        try:
+            open_orders = self.adapter.list_orders(status="open")
+            for o in open_orders:
+                if getattr(o, "symbol", None) == symbol:
+                    try:
+                        self.adapter.cancel_order(o.id)
+                        logger.info(
+                            f"OrderExecutor [{symbol}]: cancelled open order "
+                            f"id={o.id} before sentiment close."
+                        )
+                    except Exception as ce:
+                        logger.warning(
+                            f"OrderExecutor [{symbol}]: failed to cancel order "
+                            f"id={o.id} before sentiment close: {ce}"
+                        )
+        except Exception as e:
+            logger.warning(
+                f"OrderExecutor [{symbol}]: failed to list orders "
+                f"for pre-close cleanup: {e}"
+            )
+
     def cancel_exit_legs(
         self,
         symbol: str,
         tp_order_id: Optional[str],
         ts_order_id: Optional[str],
+        bracket_order_id: Optional[str] = None,
     ) -> None:
         """
         Cancel both exit legs for a symbol.  Call this when one leg fills or
         when the position is being closed via a sentiment exit so orphaned
         orders do not persist.
+
+        bracket_order_id (optional): if supplied, the full bracket parent order
+        is cancelled in one call instead of cancelling TP and stop individually.
         """
-        self._cancel_leg(tp_order_id, "take-profit", symbol)
-        self._cancel_leg(ts_order_id, "trailing-stop", symbol)
+        if bracket_order_id:
+            self._cancel_leg(bracket_order_id, "bracket", symbol)
+        else:
+            self._cancel_leg(tp_order_id, "take-profit", symbol)
+            self._cancel_leg(ts_order_id, "trailing-stop", symbol)
 
     def execute_proposed_trade(self, trade: ProposedTrade):
         # Log the proposed trade with environment mode
@@ -2218,11 +2313,10 @@ class OrderExecutor:
         if side not in ("buy", "sell"):
             raise ValueError("side must be 'buy' or 'sell'")
 
-        # Fix 8a: cancel any orphaned open orders for this symbol BEFORE
-        # entering a new position.  This handles the race condition where a
-        # prior cycle's trailing stop or take-profit is still resting on the
-        # book after the position was flat.  Swallow errors so a stale-order
-        # cleanup failure never blocks a new entry.
+        # Cancel any orphaned open orders for this symbol BEFORE entering a new
+        # position.  Handles the race condition where a prior cycle's bracket
+        # leg or standalone exit is still resting on the book after the position
+        # went flat.  Swallow errors so cleanup failure never blocks a new entry.
         try:
             existing_orders = self.adapter.list_orders(status="open")
             for o in existing_orders:
@@ -2244,6 +2338,43 @@ class OrderExecutor:
                 f"for orphan cleanup: {e}"
             )
 
+        # ── Bracket path: TP + fixed stop in a single atomic order ────────────
+        # Use this whenever both exits are enabled.  Bracket orders avoid the
+        # qty-reservation conflict that caused the "insufficient qty available"
+        # error when TP and stop were placed as two independent orders.
+        use_bracket = (
+            self.execution_cfg.enable_take_profit
+            and self.execution_cfg.enable_trailing_stop
+        )
+
+        if use_bracket:
+            tp_price   = round(float(trade.take_profit_price), 2)
+            stop_price = round(float(trade.stop_price), 2)
+            try:
+                entry_order = self.adapter.submit_bracket_order(
+                    symbol=trade.symbol,
+                    qty=trade.qty,
+                    side=side,
+                    stop_price=stop_price,
+                    take_profit_price=tp_price,
+                    time_in_force=self.execution_cfg.entry_time_in_force,
+                )
+                logger.info(
+                    f"OrderExecutor [{trade.symbol}]: bracket order placed — "
+                    f"side={side} qty={trade.qty} "
+                    f"entry~={trade.entry_price:.4f} "
+                    f"stop={stop_price:.4f} tp={tp_price:.4f}"
+                )
+                return entry_order
+            except APIError as e:
+                logger.error(
+                    f"Bracket order placement failed for {trade.symbol}: {e}"
+                )
+                return None
+
+        # ── Fallback: plain market entry + individual exit orders ─────────────
+        # Reached only when exactly one of TP / stop is enabled, or both are
+        # disabled (in which case we return immediately after the entry).
         try:
             # 1) Entry: market order
             entry_order = self.adapter.submit_market_order(
@@ -2256,10 +2387,11 @@ class OrderExecutor:
             logger.error(f"Entry order placement failed for {trade.symbol}: {e}")
             return None
 
-        # 2) If configured, attempt to place trailing stop + take profit AFTER fill
+        # 2) If neither exit is configured, return early.
         if not self.execution_cfg.enable_trailing_stop and not self.execution_cfg.enable_take_profit:
             return entry_order
 
+        # 3) Wait for the position to appear so we know the filled qty.
         pos = self._wait_for_position(trade.symbol, self.execution_cfg.post_entry_fill_timeout_sec)
         if pos is None:
             # Position not visible yet; next loop will manage it via the
@@ -2274,7 +2406,7 @@ class OrderExecutor:
         if pos_qty <= 0:
             return entry_order
 
-        # Determine exit side opposite of entry
+        # Determine exit side (opposite of entry)
         exit_side = "sell" if side == "buy" else "buy"
 
         # Attach exit order IDs to the entry_order object so main.py can
@@ -2282,7 +2414,7 @@ class OrderExecutor:
         tp_order_id: Optional[str] = None
         ts_order_id: Optional[str] = None
 
-        # Place Take Profit limit (optional)
+        # Place Take Profit limit (only TP enabled, no stop)
         if self.execution_cfg.enable_take_profit:
             tp_price = round(float(trade.take_profit_price), 2)
             try:
@@ -2297,19 +2429,20 @@ class OrderExecutor:
             except APIError as e:
                 logger.error(f"Take profit placement failed for {trade.symbol}: {e}")
 
-        # Place Trailing Stop (5% trail by default)
+        # Place fixed stop-market order (only stop enabled, no TP)
         if self.execution_cfg.enable_trailing_stop:
+            stop_px = round(float(trade.stop_price), 2)
             try:
-                ts_order = self.adapter.submit_trailing_stop_order(
+                ts_order = self.adapter.submit_stop_order(
                     symbol=trade.symbol,
                     qty=pos_qty,
                     side=exit_side,
-                    trail_percent=float(self.execution_cfg.trailing_stop_percent),
+                    stop_price=stop_px,
                     time_in_force=self.execution_cfg.exit_time_in_force,
                 )
                 ts_order_id = getattr(ts_order, "id", None)
             except APIError as e:
-                logger.error(f"Trailing stop placement failed for {trade.symbol}: {e}")
+                logger.error(f"Stop order placement failed for {trade.symbol}: {e}")
 
         # Attach exit order IDs to the entry order as plain attributes so
         # the caller can persist and later cancel the surviving leg.
@@ -2334,6 +2467,11 @@ class OrderExecutor:
 
         For a long position, we submit a sell market order of full qty.
         For a short position, we submit a buy market order of full qty.
+
+        All open orders for the symbol are cancelled BEFORE the market order is
+        submitted.  This prevents bracket child orders (TP / SL legs) from
+        attempting to close an already-flat position after the sentiment market
+        order fills, which would otherwise create an unintended new position.
 
         Fix 8b: routes through self.adapter.submit_market_order() instead of
         self.adapter.rest.submit_order() directly — restores adapter abstraction
@@ -2362,6 +2500,10 @@ class OrderExecutor:
             side = "buy"
         else:
             raise ValueError(f"Unexpected position side {position.side}")
+
+        # Cancel all open exit orders (bracket legs, TP, stop) before the
+        # market close so they cannot re-open the position after it fills.
+        self._cancel_all_open_orders_for_symbol(position.symbol)
 
         try:
             # Fix 8b: use adapter method, not bare REST call.
@@ -2717,7 +2859,14 @@ def main():
             time.sleep(60)
             continue
 
+        # ── *** ADD THIS HERE *** ─────────────────────────────────────────────
+        if not market_open:
+                logger.info("Market closed — skipping portfolio build and new entries.")
+                time.sleep(60)
+                continue
+
         # ── STEP 3: BUILD AND EXECUTE NEW TRADES ─────────────────────────────
+
         open_orders     = adapter.list_orders(status="open")
         proposed_trades = portfolio_builder.build_portfolio(snapshot, positions, open_orders)
 
@@ -3252,15 +3401,136 @@ tweak lot size based on weights
 
 5----------------------------------------------------------------------------------
 
-improve portfolio composition for better diversification
+stop loss tp stuff
 
 6----------------------------------------------------------------------------------
 
-thats lowkey and highkey it
+Close all positions one iteration before market closure
 
+7----------------------------------------------------------------------------------
+The trailing stop loss doesnt work
+2026-02-27T16:07:03.659109Z PAPER PORTFOLIO OVERVIEW
+  symbol=GOOGL side=sell qty=132.0000 notional=40670.52 signal_score=-0.203 rejected=None
+--------------------------------------------------------------------------------
+2026-02-27T16:07:03.659415Z PAPER ProposedTrade symbol=GOOGL sell qty=132.0000 notional=40670.52 entry=308.1100 stop=309.6970 tp=306.0853 risk_amt=3057.75 risk_pct=0.0300 sentiment=0.000 scale=1.000 rejected=None  SELL -0.203   
+--------------------------------------------------------------------------------
+Trailing stop placement failed for GOOGL: insufficient qty available for order (requested: 132, available: 0)
 
+8----------------------------------------------------------------------------------
 rank portfolio builder based on tech+sent score and distribute equity accordingly in viable positions
 
-Fix the Monitor
+9----------------------------------------------------------------------------------
+kelly sizing needs to become default mode!
+
+
+
+
+
+
+
+You are an expert Python quant-systems auditor. I will provide you the full 
+source code of my Alpaca-based automated swing trading bot. Your task is to 
+perform a rigorous, empirical audit across the following 8 dimensions. Be 
+exhaustive, cite specific file names, line-level locations, and exact variable 
+or method names for every finding. Do not generalise.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 1 — CORRECTNESS (Simulate execution)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Trace one full main() loop iteration step by step, as if you are the Python 
+interpreter. Identify any line that would raise an exception, return a 
+wrong value, or silently produce incorrect behaviour. Classify each finding as:
+  [CRASH]   — raises an unhandled exception
+  [WRONG]   — executes but produces an incorrect result
+  [SILENT]  — fails silently with no log or fallback
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 2 — SIGNAL MATH INTEGRITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Verify the correctness of every quantitative formula in core/signals.py:
+- RSI: confirm Wilder's EMA seeding and rolling method
+- Momentum: confirm the return calculation and normalisation
+- MA distance: confirm the formula and scale
+- Conflict dampener: verify the condition (mom * mr < 0) fires correctly and 
+  the penalty is applied to signal_score, not just flagged
+- combine_technical_scores(): confirm weights sum to 1.0 and output is in [-1, 1]
+Report any deviation from standard quant definitions.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 3 — RISK ENGINE INTEGRITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Manually compute the following for a hypothetical trade:
+  equity = $10,000 | signal_score = 0.60 | sentiment = +0.3 | 
+  entry = $150 | stop = $144 | tp = $162 | volatility = 0.008
+Compute:
+  1. sentiment_scale(0.3)
+  2. _kelly_fraction(0.60, sentiment_scale, 0.008) [if enable_kelly_sizing=True]
+  3. risk_amount (both fixed-fractional and Kelly paths)
+  4. qty = floor(risk_amount / stop_distance)
+  5. notional = qty * entry_price
+  6. gross_exposure check against 90% cap
+Confirm the code produces these exact values. Flag any discrepancy.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 4 — EXECUTION SAFETY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Verify:
+- LIVE_TRADING_ENABLED gate is checked before ANY order submission
+- Orphaned open orders are cancelled before re-entry (Fix 8)
+- _wait_for_position() times out correctly and does NOT proceed if fill fails
+- Trailing stop and take-profit are only submitted after confirmed fill
+- cancel_all_orders() and close_all_positions() are never called on the LIVE 
+  path without an explicit kill-switch trigger
+Flag any path where a live order could be submitted accidentally.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 5 — SENTIMENT PIPELINE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Confirm TTL cache prevents redundant API calls within the cache window
+- Confirm chaos_cooldown blocks trades after a -2 discrete rating
+- Confirm force_rescore() bypasses TTL only on exit path, not entry path
+- Confirm sentiment_scale() returns 0.0 for scores below no_trade_negative_threshold
+- Confirm delta-exit logic uses opening_compound correctly for both long and short
+- Identify any symbol that could receive s_scale=1.0 (neutral band) and be 
+  sized at maximum — flag whether this is intentional or a risk
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 6 — STATE & PERSISTENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Confirm equity_state.json is read and written atomically (no partial writes)
+- Confirm _opening_compounds survives a bot restart correctly
+- Confirm high_watermark_equity is updated monotonically (never decreases)
+- Confirm start_of_day_equity resets at midnight UTC (or market open), not mid-loop
+- Flag any state that is held only in memory and lost on crash
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 7 — SECTOR DIVERSIFICATION & PORTFOLIO LOGIC
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Count active symbols per sector in instrument_whitelist.yaml
+- Confirm max_positions_per_sector is actually enforced in build_portfolio() 
+  selection loop (not just declared in config)
+- Identify how many simultaneous TECH positions are possible given current 
+  whitelist and config values
+- Flag if the portfolio can become 100% TECH and under what conditions
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DIMENSION 8 — PRODUCTION READINESS GAPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+List every item that must be resolved before switching APCA_API_ENV=LIVE:
+  Priority 🔴 BLOCKER  — will cause incorrect live trades or crashes
+  Priority 🟠 HIGH     — significant risk of loss or misbehaviour
+  Priority 🟡 MEDIUM   — silent degradation, suboptimal sizing
+  Priority 🟢 LOW      — cleanup, dead code, minor inefficiency
+For each item: file, location, description, and recommended fix.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OUTPUT FORMAT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- One section per dimension with a header
+- Findings as numbered lists with severity tags
+- Inline computed values for Dimension 3
+- A final OVERALL READINESS SCORE: X/10 with one-line justification
+- End with a prioritised fix queue: fix these in this order before going live
+
 -----------
 
