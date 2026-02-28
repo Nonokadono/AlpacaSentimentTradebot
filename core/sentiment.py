@@ -226,3 +226,15 @@ class SentimentModule:
         if max_abs_s >= 0.2:
             return 600
         return 900
+
+    def adaptive_rescore_interval_hysteresis(self, max_abs_s: float, current_interval: int) -> int:
+        target = self.adaptive_rescore_interval(max_abs_s)
+        if target == current_interval:
+            return current_interval
+        boundaries = {120: 0.8, 300: 0.5, 600: 0.2, 900: 0.0}
+        current_boundary = boundaries.get(current_interval, 0.0)
+        target_boundary  = boundaries.get(target, 0.0)
+        midpoint = (current_boundary + target_boundary) / 2.0
+        if abs(max_abs_s - midpoint) > 0.05:
+            return target
+        return current_interval

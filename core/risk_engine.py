@@ -9,7 +9,18 @@
 #   from kelly_fraction; s_scale is kept as a parameter for backward compat but
 #   used only in the fixed-fractional path. Call site in pre_trade_checks passes
 #   s=sentiment.score. No renames.
+# Improvement A — Adaptive Kelly vol normalisation: self._vol_history (deque,
+#   maxlen=200) accumulates per-call volatility values. Once 20+ samples exist,
+#   the kelly_vol_norm_percentile-th percentile of the history is used as
+#   vol_norm (denominator) instead of the fixed 0.002 constant. This makes the
+#   vol penalty self-calibrate to the instrument's recent volatility regime.
+# Improvement C — Log-odds sentiment blending for Kelly p: replaced the additive
+#   p formula with a log-odds blend. p_tech is derived from tech_conviction;
+#   the log-odds are shifted by kelly_sentiment_weight * clamp(s, -1, 1); the
+#   result is squashed back to probability space and clamped to [0.35, 0.75].
 
+import math
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Dict
 
@@ -69,6 +80,10 @@ class RiskEngine:
         self.limits = risk_limits
         self.sentiment_cfg = sentiment_cfg
         self.instrument_meta = instrument_meta
+        # Improvement A: rolling vol history for adaptive percentile normalisation.
+        # maxlen=200 keeps roughly the last 200 position-sizing calls (~3-4 hours
+        # at 600s sleep with a moderate symbol count).
+        self._vol_history: deque = deque(maxlen=200)
 
     def sentiment_scale(self, s: float) -> float:
         """
@@ -97,17 +112,31 @@ class RiskEngine:
         """
         Compute a Half-Kelly multiplier in [0.0, 1.0].
 
-        Change 4: p and b are now derived solely from tech_conviction = min(|signal_score|, 1.0).
-          p = max(0.35, min(0.75, 0.5 + 0.15*tech_conviction + 0.05*clamp(s, -1, 1)))
-          q = 1 - p
-          b = max(1.0, 1.0 + 1.5*tech_conviction)
-        s_scale is accepted for backward compatibility but not used here.
+        Improvement A: adaptive vol normalisation.
+          volatility is appended to self._vol_history on every call.
+          If len >= 20, vol_norm = percentile(history, kelly_vol_norm_percentile).
+          Otherwise vol_norm = 0.002 (warm-up fallback).
+          volfactor = volatility / vol_norm if volatility > 0 else 0.0.
 
-        Change 2: volfactor = volatility / 0.002 (was 0.005).
+        Improvement C: log-odds sentiment blending.
+          p_tech = 0.5 + 0.15 * tech_conviction
+          log_odds = log(p_tech / (1 - p_tech)) + kelly_sentiment_weight * clamp(s, -1, 1)
+          p = clamp(sigmoid(log_odds), 0.35, 0.75)
+
+        Change 4: b uses only tech_conviction.
+        s_scale is accepted for backward compatibility but not used here.
         """
         tech_conviction = min(abs(signal_score), 1.0)
 
-        p = max(0.35, min(0.75, 0.5 + 0.15 * tech_conviction + 0.05 * max(-1.0, min(1.0, s))))
+        # Improvement C: log-odds blend for p
+        p_tech = 0.5 + 0.15 * tech_conviction
+        # Guard: p_tech must be strictly in (0, 1) for log to be defined.
+        p_tech = max(1e-6, min(1.0 - 1e-6, p_tech))
+        log_odds = (
+            math.log(p_tech / (1.0 - p_tech))
+            + self.limits.kelly_sentiment_weight * max(-1.0, min(1.0, s))
+        )
+        p = max(0.35, min(0.75, 1.0 / (1.0 + math.exp(-log_odds))))
         q = 1.0 - p
         b = max(1.0, 1.0 + 1.5 * tech_conviction)
 
@@ -117,8 +146,25 @@ class RiskEngine:
         full_kelly = (p * b - q) / b
         half_kelly = full_kelly * 0.5
 
-        # Change 2: constant 0.002 (was 0.005)
-        volfactor = volatility / 0.002 if volatility > 0 else 0.0
+        # Improvement A: append to history and compute adaptive vol_norm.
+        self._vol_history.append(volatility)
+        if len(self._vol_history) >= 20:
+            sorted_hist = sorted(self._vol_history)
+            pct = self.limits.kelly_vol_norm_percentile
+            # Linear interpolation for the given percentile.
+            idx_f = pct * (len(sorted_hist) - 1)
+            idx_lo = int(idx_f)
+            idx_hi = min(idx_lo + 1, len(sorted_hist) - 1)
+            frac = idx_f - idx_lo
+            vol_norm = sorted_hist[idx_lo] + frac * (sorted_hist[idx_hi] - sorted_hist[idx_lo])
+            # Guard: never divide by zero even if all history entries are 0.
+            if vol_norm <= 0.0:
+                vol_norm = 0.002
+        else:
+            # Warm-up fallback (same as the prior fixed constant).
+            vol_norm = 0.002
+
+        volfactor = volatility / vol_norm if volatility > 0 else 0.0
         vol_penalty = 1.0 / (1.0 + volfactor)
 
         kelly = half_kelly * vol_penalty
@@ -198,7 +244,8 @@ class RiskEngine:
 
         # 4) Risk per trade — fixed-fractional OR Half-Kelly
         if self.limits.enable_kelly_sizing:
-            # Change 4: pass s=sentiment.score to separate tech from sentiment
+            # Change 4 / Improvement C: pass s=sentiment.score to separate tech
+            # from sentiment and apply log-odds blending.
             kelly_f = self._kelly_fraction(signal_score, s_scale, volatility,
                                            s=sentiment.score)
             raw_risk_pct = kelly_f * self.limits.max_risk_per_trade_pct

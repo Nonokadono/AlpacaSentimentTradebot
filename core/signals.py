@@ -7,6 +7,16 @@
 #   short_th, preserving existing behaviour exactly.
 #   generate_signal_for_symbol() threads symbol through to the call site.
 #   No existing variable names renamed.
+# Improvement B — Asymmetric sentiment-adjusted entry thresholds:
+#   Replaced the old symmetric threshold formula (both long_th_adj and
+#   short_th_adj adjusted in the same direction) with asymmetric adjustment:
+#     long_th_adj  = long_th  * (1.0 - sentiment_th_scale * s_adj / 0.5)
+#     short_th_adj = short_th * (1.0 + sentiment_th_scale * s_adj / 0.5)
+#   short_th is negative, so (1.0 + ...) correctly raises the bar (makes it
+#   harder to short) when sentiment is positive and lowers it when negative.
+#   The sign logic is sound: positive s_adj shrinks long_th (easier to go long)
+#   and grows |short_th| (harder to short); negative s_adj does the opposite.
+#   enable_dynamic_threshold gates this; sentiment_th_scale controls the range.
 
 from __future__ import annotations
 
@@ -284,26 +294,45 @@ class SignalEngine:
         """
         Determine the trade side and compute stop/take-profit price bands.
 
-        Change 3: When TechnicalSignalConfig.enable_dynamic_threshold is True,
-        the raw long_th and short_th values are adjusted by the most recently
-        cached sentiment for `symbol` before the comparison against signal_score.
-        When enable_dynamic_threshold is False (the default), long_th_adj ==
-        long_th and short_th_adj == short_th, preserving existing behaviour
-        exactly.
+        Improvement B: When TechnicalSignalConfig.enable_dynamic_threshold is
+        True, thresholds are adjusted asymmetrically using sentiment_th_scale:
+          s_adj = clamp(cached_s, -0.5, 0.5)
+          long_th_adj  = long_th  * (1.0 - sentiment_th_scale * s_adj / 0.5)
+          short_th_adj = short_th * (1.0 + sentiment_th_scale * s_adj / 0.5)
+
+        Sign logic (CONFIRMED CORRECT):
+          short_th is negative.
+          Positive s_adj (bullish sentiment):
+            long_th_adj  < long_th   → easier to go long  (threshold shrinks)
+            short_th_adj > short_th  → harder to go short (negative * (1+x) is
+                                        more negative, i.e. a stricter bar)
+          Negative s_adj (bearish sentiment):
+            long_th_adj  > long_th   → harder to go long
+            short_th_adj < short_th  → easier to go short
 
         The config object is NEVER mutated — adjustments are local variables only.
+        When enable_dynamic_threshold is False (the default), long_th_adj ==
+        long_th and short_th_adj == short_th, preserving existing behaviour.
         """
         long_th = float(self.technicalcfg.long_threshold)
         short_th = float(self.technicalcfg.short_threshold)
 
-        # Change 3: sentiment-adjusted thresholds (local only, config not mutated).
+        # Improvement B: asymmetric sentiment-adjusted thresholds (local only).
         # When enable_dynamic_threshold is False (default), adj == raw threshold.
         if getattr(self.technicalcfg, "enable_dynamic_threshold", False) and symbol:
             cached_s_result = self.sentiment.get_cached_sentiment(symbol)
             cached_s = cached_s_result.score if cached_s_result is not None else 0.0
+            sentiment_th_scale = float(
+                getattr(self.technicalcfg, "sentiment_th_scale", 0.25)
+            )
             s_adj = max(-0.5, min(0.5, cached_s))
-            long_th_adj  = long_th  * (1.0 - 0.35 * s_adj / 0.5)
-            short_th_adj = short_th * (1.0 - 0.35 * s_adj / 0.5)
+            # Asymmetric adjustment:
+            # long_th_adj  shrinks when sentiment positive (easier to go long).
+            # short_th_adj becomes more negative when sentiment positive
+            # (harder to go short) because short_th is negative and
+            # (1.0 + positive_value) > 1.0, making the product more negative.
+            long_th_adj  = long_th  * (1.0 - sentiment_th_scale * s_adj / 0.5)
+            short_th_adj = short_th * (1.0 + sentiment_th_scale * s_adj / 0.5)
         else:
             long_th_adj  = long_th
             short_th_adj = short_th

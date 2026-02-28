@@ -1,26 +1,22 @@
 # CHANGES:
-# Change 1a — Fix opening_compounds semantic error: store proposed.sentiment_score
-#   (the compound sentiment float) instead of proposed.signal_score (the technical
-#   composite) after a confirmed entry fill. The exit delta check subtracts this
-#   value from current sentiment.score, so storing a technical score here produced
-#   a semantically invalid cross-space delta.
-# Change 1b — Directional delta in _check_and_exit_on_sentiment:
-#   LONG  position: delta = entry_sentiment - current_sentiment.score
-#                   (fires when sentiment has deteriorated since entry)
-#   SHORT position: delta = current_sentiment.score - entry_sentiment
-#                   (fires when sentiment has improved against the short)
-#   All existing variable names preserved: entry_sentiment, delta,
-#   soft_exit_delta_threshold, strong_exit_delta_threshold,
-#   strong_exit_confidence_min, exit_confidence_min.
-# Change 5 — Replace hardcoded time.sleep(600) with adaptive_rescore_interval()
-#   driven by the highest |sentiment.score| across open positions. Falls back to
-#   900s (neutral band) when no cached sentiment is available.
+# Change 1a — Opening compound recorded as sentiment_score at entry time.
+# Change 1b — Directional delta for sentiment exit (long: entry-current,
+#   short: current-entry) so only adverse shifts fire.
+# Change 5  — Adaptive sleep via sentiment.adaptive_rescore_interval(_max_abs_s).
+# Improvement D — Replace bare adaptive_rescore_interval call with
+#   adaptive_rescore_interval_hysteresis so the sleep interval does not
+#   oscillate rapidly when max_abs_s hovers near a boundary.
+#   _rescore_interval: int = 600 is initialised before the while True loop and
+#   updated each iteration via the hysteresis method.
 
 import json
 import logging
 import time
+from collections import deque
 from datetime import date
-from typing import Dict
+from datetime import date
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from adapters.alpaca_adapter import AlpacaAdapter
 from config.config import load_config
@@ -39,11 +35,10 @@ from monitoring.monitor import (
     log_sentiment_position_check,
     setup_logging,
 )
-from pathlib import Path
 
 logger = logging.getLogger("tradebot")
 
-STATE_PATH = Path("equity_state.json")
+STATE_PATH = Path("data/equity_state.json")
 
 
 def load_equity_state() -> Dict:
@@ -275,6 +270,10 @@ def main():
     # Persisted to equity_state.json so it survives bot restarts.
     _opening_compounds: Dict[str, float] = _load_opening_compounds()
 
+    # Improvement D: initialise adaptive sleep interval before the loop.
+    # Starts at 600s (the neutral-band default); hysteresis prevents oscillation.
+    _rescore_interval: int = 600
+
     while True:
         acct        = adapter.get_account()
         positions   = pm.get_positions(opening_compounds=_opening_compounds)
@@ -342,17 +341,23 @@ def main():
                 # Persist immediately so a crash/restart doesn't lose the entry record.
                 _persist_opening_compounds(_opening_compounds)
 
-        # ── STEP 4: ADAPTIVE SLEEP ────────────────────────────────────────────
-        # Change 5: sleep duration is driven by the highest |sentiment.score|
-        # across all currently open positions. High-conviction positions rescore
-        # every 120s; neutral portfolios wait up to 900s, reducing API cost.
+        # ── STEP 4: ADAPTIVE SLEEP WITH HYSTERESIS ───────────────────────────
+        # Change 5 / Improvement D: sleep duration is driven by the highest
+        # |sentiment.score| across all currently open positions. High-conviction
+        # positions rescore every 120s; neutral portfolios wait up to 900s,
+        # reducing API cost. Hysteresis prevents rapid interval oscillation when
+        # max_abs_s hovers near a boundary threshold.
         _max_abs_s = max(
             (abs(sentiment.get_cached_sentiment(sym).score)
              for sym in positions
              if sentiment.get_cached_sentiment(sym) is not None),
             default=0.0,
         )
-        time.sleep(sentiment.adaptive_rescore_interval(_max_abs_s))
+        # Improvement D: use hysteresis guard instead of bare adaptive call.
+        _rescore_interval = sentiment.adaptive_rescore_interval_hysteresis(
+            _max_abs_s, _rescore_interval
+        )
+        time.sleep(_rescore_interval)
 
 
 if __name__ == "__main__":

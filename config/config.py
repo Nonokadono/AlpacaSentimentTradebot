@@ -1,3 +1,15 @@
+# CHANGES:
+# Improvement A — Added kelly_vol_norm_percentile: float = 0.50 to RiskLimits.
+#   Controls the percentile of the rolling vol history used as the vol normaliser
+#   denominator in RiskEngine._kelly_fraction.
+# Improvement B — Added sentiment_th_scale: float = 0.25 to TechnicalSignalConfig.
+#   Controls how much the cached sentiment score shifts the entry thresholds
+#   asymmetrically in SignalEngine._decide_side_and_bands.
+# Improvement C — Added kelly_sentiment_weight: float = 0.08 to RiskLimits.
+#   Weight applied to the sentiment score in the log-odds blend for Kelly p.
+# Improvement E — Added confidence_gamma: float = 2.0 to SentimentConfig.
+#   Controls the convex (power-law) confidence weighting in _map_discrete_to_score.
+
 import os
 import yaml
 from pathlib import Path
@@ -25,6 +37,14 @@ class RiskLimits:
     # Override via environment config or load_config() — do not change this line
     # without re-running the Kelly calibration tests.
     enable_kelly_sizing: bool = True
+    # Improvement A: percentile of the rolling vol history (maxlen=200) used as
+    # the denominator when normalising volatility inside _kelly_fraction.
+    # 0.50 = median; raise toward 0.75 to be less sensitive to vol spikes.
+    kelly_vol_norm_percentile: float = 0.50
+    # Improvement C: weight applied to the clamped sentiment score in the
+    # log-odds blend for Kelly p.  Increasing this makes sentiment more
+    # influential on position size.
+    kelly_sentiment_weight: float = 0.08
 
 
 @dataclass
@@ -49,6 +69,12 @@ class SentimentConfig:
     #
     # Minimum model confidence for the soft exit tier.
     exit_confidence_min: float = 0.5
+    #
+    # Improvement E: exponent applied to confidence before multiplying by base.
+    # gamma=1.0 → linear (original behaviour); gamma=2.0 → convex weighting
+    # that rewards high-confidence scores more and down-weights low-confidence
+    # ones.  Clamped to [1.0, 4.0] at runtime.
+    confidence_gamma: float = 2.0
     #
     # Legacy alias kept for any downstream code that reads this field directly.
     # Points at the strong threshold so behaviour is unchanged if old code path
@@ -75,6 +101,10 @@ class TechnicalSignalConfig:
     base_tp_vol_mult: float = 3.0
     max_tp_scale_from_signal: float = 1.3
     min_tp_scale_from_signal: float = 0.7
+    # Improvement B: fraction of long_th / short_th that the cached sentiment
+    # score is allowed to shift the entry threshold asymmetrically.
+    # 0.25 means sentiment can tighten or widen each threshold by up to 25%.
+    sentiment_th_scale: float = 0.25
 
 
 @dataclass
