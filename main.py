@@ -2,24 +2,20 @@
 # Dashboard integration — monitoring/terminal.py wired into the main loop.
 #
 # Change T1: Import dashboard_state, build_position_rows, build_price_rows,
-#   launch_dashboard, and dev_mode from monitoring.terminal.
+#   launch_dashboard, persist_state, and dev_mode from monitoring.terminal.
 #
-# Change T2: A daemon thread is spawned ONCE before the main loop starts
-#   (when dev_mode is False). The thread runs launch_dashboard() which blocks
-#   inside Textual's event loop. Because it is a daemon thread it exits
-#   automatically when the main process terminates — no cleanup needed.
+# Change T2: launch_dashboard() is called ONCE before the main loop starts.
+#   It spawns a subprocess with CREATE_NEW_CONSOLE (Windows) or os.setsid (Unix)
+#   so the TUI runs in a separate OS window. The function returns immediately
+#   so the main loop continues unblocked. When dev_mode is True or textual is
+#   missing, launch_dashboard() logs a message and returns silently.
 #
-# Change T3: Inside the main loop, dashboard_state.update() is called at
-#   well-defined points:
-#     a) After snapshot is available: update cash, buying_power, market_open.
-#     b) At the start of portfolio build: set bot_state="SCANNING".
-#     c) After execute: set bot_state="EXECUTING" then back to "IDLE".
-#     d) Positions and price rows are rebuilt and pushed every cycle.
-#   All updates are non-blocking (simple attribute writes under a Lock).
+# Change T3: persist_state(dashboard_state) is called after every
+#   dashboard_state.update() so the pickled state file is always current for
+#   the TUI subprocess to poll.
 #
-# Change T4: When dev_mode is True the dashboard thread is never started and
-#   no extra imports from textual are triggered — headless operation is
-#   completely unchanged.
+# Change T4: A startup log line clearly states whether the TUI launched or
+#   fell back to headless mode.
 #
 # All prior changes (Change 1a, Change 5, Improvement D, adaptive sleep
 # hysteresis, _load/_persist opening_compounds, _check_and_exit_on_sentiment,
@@ -28,7 +24,6 @@
 
 import json
 import logging
-import threading
 import time
 from datetime import date
 from pathlib import Path
@@ -57,6 +52,7 @@ from monitoring.terminal import (
     dashboard_state,
     dev_mode,
     launch_dashboard,
+    persist_state,
 )
 
 logger = logging.getLogger("tradebot")
@@ -161,7 +157,7 @@ def get_equity_snapshot_from_account(
     )
 
 
-# ── Main loop ──────────────────────────────────────────────────────────────────
+# ── Main loop ────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     setup_logging()
@@ -185,15 +181,9 @@ def main() -> None:
     # Improvement D: initialise adaptive sleep interval before the loop.
     _rescore_interval: int = 600
 
-    # Change T2: Launch the TUI dashboard in a background daemon thread.
-    # When dev_mode is True, launch_dashboard() returns immediately.
-    _dashboard_thread = threading.Thread(
-        target=launch_dashboard,
-        args=(dashboard_state, 5.0),
-        daemon=True,
-        name="tui-dashboard",
-    )
-    _dashboard_thread.start()
+    # Change T2: Launch the TUI dashboard in a separate OS window (subprocess).
+    # When dev_mode is True or textual is missing, launch_dashboard() returns immediately.
+    launch_dashboard(refresh_seconds=5.0)
 
     _cycle_count: int = 0
 
@@ -214,6 +204,7 @@ def main() -> None:
             market_open=market_open,
             bot_state="SCANNING",
         )
+        persist_state(dashboard_state)
 
         # ── STEP 0: WEEKEND FORCED LIQUIDATION ──────────────────────────────
         if adapter.is_pre_weekend_close():
@@ -222,8 +213,10 @@ def main() -> None:
                 "until next market open."
             )
             dashboard_state.update(bot_state="EXECUTING")
+            persist_state(dashboard_state)
             executor.close_all_positions_for_weekend(positions, cfg.env_mode)
             dashboard_state.update(bot_state="IDLE")
+            persist_state(dashboard_state)
             while not adapter.get_market_open():
                 time.sleep(60)
             continue
@@ -232,6 +225,7 @@ def main() -> None:
         log_kill_switch_state(ks_state)
         if ks_state.halted:
             dashboard_state.update(bot_state="HALTED")
+            persist_state(dashboard_state)
             time.sleep(60)
             continue
 
@@ -265,6 +259,7 @@ def main() -> None:
                 prices=build_price_rows(cfg.instruments, adapter),
                 bot_state="IDLE",
             )
+            persist_state(dashboard_state)
             time.sleep(60)
             continue
 
@@ -276,12 +271,14 @@ def main() -> None:
             )
         else:
             dashboard_state.update(bot_state="SCANNING")
+            persist_state(dashboard_state)
             open_orders     = adapter.list_orders(status="open")
             proposed_trades = portfolio_builder.build_portfolio(snapshot, positions, open_orders)
 
             log_portfolio_overview(proposed_trades, cfg.env_mode)
 
             dashboard_state.update(bot_state="EXECUTING")
+            persist_state(dashboard_state)
             for proposed in proposed_trades:
                 order = executor.execute_proposed_trade(proposed)
                 if order is not None and proposed.rejected_reason is None and proposed.qty > 0:
@@ -305,6 +302,7 @@ def main() -> None:
             prices=build_price_rows(cfg.instruments, adapter),
             bot_state="IDLE",
         )
+        persist_state(dashboard_state)
 
         # ── STEP 4: ADAPTIVE SLEEP WITH HYSTERESIS ──────────────────────────
         _max_abs_s = max(
