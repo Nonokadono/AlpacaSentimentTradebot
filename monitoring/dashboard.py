@@ -1,40 +1,21 @@
 # CHANGES:
-# NEW FILE — monitoring/dashboard.py
-# Professional PyQt5 desktop GUI for the Alpaca algorithmic trading bot.
+# FIX 1: Replace threading with multiprocessing to comply with PyQt5's
+#   requirement that QApplication must be created in the main thread of a process.
+#   The GUI now spawns as a separate OS process via multiprocessing.Process.
 #
-# Architecture:
-#   - QMainWindow with native OS window controls, menu bar, and status bar
-#   - QThread-based architecture: GUI runs in a daemon thread spawned by
-#     launch_dashboard(), leaving the main trading loop completely non-blocking
-#   - Pickle-based IPC: main.py writes dashboard_state.pkl on every update;
-#     the GUI polls this file every 5 seconds via QTimer and refreshes all widgets
-#   - No shared memory, no locks, no cross-thread signaling complexity
+# FIX 2: Remove invalid QTabWidget.setShortcut() calls. QTabWidget doesn't have
+#   a setShortcut method. Keyboard shortcuts (Ctrl+P, Ctrl+O) removed for now
+#   (can be re-added later using QShortcut if needed, but not blocking launch).
 #
-# New dependency: PyQt5
-#   Justification: PyQt5 is the industry-standard cross-platform GUI framework
-#   for Python, with mature threading support, native OS integration, and zero
-#   terminal dependency. It produces true desktop applications, not terminal UIs.
-#
-# Design:
-#   - Dark theme (#0d0d0d background, #e0e0e0 foreground)
-#   - Green=#22c55e (profit/live), Red=#ef4444 (loss/alert),
-#     Amber=#f59e0b (TP/SL), Cyan=#22d3ee (info), Grey=#4b5563 (inactive)
-#   - Monospace fonts for all numeric columns
-#   - QTableWidget with alternating row colors for readability
-#   - Pulsing live indicator in status bar
-#
-# Graceful degradation:
-#   - Module-level try/except sets _PYQT5_AVAILABLE: bool
-#   - launch_dashboard() checks dev_mode, PyQt5 availability, and singleton state
-#   - When any condition fails, logs a message and returns silently
-#   - The bot never crashes when PyQt5 is missing
+# FIX 3: _run_gui() now creates a fresh QApplication(sys.argv) unconditionally
+#   since it runs in a separate process with its own main thread.
 
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import pickle
 import sys
-import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -146,7 +127,7 @@ STATE_FILE = Path("dashboard_state.pkl")
 
 
 def persist_state(state: DashboardState) -> None:
-    """Pickle dashboard_state to disk for cross-thread IPC."""
+    """Pickle dashboard_state to disk for cross-process IPC."""
     try:
         with STATE_FILE.open("wb") as f:
             pickle.dump(state, f)
@@ -272,9 +253,8 @@ if _PYQT5_AVAILABLE:
             )
             self._tabs.addTab(self._prices_table, "Prices")
 
-            # Keyboard shortcuts
-            self._tabs.setShortcut(Qt.CTRL + Qt.Key_O, lambda: self._tabs.setCurrentIndex(0))
-            self._tabs.setShortcut(Qt.CTRL + Qt.Key_P, lambda: self._tabs.setCurrentIndex(1))
+            # FIX 2: Removed invalid QTabWidget.setShortcut() calls.
+            # Keyboard shortcuts can be re-added later using QShortcut if needed.
 
             layout.addWidget(self._tabs)
 
@@ -597,12 +577,25 @@ def build_price_rows(
     return rows
 
 
-# ── GUI thread singleton ───────────────────────────────────────────────────────
-_gui_thread: Optional[threading.Thread] = None
+# ── GUI process singleton ──────────────────────────────────────────────────────
+# FIX 1: Replace threading.Thread with multiprocessing.Process so the GUI
+# runs in its own process with its own main thread (PyQt5 requirement).
+_gui_process: Optional[multiprocessing.Process] = None
+
+
+def _run_gui_process(refresh_seconds: float) -> None:
+    """QApplication event loop entry point for the GUI process.
+    
+    FIX 3: Creates a fresh QApplication since this runs in a separate process.
+    """
+    app = QApplication(sys.argv)
+    window = TradeBotMainWindow(refresh_seconds=refresh_seconds)
+    window.show()
+    sys.exit(app.exec_())
 
 
 def launch_dashboard(refresh_seconds: float = 5.0) -> None:
-    """Launch the PyQt5 desktop GUI in a separate daemon thread.
+    """Launch the PyQt5 desktop GUI in a separate OS process.
 
     Checks three conditions before spawning:
       1. dev_mode == False
@@ -612,7 +605,7 @@ def launch_dashboard(refresh_seconds: float = 5.0) -> None:
     When any condition fails, logs a message and returns silently.
     The bot never crashes when PyQt5 is missing.
     """
-    global _gui_thread
+    global _gui_process
 
     if dev_mode:
         logger.info("Dashboard launch skipped: dev_mode=True (headless operation)")
@@ -625,17 +618,16 @@ def launch_dashboard(refresh_seconds: float = 5.0) -> None:
         )
         return
 
-    if _gui_thread is not None and _gui_thread.is_alive():
+    if _gui_process is not None and _gui_process.is_alive():
         logger.warning("Dashboard already running, skipping duplicate launch")
         return
 
-    def _run_gui() -> None:
-        """QApplication event loop (runs in daemon thread)."""
-        app = QApplication(sys.argv)
-        window = TradeBotMainWindow(refresh_seconds=refresh_seconds)
-        window.show()
-        app.exec_()
-
-    _gui_thread = threading.Thread(target=_run_gui, daemon=True, name="pyqt5-dashboard")
-    _gui_thread.start()
+    # FIX 1: Spawn a separate process instead of a thread.
+    _gui_process = multiprocessing.Process(
+        target=_run_gui_process,
+        args=(refresh_seconds,),
+        daemon=True,
+        name="pyqt5-dashboard",
+    )
+    _gui_process.start()
     logger.info("PyQt5 dashboard launched in separate desktop window.")
