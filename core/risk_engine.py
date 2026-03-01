@@ -1,14 +1,24 @@
 # CHANGES:
-# Fix M5 — In pre_trade_checks(), after computing kelly_f via _kelly_fraction(),
-#   multiply the result by s_scale before computing raw_risk_pct:
-#   kelly_f = kelly_f * s_scale.  This ensures a neutral-sentiment trade
-#   (s_scale ≈ 1.0) is unaffected, a high-confidence positive trade
-#   (s_scale = 1.3) receives proportionally larger sizing, and a no-trade
-#   negative threshold (s_scale = 0.0) zeroes out Kelly sizing without relying
-#   on the upstream s_scale == 0.0 guard alone.  No variable renames.
+# FIX 3 — Kelly path in pre_trade_checks() now applies min_risk_per_trade_pct as
+#   the floor for risk_pct, matching the fixed-fractional path.  Changed:
+#     max(0.0, raw_risk_pct)
+#   to:
+#     max(self.limits.min_risk_per_trade_pct, raw_risk_pct)
+#   This prevents a very low kelly_f from collapsing risk_pct to zero and
+#   producing qty=0 (silently wasted candidate evaluation).
 #
-# All prior changes (Change 2, Change 4, Improvement A, Improvement C) are
-# preserved unchanged.
+# FIX 4 — _vol_history is now a per-symbol Dict[str, deque] instead of a single
+#   shared deque.  A single shared deque caused cross-symbol vol contamination:
+#   one high-vol symbol (TSLA, NVDA) shifted the median upward and under-sized
+#   all normal-vol symbols.
+#   In __init__: self._vol_history: Dict[str, deque] = {}
+#   In _kelly_fraction(): added symbol: str = "" parameter (default preserves all
+#   existing call sites).  Inside the method, per-symbol deque is created on
+#   first use (maxlen=200) and all percentile logic uses that deque exclusively.
+#   In pre_trade_checks(): _kelly_fraction() call now passes symbol=symbol.
+#
+# All prior changes (Fix M5, Change 2, Change 4, Improvement A, Improvement C)
+# are preserved unchanged.
 
 import math
 from collections import deque
@@ -71,10 +81,11 @@ class RiskEngine:
         self.limits = risk_limits
         self.sentiment_cfg = sentiment_cfg
         self.instrument_meta = instrument_meta
-        # Improvement A: rolling vol history for adaptive percentile normalisation.
-        # maxlen=200 keeps roughly the last 200 position-sizing calls (~3-4 hours
-        # at 600s sleep with a moderate symbol count).
-        self._vol_history: deque = deque(maxlen=200)
+        # FIX 4: per-symbol vol history dict replaces the single shared deque.
+        # Key = symbol str, value = deque(maxlen=200).
+        # Previously self._vol_history = deque(maxlen=200) was a single pool
+        # that mixed all symbols' volatilities, biasing the percentile normaliser.
+        self._vol_history: Dict[str, deque] = {}
 
     def sentiment_scale(self, s: float) -> float:
         """
@@ -99,12 +110,19 @@ class RiskEngine:
         s_scale: float,
         volatility: float,
         s: float = 0.0,
+        symbol: str = "",
     ) -> float:
         """
         Compute a Half-Kelly multiplier in [0.0, 1.0].
 
+        FIX 4: added symbol: str = "" parameter.  Volatility history is now
+          maintained per-symbol in self._vol_history[symbol] (deque maxlen=200).
+          The percentile normaliser therefore reflects each symbol's own vol
+          distribution rather than the cross-symbol pool.
+          Existing call sites that do not pass symbol still work (default "").
+
         Improvement A: adaptive vol normalisation.
-          volatility is appended to self._vol_history on every call.
+          volatility is appended to the symbol's deque on every call.
           If len >= 20, vol_norm = percentile(history, kelly_vol_norm_percentile).
           Otherwise vol_norm = 0.002 (warm-up fallback).
           volfactor = volatility / vol_norm if volatility > 0 else 0.0.
@@ -137,10 +155,15 @@ class RiskEngine:
         full_kelly = (p * b - q) / b
         half_kelly = full_kelly * 0.5
 
-        # Improvement A: append to history and compute adaptive vol_norm.
-        self._vol_history.append(volatility)
-        if len(self._vol_history) >= 20:
-            sorted_hist = sorted(self._vol_history)
+        # FIX 4: per-symbol deque — create on first use.
+        if symbol not in self._vol_history:
+            self._vol_history[symbol] = deque(maxlen=200)
+        hist = self._vol_history[symbol]
+        hist.append(volatility)
+
+        # Improvement A: adaptive percentile normalisation using symbol-local history.
+        if len(hist) >= 20:
+            sorted_hist = sorted(hist)
             pct = self.limits.kelly_vol_norm_percentile
             # Linear interpolation for the given percentile.
             idx_f = pct * (len(sorted_hist) - 1)
@@ -237,15 +260,18 @@ class RiskEngine:
         if self.limits.enable_kelly_sizing:
             # Change 4 / Improvement C: pass s=sentiment.score to separate tech
             # from sentiment and apply log-odds blending.
+            # FIX 4: pass symbol=symbol so _kelly_fraction uses per-symbol vol history.
             kelly_f = self._kelly_fraction(signal_score, s_scale, volatility,
-                                           s=sentiment.score)
+                                           s=sentiment.score, symbol=symbol)
             # Fix M5: apply s_scale as a multiplier so sentiment strength
             # differentiates sizing within the Kelly path.
             kelly_f = kelly_f * s_scale
             raw_risk_pct = kelly_f * self.limits.max_risk_per_trade_pct
+            # FIX 3: apply min_risk_per_trade_pct floor (was max(0.0, ...)).
+            # Matches the fixed-fractional path and prevents qty=0 from a tiny kelly_f.
             risk_pct = min(
                 self.limits.max_risk_per_trade_pct,
-                max(0.0, raw_risk_pct),
+                max(self.limits.min_risk_per_trade_pct, raw_risk_pct),
             )
         else:
             raw_risk_pct = self.limits.max_risk_per_trade_pct * s_scale

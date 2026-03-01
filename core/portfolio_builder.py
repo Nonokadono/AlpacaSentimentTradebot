@@ -1,15 +1,18 @@
 # CHANGES:
-# Fix C4 — Enforce max_positions_per_sector in build_portfolio() selection loop.
-#   sector_counts: Dict[str, int] is initialised to {} before the for t in
-#   feasible loop.  Before appending t to selected, the symbol's sector is
-#   looked up from self.cfg.instruments (defaulting to "UNKNOWN" if missing).
-#   If sector_counts.get(sector, 0) >= self.cfg.portfolio.max_positions_per_sector,
-#   the candidate is skipped via continue.  Otherwise sector_counts[sector] is
-#   incremented.  No variable renames.
-# Fix H4 — Added volatility=sig.volatility as a named keyword argument to the
-#   self.risk_engine.pre_trade_checks() call in _build_candidate_for_symbol().
-#   Previously this was omitted, so the Kelly path always received volatility=0.0
-#   (the default), making the adaptive vol_norm history useless for new trades.
+# FIX 1 — sector_counts pre-seeded from existing `positions` before the feasible
+#   candidate selection loop begins.  Iterates over every symbol in `positions`,
+#   looks up its InstrumentMeta, and increments sector_counts so that already-open
+#   TECH (or any other sector) positions are visible to the per-sector cap check.
+#   Without this, a bot restart with 3 open TECH positions would admit a 4th because
+#   the counter started empty.
+#
+# FIX 2 — UNKNOWN-sector symbols (meta is None) are now exempt from the sector cap
+#   check entirely.  Previously all missing-meta symbols shared one "UNKNOWN" bucket
+#   and competed for the same cap slots, incorrectly blocking unrelated symbols.
+#   Guard changed to:  if meta is not None and sector_counts.get(...) >= cap: continue
+#   Sector counter is only incremented when meta is not None.
+#
+# All prior changes (Fix C4, Fix H4) are preserved unchanged.
 
 from typing import Dict, List, Any
 
@@ -162,8 +165,22 @@ class PortfolioBuilder:
         selected: List[ProposedTrade] = []
         current_gross = snapshot.gross_exposure
         current_open_positions = len(positions)
+
         # Fix C4: per-sector position counter initialised before the loop.
         sector_counts: Dict[str, int] = {}
+
+        # FIX 1: Pre-seed sector_counts with sectors of already-open positions so
+        # that existing holdings count against the per-sector cap from the start.
+        # Without this, a bot restart with N open TECH positions would not
+        # recognise them and admit further TECH candidates up to the cap.
+        for sym in positions:
+            meta = self.cfg.instruments.get(sym)
+            if meta is not None:
+                sector = meta.sector
+                sector_counts[sector] = sector_counts.get(sector, 0) + 1
+            # FIX 2: If meta is None we do NOT create an "UNKNOWN" entry here —
+            # missing-meta symbols are exempt from the cap entirely (see selection
+            # loop below), so pre-seeding "UNKNOWN" would be misleading.
 
         for t in feasible:
             # Secondary guard (defensive): never select a symbol already in positions.
@@ -181,18 +198,23 @@ class PortfolioBuilder:
             if projected_positions > self.cfg.risk_limits.max_open_positions:
                 continue
 
-            # Fix C4: enforce max_positions_per_sector.
+            # Fix C4 / FIX 2: enforce max_positions_per_sector.
+            # FIX 2: symbols whose InstrumentMeta is missing (meta is None) are
+            # treated as uncapped — they do NOT share an "UNKNOWN" bucket that
+            # would incorrectly block unrelated missing-meta symbols.
             meta = self.cfg.instruments.get(t.symbol)
-            sector = meta.sector if meta is not None else "UNKNOWN"
-            if sector_counts.get(sector, 0) >= self.cfg.portfolio.max_positions_per_sector:
-                continue
+            if meta is not None:
+                sector = meta.sector
+                if sector_counts.get(sector, 0) >= self.cfg.portfolio.max_positions_per_sector:
+                    continue
 
             selected.append(t)
             current_gross = projected_gross
             if new_symbol:
                 current_open_positions = projected_positions
-            # Fix C4: increment sector counter after selection.
-            sector_counts[sector] = sector_counts.get(sector, 0) + 1
+            # Fix C4 / FIX 2: only increment when meta is not None.
+            if meta is not None:
+                sector_counts[sector] = sector_counts.get(sector, 0) + 1
 
         if not selected:
             return []

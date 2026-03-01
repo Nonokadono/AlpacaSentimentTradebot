@@ -1,17 +1,19 @@
 # CHANGES:
-# Fix L3 — Added conflict_dampener_penalty: float = 0.6 as an explicit field in
-#   TechnicalSignalConfig. Previously it was absent and SignalEngine accessed it
-#   via getattr(..., 0.6) fallback, making it invisible to introspection and
-#   serialisation. No existing fields removed or renamed.
+# FIX 7 — Added ema_crossover_norm_scale: float = 0.10 to TechnicalSignalConfig.
+#   Previously _compute_simple_momentum_raw() divided raw EMA crossover by
+#   momentum_norm_scale (0.05), causing saturation at ±1 for high-momentum
+#   equities where the EMA spread exceeds 5%.  The new field widens the graded
+#   range to ±10%.  Existing momentum_norm_scale (used by
+#   _normalize_momentum_trend()) is unchanged.  New field carries a default so
+#   backward compatibility with all existing configs is maintained.
 #
-# All other fields and classes are unchanged.
+# All prior changes (Fix L3, Change 2, Change 4) are preserved unchanged.
 
 import os
 import yaml
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Dict
-
 
 ENV_MODE = os.getenv("APCA_API_ENV", "PAPER").upper()
 if ENV_MODE not in ("PAPER", "LIVE"):
@@ -50,11 +52,11 @@ class SentimentConfig:
     max_scale: float = 1.3
     no_trade_negative_threshold: float = -0.4
     # --- Sentiment-exit thresholds ---
-    # Hard exit: raw_discrete == -2 → always close, no delta check (unchanged).
+    # Hard exit: raw_discrete == -2 -> always close, no delta check (unchanged).
     #
     # Soft exit: fires when delta > soft_exit_delta_threshold AND
     #            confidence > exit_confidence_min.
-    #            Catches partial deterioration (e.g. +0.7 → 0.0, delta=0.70).
+    #            Catches partial deterioration (e.g. +0.7 -> 0.0, delta=0.70).
     soft_exit_delta_threshold: float = 0.6
     #
     # Strong exit: fires when delta > strong_exit_delta_threshold AND
@@ -67,7 +69,7 @@ class SentimentConfig:
     exit_confidence_min: float = 0.5
     #
     # Improvement E: exponent applied to confidence before multiplying by base.
-    # gamma=1.0 → linear (original behaviour); gamma=2.0 → convex weighting
+    # gamma=1.0 -> linear (original behaviour); gamma=2.0 -> convex weighting
     # that rewards high-confidence scores more and down-weights low-confidence
     # ones.  Clamped to [1.0, 4.0] at runtime.
     confidence_gamma: float = 2.0
@@ -104,6 +106,11 @@ class TechnicalSignalConfig:
     # Fix L3: explicit field so it is visible to introspection/serialisation
     # and can be overridden via config.  Previously accessed via getattr fallback.
     conflict_dampener_penalty: float = 0.6
+    # FIX 7: normalisation scale for EMA crossover signal.
+    # Wider than momentum_norm_scale (0.05) to prevent ±1 saturation for
+    # high-momentum equities (NVDA, TSLA) where EMA spread can exceed 5%.
+    # 0.10 allows a graded signal up to ±10% EMA divergence.
+    ema_crossover_norm_scale: float = 0.10
 
 
 @dataclass
