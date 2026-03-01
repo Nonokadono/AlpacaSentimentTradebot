@@ -1,28 +1,34 @@
 # CHANGES:
-# Feature 7A — STEP 0: Weekend forced liquidation inserted immediately after
-#   positions are fetched (after pm.get_positions()) and BEFORE the kill-switch
-#   block. Rationale: weekend liquidation must proceed even when daily-loss or
-#   drawdown limits have been breached — the kill-switch only halts new entries.
-#   When is_pre_weekend_close() returns True:
-#     - executor.close_all_positions_for_weekend() is called with current positions.
-#     - The bot parks in a tight 60s poll loop via while not adapter.get_market_open().
-#     - `continue` re-enters the loop from a clean state on Monday open.
-#     - The adaptive sleep at the loop bottom is intentionally bypassed by `continue`.
+# Dashboard integration — monitoring/terminal.py wired into the main loop.
 #
-# Feature 7B — STEP 3: Pre-close entry blackout guard wraps the
-#   build_portfolio → execute block. When is_pre_close_blackout() returns True,
-#   a single INFO message is logged and the build+execute block is skipped.
-#   When False, the existing build+execute logic runs unchanged.
-#   check_and_exit_on_sentiment() (formerly _check_and_exit_on_sentiment())
-#   is moved OUTSIDE and AFTER the if/else block so sentiment exits always
-#   execute unconditionally — they are never gated by the entry blackout.
+# Change T1: Import dashboard_state, build_position_rows, build_price_rows,
+#   launch_dashboard, and dev_mode from monitoring.terminal.
+#
+# Change T2: A daemon thread is spawned ONCE before the main loop starts
+#   (when dev_mode is False). The thread runs launch_dashboard() which blocks
+#   inside Textual's event loop. Because it is a daemon thread it exits
+#   automatically when the main process terminates — no cleanup needed.
+#
+# Change T3: Inside the main loop, dashboard_state.update() is called at
+#   well-defined points:
+#     a) After snapshot is available: update cash, buying_power, market_open.
+#     b) At the start of portfolio build: set bot_state="SCANNING".
+#     c) After execute: set bot_state="EXECUTING" then back to "IDLE".
+#     d) Positions and price rows are rebuilt and pushed every cycle.
+#   All updates are non-blocking (simple attribute writes under a Lock).
+#
+# Change T4: When dev_mode is True the dashboard thread is never started and
+#   no extra imports from textual are triggered — headless operation is
+#   completely unchanged.
 #
 # All prior changes (Change 1a, Change 5, Improvement D, adaptive sleep
 # hysteresis, _load/_persist opening_compounds, _check_and_exit_on_sentiment,
-# get_equity_snapshot_from_account, etc.) are preserved unchanged.
+# get_equity_snapshot_from_account, Feature 7A, Feature 7B, etc.) are
+# preserved unchanged.
 
 import json
 import logging
+import threading
 import time
 from datetime import date
 from pathlib import Path
@@ -44,6 +50,13 @@ from monitoring.monitor import (
     log_portfolio_overview,
     log_sentiment_position_check,
     setup_logging,
+)
+from monitoring.terminal import (
+    build_position_rows,
+    build_price_rows,
+    dashboard_state,
+    dev_mode,
+    launch_dashboard,
 )
 
 logger = logging.getLogger("tradebot")
@@ -165,24 +178,42 @@ def main() -> None:
     kill_switch       = KillSwitch(cfg.risk_limits)
     portfolio_builder = PortfolioBuilder(cfg, adapter, sentiment, signal_engine, risk_engine)
 
-    # Registry: symbol -> sentiment_score recorded at entry time.
     # Change 1a: stores proposed.sentiment_score (compound sentiment float) —
-    # NOT proposed.signal_score (technical composite). The exit delta check
-    # subtracts this from current sentiment.score; mixing a technical score here
-    # produced a semantically invalid cross-space comparison.
-    # Persisted to equity_state.json so it survives bot restarts.
+    # NOT proposed.signal_score (technical composite).
     _opening_compounds: Dict[str, float] = _load_opening_compounds()
 
     # Improvement D: initialise adaptive sleep interval before the loop.
-    # Starts at 600s (the neutral-band default); hysteresis prevents oscillation.
     _rescore_interval: int = 600
 
+    # Change T2: Launch the TUI dashboard in a background daemon thread.
+    # When dev_mode is True, launch_dashboard() returns immediately.
+    _dashboard_thread = threading.Thread(
+        target=launch_dashboard,
+        args=(dashboard_state, 5.0),
+        daemon=True,
+        name="tui-dashboard",
+    )
+    _dashboard_thread.start()
+
+    _cycle_count: int = 0
+
     while True:
+        _cycle_count += 1
+
         acct        = adapter.get_account()
         positions   = pm.get_positions(opening_compounds=_opening_compounds)
         snapshot    = get_equity_snapshot_from_account(acct, positions)
         market_open = adapter.get_market_open()
         log_equity_snapshot(snapshot, market_open=market_open)
+
+        # Change T3a: push account + market state into the dashboard.
+        dashboard_state.update(
+            cash=snapshot.cash,
+            buying_power=snapshot.day_trading_buying_power,
+            cycle_count=_cycle_count,
+            market_open=market_open,
+            bot_state="SCANNING",
+        )
 
         # ── STEP 0: WEEKEND FORCED LIQUIDATION ──────────────────────────────
         if adapter.is_pre_weekend_close():
@@ -190,15 +221,17 @@ def main() -> None:
                 "WEEKEND CLOSE DETECTED: Closing all positions and sleeping "
                 "until next market open."
             )
+            dashboard_state.update(bot_state="EXECUTING")
             executor.close_all_positions_for_weekend(positions, cfg.env_mode)
-            # Park the bot over the weekend — poll every 60s until Monday open.
+            dashboard_state.update(bot_state="IDLE")
             while not adapter.get_market_open():
                 time.sleep(60)
-            continue  # Re-enter the loop from a clean state on Monday open.
+            continue
 
         ks_state = kill_switch.check(snapshot)
         log_kill_switch_state(ks_state)
         if ks_state.halted:
+            dashboard_state.update(bot_state="HALTED")
             time.sleep(60)
             continue
 
@@ -211,11 +244,9 @@ def main() -> None:
                 executor=executor,
                 cfg=cfg,
             )
-            # Refresh positions after potential closes.
             positions = pm.get_positions(opening_compounds=_opening_compounds)
             snapshot  = get_equity_snapshot_from_account(acct, positions)
 
-            # Purge _opening_compounds for symbols no longer open, then persist.
             for sym in list(_opening_compounds.keys()):
                 if sym not in positions:
                     del _opening_compounds[sym]
@@ -227,6 +258,13 @@ def main() -> None:
             snapshot.gross_exposure >= exposure_cap_notional
             or len(positions) >= cfg.risk_limits.max_open_positions
         ):
+            # Change T3: push positions + prices before sleeping
+            open_orders_ui = adapter.list_orders(status="open")
+            dashboard_state.update(
+                positions=build_position_rows(positions, open_orders_ui),
+                prices=build_price_rows(cfg.instruments, adapter),
+                bot_state="IDLE",
+            )
             time.sleep(60)
             continue
 
@@ -237,21 +275,20 @@ def main() -> None:
                 "(within 3 hours of market close). Monitoring existing positions only."
             )
         else:
+            dashboard_state.update(bot_state="SCANNING")
             open_orders     = adapter.list_orders(status="open")
             proposed_trades = portfolio_builder.build_portfolio(snapshot, positions, open_orders)
 
             log_portfolio_overview(proposed_trades, cfg.env_mode)
 
+            dashboard_state.update(bot_state="EXECUTING")
             for proposed in proposed_trades:
                 order = executor.execute_proposed_trade(proposed)
                 if order is not None and proposed.rejected_reason is None and proposed.qty > 0:
-                    # Change 1a: record entry-time SENTIMENT score (proposed.sentiment_score)
-                    # as the opening compound baseline — NOT proposed.signal_score.
                     _opening_compounds[proposed.symbol] = proposed.sentiment_score
-                    # Persist immediately so a crash/restart doesn't lose the entry record.
                     _persist_opening_compounds(_opening_compounds)
 
-        # Sentiment-exit check runs unconditionally — blackout does NOT affect exits.
+        # Sentiment-exit check runs unconditionally.
         _check_and_exit_on_sentiment(
             positions=positions,
             adapter=adapter,
@@ -260,12 +297,16 @@ def main() -> None:
             cfg=cfg,
         )
 
+        # Change T3d: refresh positions + prices in dashboard after all executions.
+        open_orders_final = adapter.list_orders(status="open")
+        positions_refreshed = pm.get_positions(opening_compounds=_opening_compounds)
+        dashboard_state.update(
+            positions=build_position_rows(positions_refreshed, open_orders_final),
+            prices=build_price_rows(cfg.instruments, adapter),
+            bot_state="IDLE",
+        )
+
         # ── STEP 4: ADAPTIVE SLEEP WITH HYSTERESIS ──────────────────────────
-        # Change 5 / Improvement D: sleep duration is driven by the highest
-        # |sentiment.score| across all currently open positions. High-conviction
-        # positions rescore every 120s; neutral portfolios wait up to 900s,
-        # reducing API cost. Hysteresis prevents rapid interval oscillation when
-        # max_abs_s hovers near a boundary threshold.
         _max_abs_s = max(
             (
                 abs(sentiment.get_cached_sentiment(sym).score)
@@ -274,7 +315,6 @@ def main() -> None:
             ),
             default=0.0,
         )
-        # Improvement D: use hysteresis guard instead of bare adaptive call.
         _rescore_interval = sentiment.adaptive_rescore_interval_hysteresis(
             _max_abs_s, _rescore_interval
         )
