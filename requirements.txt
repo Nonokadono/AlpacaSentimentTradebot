@@ -1,3 +1,4 @@
 alpaca-trade-api>=3.0.0
 PyYAML>=6.0
 pytz>=2024.1
+PyQt5
