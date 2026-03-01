@@ -1,11 +1,6 @@
-# CHANGES:
-# - Added get_clock() method that returns the raw Alpaca clock object (is_open, next_close, next_open).
-#   This exposes next_close so main.py can compute time-until-close without a second API call.
-#   get_market_open() is unchanged and still used everywhere else.
-
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import alpaca_trade_api as tradeapi
@@ -63,6 +58,114 @@ class AlpacaAdapter:
             clock = self.rest.get_clock()
             return bool(clock.is_open)
         except Exception:
+            return False
+
+    def get_market_close_time(self) -> Optional[datetime]:
+        """
+        Return the next scheduled market close as a timezone-aware datetime
+        (UTC), or None if unavailable.
+
+        Implementation rules:
+        - Calls self.get_clock() — does NOT call self.rest.get_clock() directly.
+        - If get_clock() returns None, returns None immediately.
+        - Parses clock.next_close (an ISO 8601 string) into a timezone-aware
+          datetime using datetime.fromisoformat() or a compatible parser.
+        - Ensures the result is UTC-aware. If the parsed datetime is naive,
+          attaches UTC via .replace(tzinfo=timezone.utc).
+        - Catches all exceptions, logs at WARNING level, and returns None.
+        - Never raises.
+        """
+        try:
+            clock = self.get_clock()
+            if clock is None:
+                return None
+            raw_close = clock.next_close
+            # next_close may be a string or already a datetime-like object.
+            if isinstance(raw_close, datetime):
+                dt = raw_close
+            else:
+                dt = datetime.fromisoformat(str(raw_close).replace("Z", "+00:00"))
+            # Ensure offset-aware UTC.
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception as e:
+            logger.warning(f"get_market_close_time error: {e}")
+            return None
+
+    def is_pre_weekend_close(self, minutes_before: int = 12) -> bool:
+        """
+        Return True if and only if ALL of the following are true:
+          1. The market is currently open (self.get_market_open() is True).
+          2. The next scheduled close falls on a Friday (weekday() == 4),
+             evaluated in the UTC timezone of the parsed close datetime.
+          3. The current UTC time is within `minutes_before` minutes of
+             that close.
+
+        The default of 12 minutes is intentional: the main loop cycle is
+        600 seconds (10 min). A 12-minute window guarantees this check
+        fires at least once before close, even under scheduling jitter,
+        without producing false positives during intra-week closes.
+
+        Implementation rules:
+        - Calls self.get_market_close_time() — does NOT call get_clock() again.
+        - Uses datetime.utcnow().replace(tzinfo=timezone.utc) for the current
+          time to ensure offset-aware arithmetic.
+        - Catches all exceptions, logs at WARNING level, and returns False.
+        - Never raises.
+        """
+        try:
+            if not self.get_market_open():
+                return False
+            close_time = self.get_market_close_time()
+            if close_time is None:
+                return False
+            # Check that the close falls on a Friday (weekday 4).
+            if close_time.weekday() != 4:
+                return False
+            now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+            minutes_until_close = (close_time - now_utc).total_seconds() / 60.0
+            return 0 <= minutes_until_close <= minutes_before
+        except Exception as e:
+            logger.warning(f"is_pre_weekend_close error: {e}")
+            return False
+
+    def is_pre_close_blackout(self, blackout_minutes: int = 180) -> bool:
+        """
+        Return True if the market is currently open AND the current UTC time
+        is within `blackout_minutes` minutes of the next scheduled close,
+        on ANY day of the week.
+
+        Default is 180 minutes (3 hours). On a standard 09:30–16:00 ET
+        session this suppresses new entries from 13:00 ET onward.
+
+        Implementation rules:
+        - Calls self.get_market_close_time() — does NOT call get_clock() again.
+          get_market_close_time() is shared by both is_pre_weekend_close()
+          and is_pre_close_blackout(). The clock API is never called more than
+          once per logical check.
+        - Uses datetime.utcnow().replace(tzinfo=timezone.utc) for the current
+          time.
+        - Emits a single logger.debug() message when returning True.
+        - Catches all exceptions, logs at WARNING level, and returns False.
+        - Never raises.
+        """
+        try:
+            if not self.get_market_open():
+                return False
+            close_time = self.get_market_close_time()
+            if close_time is None:
+                return False
+            now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+            minutes_until_close = (close_time - now_utc).total_seconds() / 60.0
+            if 0 <= minutes_until_close <= blackout_minutes:
+                logger.debug(
+                    f"PRE-CLOSE BLACKOUT active: {minutes_until_close:.1f}m until market close."
+                )
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"is_pre_close_blackout error: {e}")
             return False
 
     # --- Market data ---

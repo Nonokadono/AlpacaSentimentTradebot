@@ -1,21 +1,30 @@
 # CHANGES:
-# Fix M6 — In scorenews(), added type-coercion for the sentiment field before
-#   the membership check.  After sentiment = result.get("sentiment", 0), we now
-#   apply: try: sentiment = int(round(float(sentiment))) except (TypeError,
-#   ValueError): sentiment = 0.  This handles model responses that return the
-#   value as a float string (e.g. "-1.0") or a bare float, which would
-#   previously fall through the `if sentiment not in (-2,-1,0,1)` guard and
-#   silently become 0.  No variable renames.
+# GROQ MIGRATION — Replace Gemini with Groq (llama-3.1-8b-instant).
+#   - _GROQ_URL points to Groq's OpenAI-compat endpoint.
+#   - apikey reads GROQ_API_KEY env var.
+#   - model changed to "llama-3.1-8b-instant" (30 RPM / 14,400 RPD free tier).
+#   - _INTER_CALL_DELAY_SEC reduced from 6.0 to 2.0 — Groq allows 30 RPM so
+#     2s spacing gives comfortable headroom for 8 symbols/loop.
+#   - max_tokens kept at 1024 to prevent truncation.
+#   - All error handling, markdown fence stripping, and parse logic unchanged.
 
-# aiclient.py
 import json
+import logging
 import os
+import time
 import requests
+
+logger = logging.getLogger("tradebot")
+
+_GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+_GROQ_MODEL = "llama-3.1-8b-instant"
+# Groq free tier is 30 RPM. 2s spacing = max 30 calls/min with headroom.
+_INTER_CALL_DELAY_SEC = 2.0
 
 
 class NewsReasoner:
     """
-    Uses Perplexity's Chat Completions API (OpenAI-compatible with the sonar model)
+    Uses Groq (llama-3.1-8b-instant) via the OpenAI-compatible endpoint
     to score short-term news sentiment.
 
     Returns a dict with keys:
@@ -25,11 +34,16 @@ class NewsReasoner:
     """
 
     def __init__(self) -> None:
-        # Read directly from environment variables
-        self.apiurl = os.getenv("AI_API_URL", "https://api.perplexity.ai/chat/completions")
-        self.apikey = os.getenv("AI_API_KEY")
+        self.apiurl = _GROQ_URL
+        self.apikey = os.getenv("GROQ_API_KEY")
         if not self.apikey:
-            raise RuntimeError("AI_API_KEY is not set. Please export your Perplexity API key.")
+            logger.warning(
+                "GROQ_API_KEY is not set — NewsReasoner disabled. "
+                "All sentiment scores will be neutral (0) until the key is provided."
+            )
+            self.disabled = True
+        else:
+            self.disabled = False
 
     def scorenews(self, symbol: str, newsitems):
         """
@@ -42,13 +56,24 @@ class NewsReasoner:
             - confidence: float 0-1
             - explanation: str
         """
+        if self.disabled:
+            return {
+                "sentiment": 0,
+                "confidence": 0.0,
+                "explanation": "NewsReasoner disabled (GROQ_API_KEY not set).",
+            }
+
+        # Rate-limit guard: enforce minimum spacing between API calls to stay
+        # under the 30 RPM free-tier cap regardless of how fast the loop runs.
+        time.sleep(_INTER_CALL_DELAY_SEC)
+
         try:
             # No news -> neutral, low confidence
             if not newsitems:
                 return {
                     "sentiment": 0,
                     "confidence": 0.0,
-                    "explanation": "No recent news."
+                    "explanation": "No recent news.",
                 }
 
             # Build compact headlines + summaries for up to 10 news items
@@ -64,7 +89,7 @@ class NewsReasoner:
                 return {
                     "sentiment": 0,
                     "confidence": 0.0,
-                    "explanation": "No usable news text."
+                    "explanation": "No usable news text.",
                 }
 
             userprompt = (
@@ -88,13 +113,14 @@ class NewsReasoner:
                 "Content-Type": "application/json",
             }
             payload = {
-                "model": "sonar",
+                "model": _GROQ_MODEL,
                 "messages": [
                     {
                         "role": "system",
                         "content": (
                             "You are a precise financial sentiment classifier. "
-                            "You only output strict JSON with the requested keys."
+                            "You only output strict JSON with the requested keys. "
+                            "Do not wrap your response in markdown code fences."
                         ),
                     },
                     {
@@ -103,13 +129,26 @@ class NewsReasoner:
                     },
                 ],
                 "temperature": 0.1,
-                "max_tokens": 300,
+                "max_tokens": 1024,
             }
 
             resp = requests.post(self.apiurl, headers=headers, json=payload, timeout=30)
+
+            if resp.status_code == 429:
+                logger.warning(
+                    f"Groq API rate-limited (429) for {symbol} — treating sentiment as neutral. "
+                    f"Check free-tier RPM/RPD quota."
+                )
+                return {
+                    "sentiment": 0,
+                    "confidence": 0.0,
+                    "explanation": "Groq API rate limit hit; treating sentiment as neutral.",
+                }
+
             if not resp.ok:
-                # Log error and degrade gracefully to neutral sentiment
-                print("Perplexity error", resp.status_code, resp.text)
+                logger.warning(
+                    f"Groq API error {resp.status_code} for {symbol} — treating sentiment as neutral."
+                )
                 return {
                     "sentiment": 0,
                     "confidence": 0.0,
@@ -118,6 +157,15 @@ class NewsReasoner:
 
             data = resp.json()
             rawcontent = data["choices"][0]["message"]["content"].strip()
+
+            logger.debug(f"Groq raw response for {symbol}: {rawcontent!r}")
+
+            # Strip markdown code fences if model wraps response despite instructions.
+            if rawcontent.startswith("```"):
+                rawcontent = rawcontent.strip("`")
+                if rawcontent.startswith("json"):
+                    rawcontent = rawcontent[4:]
+                rawcontent = rawcontent.strip()
 
             # Expect JSON, fallback to extracting JSON substring if needed
             try:
@@ -161,7 +209,7 @@ class NewsReasoner:
 
         except Exception as e:
             # Normalize fields on any unexpected error
-            print("scorenews error", e)
+            logger.warning(f"scorenews error for {symbol}: {e}")
             return {
                 "sentiment": 0,
                 "confidence": 0.0,

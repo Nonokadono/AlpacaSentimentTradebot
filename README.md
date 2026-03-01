@@ -52,8 +52,7 @@ All credentials and mode flags are injected via environment variables — **neve
 
 | Variable | Description |
 |---|---|
-| `AI_API_KEY` | Perplexity API key for the Sonar sentiment model |
-| `AI_API_URL` | Defaults to `https://api.perplexity.ai/chat/completions` |
+| `GEMINI_API_KEY` | Perplexity API key for the Sonar sentiment model |
 
 ### PAPER mode (default)
 
@@ -62,7 +61,7 @@ export APCA_API_ENV=PAPER
 export APCA_API_BASE_URL=https://paper-api.alpaca.markets
 export APCA_API_KEY_ID=your_paper_key
 export APCA_API_SECRET_KEY=your_paper_secret
-export AI_API_KEY=your_perplexity_key
+export GEMINI_API_KEY=your_gemini_key
 ```
 
 ### LIVE mode
@@ -72,7 +71,7 @@ export APCA_API_ENV=LIVE
 export APCA_API_BASE_URL=https://api.alpaca.markets
 export APCA_API_KEY_ID=your_live_key
 export APCA_API_SECRET_KEY=your_live_secret
-export AI_API_KEY=your_perplexity_key
+export GEMINI_API_KEY=your_gemini_key
 export LIVE_TRADING_ENABLED=false   # keep false for dry-run; set true only after sign-off
 ```
 

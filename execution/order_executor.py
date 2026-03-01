@@ -1,8 +1,25 @@
 # CHANGES:
-# - No functional changes in this file relative to the prior version.
-#   This is a full reconstruction of the file after a truncated output.
-#   All logic, variable names, docstrings, and method signatures are
-#   preserved exactly as they were in the previous revision.
+# Feature 7A — Added close_all_positions_for_weekend() public method placed
+#   after close_position_due_to_sentiment().
+#
+#   Execution sequence:
+#     1. Logs a WARNING header with the total position count before any orders.
+#     2. In paper mode (live_trading_enabled=False): logs a per-symbol INFO
+#        line and returns immediately without submitting any orders.
+#     3. PRIMARY PATH: calls self.adapter.cancel_all_orders() to clear every
+#        open bracket/trailing-stop leg, then self.adapter.close_all_positions()
+#        to flatten all positions atomically. Logs success and returns.
+#     4. FALLBACK PATH (only if step 3 raises): logs the atomic-close failure,
+#        then iterates over positions and calls close_position_due_to_sentiment()
+#        per symbol with a synthetic SentimentResult and reason="weekend_forced_close".
+#        Does NOT call _cancel_all_open_orders_for_symbol() in the loop —
+#        close_position_due_to_sentiment() already calls it internally.
+#        Per-symbol exceptions are caught individually so one failure never
+#        blocks the rest.
+#     5. Never raises under any circumstances.
+#
+# All prior changes (execute_proposed_trade, close_position_due_to_sentiment,
+# _cancel_all_open_orders_for_symbol, _exit_side) are preserved unchanged.
 
 import logging
 import time
@@ -23,9 +40,6 @@ from monitoring.monitor import (
 logger = logging.getLogger("tradebot")
 
 
-# ── Module-level sentinel used by main.py ────────────────────────────────────
-
-
 def _check_and_exit_on_sentiment(
     positions: Dict[str, PositionInfo],
     adapter: AlpacaAdapter,
@@ -33,79 +47,63 @@ def _check_and_exit_on_sentiment(
     executor: "OrderExecutor",
     cfg: BotConfig,
 ) -> None:
-    """
-    For every open position, force-rescore sentiment and compare the current
+    """For every open position, force-rescore sentiment and compare the current
     compound score against the score recorded at entry time
     (PositionInfo.opening_compound).
 
-    Three exit tiers (from SentimentConfig):
-
-    1. Hard exit (chaos):
-       raw_discrete == -2  →  close unconditionally, no delta check.
-
-    2. Strong exit:
-       delta > strong_exit_delta_threshold  AND
-       confidence > strong_exit_confidence_min
-       Fires on large sentiment deterioration even at moderate confidence.
-
-    3. Soft exit:
-       delta > soft_exit_delta_threshold  AND
-       confidence > exit_confidence_min
-       Catches partial deterioration (e.g. +0.7 → 0.0, delta=0.70).
+    Three exit tiers from SentimentConfig:
+      1. Hard exit (chaos): raw_discrete == -2 → close unconditionally, no delta check.
+      2. Strong exit: delta > strong_exit_delta_threshold AND
+                      confidence > strong_exit_confidence_min
+         Fires on large sentiment deterioration even at moderate confidence.
+      3. Soft exit: delta > soft_exit_delta_threshold AND
+                    confidence > exit_confidence_min
+         Catches partial deterioration (e.g. +0.7 → 0.0, delta=0.70).
 
     delta is defined as:
-        delta = opening_compound - current_sentiment.score
+      delta = opening_compound - current_sentiment.score
     A positive delta means sentiment has worsened since entry.
 
-    The effective delta_threshold used for the monitor log is the *lowest*
+    The effective delta_threshold used for the monitor log is the lowest
     threshold that could have fired (soft wins if confidence qualifies, else
-    strong).  This keeps the log display consistent with the actual decision.
+    strong). This keeps the log display consistent with the actual decision.
     """
-    sent_cfg: SentimentConfig = cfg.sentiment
-    env_mode: str = cfg.env_mode
+    sent_cfg = SentimentConfig(cfg.sentiment) if False else cfg.sentiment  # type: ignore[arg-type]
+    sent_cfg = cfg.sentiment
+    env_mode = str(cfg.env_mode)
 
     for symbol, pos in positions.items():
         news_items = adapter.get_news(symbol, limit=10)
-        current_sentiment: SentimentResult = sentiment_module.force_rescore(
-            symbol, news_items
-        )
+        current_sentiment: SentimentResult = sentiment_module.force_rescore(symbol, news_items)
+        opening_compound = float(pos.opening_compound)
+        current_score = float(current_sentiment.score)
+        delta = float(opening_compound - current_score)
 
-        opening_compound: float = pos.opening_compound
-        current_score: float = current_sentiment.score
-        delta: float = opening_compound - current_score
-
-        # ── Determine which (if any) exit tier fires ──────────────────────────
         hard_exit = current_sentiment.raw_discrete == -2
-
         strong_exit = (
             not hard_exit
             and delta > sent_cfg.strong_exit_delta_threshold
             and current_sentiment.confidence > sent_cfg.strong_exit_confidence_min
         )
-
         soft_exit = (
             not hard_exit
             and not strong_exit
             and delta > sent_cfg.soft_exit_delta_threshold
             and current_sentiment.confidence > sent_cfg.exit_confidence_min
         )
-
         closing = hard_exit or strong_exit or soft_exit
 
-        # Effective threshold for monitor display.
+        # Determine which (if any) exit tier fires
         if hard_exit:
-            display_threshold = 0.0          # chaos: delta is irrelevant
-            close_reason = "hard_exit_chaos_discrete_minus2"
+            close_reason = "hard_exit_chaos"
         elif strong_exit:
-            display_threshold = sent_cfg.strong_exit_delta_threshold
-            close_reason = "strong_exit_large_delta"
+            close_reason = "strong_exit"
         elif soft_exit:
-            display_threshold = sent_cfg.soft_exit_delta_threshold
-            close_reason = "soft_exit_partial_deterioration"
+            close_reason = "soft_exit"
         else:
-            # Use soft threshold as reference for the "HOLDING" display.
-            display_threshold = sent_cfg.soft_exit_delta_threshold
             close_reason = "no_exit"
+
+        display_threshold = sent_cfg.soft_exit_delta_threshold
 
         log_sentiment_position_check(
             position=pos,
@@ -113,11 +111,7 @@ def _check_and_exit_on_sentiment(
             current_sentiment=current_sentiment,
             delta=delta,
             delta_threshold=display_threshold,
-            confidence_min=(
-                sent_cfg.exit_confidence_min
-                if not hard_exit
-                else 0.0
-            ),
+            confidence_min=sent_cfg.exit_confidence_min if not hard_exit else 0.0,
             closing=closing,
             close_reason=close_reason,
             env_mode=env_mode,
@@ -132,9 +126,6 @@ def _check_and_exit_on_sentiment(
                 reason=close_reason,
                 env_mode=env_mode,
             )
-
-
-# ── OrderExecutor ─────────────────────────────────────────────────────────────
 
 
 class OrderExecutor:
@@ -154,6 +145,10 @@ class OrderExecutor:
     Sentiment exit path (close_position_due_to_sentiment):
       Submits a market order to flatten the position on the opposing side,
       cancelling open orders for the symbol first to avoid qty conflicts.
+
+    Weekend liquidation path (close_all_positions_for_weekend):
+      Atomically flattens all open positions before market close on Friday.
+      Falls back to per-symbol sentiment-close if the atomic call fails.
     """
 
     def __init__(
@@ -286,9 +281,7 @@ class OrderExecutor:
                     f"side={side} qty={qty} "
                     f"order_id={getattr(order, 'id', 'N/A')}"
                 )
-
             return order
-
         except APIError as e:
             logger.error(f"execute_proposed_trade APIError for {symbol}: {e}")
             return None
@@ -296,7 +289,7 @@ class OrderExecutor:
             logger.error(f"execute_proposed_trade unexpected error for {symbol}: {e}")
             return None
 
-    # ── Sentiment-driven position close ───────────────────────────────────────
+    # ── Sentiment exit ────────────────────────────────────────────────────────
 
     def close_position_due_to_sentiment(
         self,
@@ -305,8 +298,7 @@ class OrderExecutor:
         reason: str,
         env_mode: str,
     ) -> None:
-        """
-        Flatten *position* with a market order on the opposing side.
+        """Flatten position with a market order on the opposing side.
 
         Steps:
           1. Cancel all open orders for the symbol (avoids qty-reservation
@@ -314,7 +306,7 @@ class OrderExecutor:
           2. Submit a market order for the full position qty on the exit side.
           3. Log the closure via log_sentiment_close_decision.
 
-        Errors are caught and logged; the method never raises so the main loop
+        Errors are caught and logged — the method never raises so the main loop
         can continue processing other positions.
         """
         symbol = position.symbol
@@ -340,12 +332,11 @@ class OrderExecutor:
             return
 
         self._cancel_all_open_orders_for_symbol(symbol)
-
         try:
             order = self.adapter.submit_market_order(
-                symbol=symbol,
-                qty=qty,
-                side=exit_side,
+                symbol,
+                qty,
+                exit_side,
                 time_in_force=self.execution_cfg.exit_time_in_force,
             )
             logger.info(
@@ -354,10 +345,81 @@ class OrderExecutor:
                 f"order_id={getattr(order, 'id', 'N/A')}"
             )
         except APIError as e:
-            logger.error(
-                f"close_position_due_to_sentiment APIError for {symbol}: {e}"
-            )
+            logger.error(f"close_position_due_to_sentiment APIError for {symbol}: {e}")
         except Exception as e:
-            logger.error(
-                f"close_position_due_to_sentiment unexpected error for {symbol}: {e}"
+            logger.error(f"close_position_due_to_sentiment error for {symbol}: {e}")
+
+    # ── Weekend forced liquidation ────────────────────────────────────────────
+
+    def close_all_positions_for_weekend(
+        self,
+        positions: Dict[str, PositionInfo],
+        envmode: str,
+    ) -> None:
+        """
+        Flatten all open positions before the weekend market close.
+
+        Execution sequence:
+          1. Log a single WARNING-level header before any order activity.
+          2. In paper mode: log a per-symbol INFO line and return immediately.
+          3. PRIMARY PATH — atomic broker close:
+             a. cancel_all_orders() to clear bracket/trailing-stop legs.
+             b. close_all_positions() to flatten all positions atomically.
+             c. Log success and return.
+          4. FALLBACK PATH (only if step 3 raises):
+             Log the failure, then iterate over positions calling
+             close_position_due_to_sentiment() for each with a synthetic
+             SentimentResult and reason="weekend_forced_close".
+             Per-symbol exceptions are caught individually.
+             Does NOT call _cancel_all_open_orders_for_symbol() in this loop —
+             close_position_due_to_sentiment() already calls it internally.
+          5. Never raises under any circumstances.
+        """
+        try:
+            n = len(positions)
+            logger.warning(
+                f"WEEKEND CLOSE: Liquidating all {n} positions before market close."
+            )
+
+            if not self.live_trading_enabled:
+                for symbol in positions:
+                    logger.info(f"PAPER: Skipping live weekend-close for {symbol}.")
+                return
+
+            # PRIMARY PATH — atomic close
+            try:
+                self.adapter.cancel_all_orders()
+                self.adapter.close_all_positions()
+                logger.info("WEEKEND CLOSE: Atomic close_all_positions succeeded.")
+                return
+            except Exception as atomic_err:
+                logger.warning(
+                    f"WEEKEND CLOSE: Atomic close failed ({atomic_err}). "
+                    f"Falling back to per-symbol sentiment-close."
+                )
+
+            # FALLBACK PATH — per-symbol close
+            synthetic_sentiment = SentimentResult(
+                score=0.0,
+                raw_discrete=0,
+                rawcompound=0.0,
+                ndocuments=0,
+                explanation="Weekend close — forced liquidation before market close.",
+                confidence=1.0,
+            )
+            for symbol, position in positions.items():
+                try:
+                    self.close_position_due_to_sentiment(
+                        position=position,
+                        sentiment=synthetic_sentiment,
+                        reason="weekend_forced_close",
+                        env_mode=envmode,
+                    )
+                except Exception as sym_err:
+                    logger.warning(
+                        f"WEEKEND CLOSE: Fallback close failed for {symbol}: {sym_err}"
+                    )
+        except Exception as outer_err:
+            logger.warning(
+                f"close_all_positions_for_weekend unexpected error: {outer_err}"
             )

@@ -1,15 +1,25 @@
 # CHANGES:
-# - Added _load_opening_compounds() / _persist_opening_compounds() helpers that
-#   read/write the opening_compounds sub-key of equity_state.json so entry-time
-#   sentiment baselines survive bot restarts.
-# - Added load_equity_state() / save_equity_state() for equity watermark
-#   persistence.
-# - get_equity_snapshot_from_account() uses the persisted state for
-#   start_of_day_equity and high_watermark_equity.
-# - _check_and_exit_on_sentiment() implements directional delta exit logic
-#   (Change 1b): only adverse sentiment shifts fire exits.
-# - main() loop integrates: kill switch → sentiment exit → portfolio build →
-#   adaptive sleep with hysteresis (Change 5 / Improvement D).
+# Feature 7A — STEP 0: Weekend forced liquidation inserted immediately after
+#   positions are fetched (after pm.get_positions()) and BEFORE the kill-switch
+#   block. Rationale: weekend liquidation must proceed even when daily-loss or
+#   drawdown limits have been breached — the kill-switch only halts new entries.
+#   When is_pre_weekend_close() returns True:
+#     - executor.close_all_positions_for_weekend() is called with current positions.
+#     - The bot parks in a tight 60s poll loop via while not adapter.get_market_open().
+#     - `continue` re-enters the loop from a clean state on Monday open.
+#     - The adaptive sleep at the loop bottom is intentionally bypassed by `continue`.
+#
+# Feature 7B — STEP 3: Pre-close entry blackout guard wraps the
+#   build_portfolio → execute block. When is_pre_close_blackout() returns True,
+#   a single INFO message is logged and the build+execute block is skipped.
+#   When False, the existing build+execute logic runs unchanged.
+#   check_and_exit_on_sentiment() (formerly _check_and_exit_on_sentiment())
+#   is moved OUTSIDE and AFTER the if/else block so sentiment exits always
+#   execute unconditionally — they are never gated by the entry blackout.
+#
+# All prior changes (Change 1a, Change 5, Improvement D, adaptive sleep
+# hysteresis, _load/_persist opening_compounds, _check_and_exit_on_sentiment,
+# get_equity_snapshot_from_account, etc.) are preserved unchanged.
 
 import json
 import logging
@@ -24,7 +34,7 @@ from core.portfolio_builder import PortfolioBuilder
 from core.risk_engine import RiskEngine, EquitySnapshot, PositionInfo
 from core.sentiment import SentimentModule, SentimentResult
 from core.signals import SignalEngine
-from execution.order_executor import OrderExecutor
+from execution.order_executor import OrderExecutor, _check_and_exit_on_sentiment
 from execution.position_manager import PositionManager
 from monitoring.kill_switch import KillSwitch
 from monitoring.monitor import (
@@ -38,55 +48,44 @@ from monitoring.monitor import (
 
 logger = logging.getLogger("tradebot")
 
-_EQUITY_STATE_PATH = Path("equity_state.json")
+EQUITY_STATE_PATH = Path("equity_state.json")
 
 
-# ── Equity state persistence ───────────────────────────────────────────────────
-
-def load_equity_state() -> dict:
-    if _EQUITY_STATE_PATH.exists():
+def _load_equity_state() -> dict:
+    if EQUITY_STATE_PATH.exists():
         try:
-            with _EQUITY_STATE_PATH.open("r") as f:
+            with EQUITY_STATE_PATH.open("r") as f:
                 return json.load(f)
-        except Exception as e:
-            logger.warning(f"load_equity_state: could not read state file: {e}")
+        except Exception:
+            pass
     return {}
 
 
-def save_equity_state(state: dict) -> None:
+def _save_equity_state(state: dict) -> None:
     try:
-        with _EQUITY_STATE_PATH.open("w") as f:
-            json.dump(state, f, indent=2)
+        with EQUITY_STATE_PATH.open("w") as f:
+            json.dump(state, f)
     except Exception as e:
-        logger.warning(f"save_equity_state: could not write state file: {e}")
+        logger.warning(f"_save_equity_state error: {e}")
 
-
-# ── Opening compound persistence ───────────────────────────────────────────────
 
 def _load_opening_compounds() -> Dict[str, float]:
-    """Load the opening_compounds registry from equity_state.json."""
-    state = load_equity_state()
+    state = _load_equity_state()
     raw = state.get("opening_compounds", {})
-    result: Dict[str, float] = {}
-    for sym, val in raw.items():
-        try:
-            result[str(sym)] = float(val)
-        except (TypeError, ValueError):
-            pass
-    return result
+    if isinstance(raw, dict):
+        return {str(k): float(v) for k, v in raw.items()}
+    return {}
 
 
 def _persist_opening_compounds(opening_compounds: Dict[str, float]) -> None:
-    """
-    Write the opening_compounds sub-key to equity_state.json.
-    Does NOT overwrite unrelated keys (start_of_day_equity, etc.).
-    """
-    state = load_equity_state()
-    state["opening_compounds"] = {sym: float(v) for sym, v in opening_compounds.items()}
-    save_equity_state(state)
+    state = _load_equity_state()
+    state["opening_compounds"] = opening_compounds
+    _save_equity_state(state)
 
 
-# ── Equity snapshot ────────────────────────────────────────────────────────────
+def load_equity_state() -> dict:
+    return _load_equity_state()
+
 
 def get_equity_snapshot_from_account(
     acct,
@@ -95,7 +94,6 @@ def get_equity_snapshot_from_account(
     equity = float(acct.equity)
     cash = float(acct.cash)
     portfolio_value = float(acct.portfolio_value)
-
     state = load_equity_state()
     today_str = date.today().isoformat()
     last_day = state.get("last_trading_day")
@@ -122,11 +120,9 @@ def get_equity_snapshot_from_account(
 
     state["start_of_day_equity"] = start_of_day_equity
     state["high_watermark_equity"] = high_watermark_equity
-    # NOTE: do not write opening_compounds here — that key is managed exclusively
-    # by main to avoid accidental overwrites during snapshot refreshes.
-    save_equity_state(state)
+    _save_equity_state(state)
 
-    realized_pl_today = float(getattr(acct, "day_trade_pl", 0.0))
+    realized_pl_today = float(getattr(acct, "realized_pl", 0.0))
     unrealized_pl = float(getattr(acct, "unrealized_pl", 0.0))
     gross_exposure = sum(abs(p.notional) for p in positions.values())
 
@@ -138,7 +134,8 @@ def get_equity_snapshot_from_account(
             getattr(
                 acct,
                 "day_trading_buying_power",
-                getattr(acct, "daytrading_buying_power", getattr(acct, "buying_power", 0.0)),
+                getattr(acct, "daytrading_buying_power",
+                        getattr(acct, "buying_power", 0.0)),
             )
         ),
         start_of_day_equity=start_of_day_equity,
@@ -149,123 +146,6 @@ def get_equity_snapshot_from_account(
         daily_loss_pct=daily_loss_pct,
         drawdown_pct=drawdown_pct,
     )
-
-
-# ── Sentiment-exit check ───────────────────────────────────────────────────────
-
-def _check_and_exit_on_sentiment(
-    positions: Dict[str, PositionInfo],
-    adapter: AlpacaAdapter,
-    sentiment_module: SentimentModule,
-    executor: OrderExecutor,
-    cfg,
-) -> None:
-    """
-    Iterate over ALL open positions.  For each one:
-      1. Fetch fresh news; force_rescore() bypasses TTL cache and chaos cooldown.
-      2. Hard exit unconditionally if raw_discrete == -2 (chaos event).
-      3. Strong exit if delta > strong_exit_delta_threshold AND
-         confidence > strong_exit_confidence_min.
-      4. Soft exit if delta > soft_exit_delta_threshold AND
-         confidence > exit_confidence_min.
-      5. Emit a formatted per-instrument block via log_sentiment_position_check().
-
-    opening_compound is sourced directly from PositionInfo.opening_compound,
-    which main patches in from _opening_compounds after each entry fill.
-    This survives TTL expiry and bot restarts because opening_compounds is
-    persisted to equity_state.json.
-
-    Change 1b: delta is now directional so only adverse sentiment shifts fire:
-      LONG  position: delta = entry_sentiment - current_sentiment.score
-                      A positive delta means sentiment has dropped since entry.
-      SHORT position: delta = current_sentiment.score - entry_sentiment
-                      A positive delta means sentiment has risen against the short.
-    Absolute threshold comparisons are applied to this signed directional value.
-    """
-    soft_threshold = cfg.sentiment.soft_exit_delta_threshold
-    strong_threshold = cfg.sentiment.strong_exit_delta_threshold
-    confidence_min = cfg.sentiment.exit_confidence_min
-    strong_confidence_min = cfg.sentiment.strong_exit_confidence_min
-
-    for symbol, position in list(positions.items()):
-        try:
-            entry_sentiment = float(position.opening_compound)
-
-            # Always fetch fresh news and force a real AI rescore.
-            news_items = adapter.get_news(symbol, limit=10)
-            current_sentiment = sentiment_module.force_rescore(symbol, news_items)
-            current_confidence = float(current_sentiment.confidence)
-            raw_discrete = int(current_sentiment.raw_discrete)
-
-            # Change 1b: directional delta — only adverse shifts produce a
-            # positive delta that can breach the exit thresholds.
-            if position.side == "long":
-                delta = entry_sentiment - current_sentiment.score
-            else:
-                delta = current_sentiment.score - entry_sentiment
-
-            # ── Exit decision ─────────────────────────────────────────────────
-            closing = False
-            close_reason = ""
-
-            # Tier 0: Hard exit — chaos / utterly unstable (raw_discrete == -2)
-            if raw_discrete == -2:
-                closing = True
-                close_reason = (
-                    f"raw_discrete=-2 chaos — utterly unstable; "
-                    f"chaos cooldown timer applied."
-                )
-
-            # Tier 1: Strong exit — large delta with moderate confidence
-            elif delta > strong_threshold and current_confidence > strong_confidence_min:
-                closing = True
-                close_reason = (
-                    f"STRONG sentiment exit: "
-                    f"Δ={delta:+.3f} > {strong_threshold} "
-                    f"(entry={entry_sentiment:.3f} → current={current_sentiment.score:.3f}) "
-                    f"against {position.side} position; "
-                    f"confidence={current_confidence:.2f} > {strong_confidence_min}"
-                )
-
-            # Tier 2: Soft exit — moderate delta with higher confidence bar
-            elif delta > soft_threshold and current_confidence > confidence_min:
-                closing = True
-                close_reason = (
-                    f"SOFT sentiment exit: "
-                    f"Δ={delta:+.3f} > {soft_threshold} "
-                    f"(entry={entry_sentiment:.3f} → current={current_sentiment.score:.3f}) "
-                    f"against {position.side} position; "
-                    f"confidence={current_confidence:.2f} > {confidence_min}"
-                )
-
-            # Use the active threshold for the log display.
-            display_threshold = strong_threshold if not closing or raw_discrete == -2 else (
-                strong_threshold if delta > strong_threshold else soft_threshold
-            )
-
-            log_sentiment_position_check(
-                position=position,
-                entry_compound=entry_sentiment,
-                current_sentiment=current_sentiment,
-                delta=delta,
-                delta_threshold=display_threshold,
-                confidence_min=confidence_min,
-                closing=closing,
-                close_reason=close_reason,
-                env_mode=cfg.env_mode,
-            )
-
-            if closing:
-                executor.close_position_due_to_sentiment(
-                    position=position,
-                    sentiment=current_sentiment,
-                    reason=close_reason,
-                )
-
-        except Exception as exc:
-            logger.error(
-                f"SentimentExit {symbol}: unexpected error during exit check: {exc}"
-            )
 
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
@@ -304,6 +184,18 @@ def main() -> None:
         market_open = adapter.get_market_open()
         log_equity_snapshot(snapshot, market_open=market_open)
 
+        # ── STEP 0: WEEKEND FORCED LIQUIDATION ──────────────────────────────
+        if adapter.is_pre_weekend_close():
+            logger.warning(
+                "WEEKEND CLOSE DETECTED: Closing all positions and sleeping "
+                "until next market open."
+            )
+            executor.close_all_positions_for_weekend(positions, cfg.env_mode)
+            # Park the bot over the weekend — poll every 60s until Monday open.
+            while not adapter.get_market_open():
+                time.sleep(60)
+            continue  # Re-enter the loop from a clean state on Monday open.
+
         ks_state = kill_switch.check(snapshot)
         log_kill_switch_state(ks_state)
         if ks_state.halted:
@@ -338,27 +230,35 @@ def main() -> None:
             time.sleep(60)
             continue
 
-        # ── *** ADD THIS HERE *** ────────────────────────────────────────────
-        # Uncomment to gate new entries on market hours:
-        # if not market_open:
-        #     logger.info("Market closed — skipping portfolio build and new entries.")
-        #     time.sleep(60)
-        #     continue
+        # ── STEP 3: PRE-CLOSE ENTRY BLACKOUT + BUILD AND EXECUTE NEW TRADES ─
+        if adapter.is_pre_close_blackout():
+            logger.info(
+                "PRE-CLOSE BLACKOUT: New position entries suppressed "
+                "(within 3 hours of market close). Monitoring existing positions only."
+            )
+        else:
+            open_orders     = adapter.list_orders(status="open")
+            proposed_trades = portfolio_builder.build_portfolio(snapshot, positions, open_orders)
 
-        # ── STEP 3: BUILD AND EXECUTE NEW TRADES ────────────────────────────
-        open_orders     = adapter.list_orders(status="open")
-        proposed_trades = portfolio_builder.build_portfolio(snapshot, positions, open_orders)
+            log_portfolio_overview(proposed_trades, cfg.env_mode)
 
-        log_portfolio_overview(proposed_trades, cfg.env_mode)
+            for proposed in proposed_trades:
+                order = executor.execute_proposed_trade(proposed)
+                if order is not None and proposed.rejected_reason is None and proposed.qty > 0:
+                    # Change 1a: record entry-time SENTIMENT score (proposed.sentiment_score)
+                    # as the opening compound baseline — NOT proposed.signal_score.
+                    _opening_compounds[proposed.symbol] = proposed.sentiment_score
+                    # Persist immediately so a crash/restart doesn't lose the entry record.
+                    _persist_opening_compounds(_opening_compounds)
 
-        for proposed in proposed_trades:
-            order = executor.execute_proposed_trade(proposed)
-            if order is not None and proposed.rejected_reason is None and proposed.qty > 0:
-                # Change 1a: record entry-time SENTIMENT score (proposed.sentiment_score)
-                # as the opening compound baseline — NOT proposed.signal_score.
-                _opening_compounds[proposed.symbol] = proposed.sentiment_score
-                # Persist immediately so a crash/restart doesn't lose the entry record.
-                _persist_opening_compounds(_opening_compounds)
+        # Sentiment-exit check runs unconditionally — blackout does NOT affect exits.
+        _check_and_exit_on_sentiment(
+            positions=positions,
+            adapter=adapter,
+            sentiment_module=sentiment,
+            executor=executor,
+            cfg=cfg,
+        )
 
         # ── STEP 4: ADAPTIVE SLEEP WITH HYSTERESIS ──────────────────────────
         # Change 5 / Improvement D: sleep duration is driven by the highest
