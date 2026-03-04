@@ -2,6 +2,11 @@
 # FIX 3 — Added best-effort cancel attempt in execute_proposed_trade() when _wait_for_position() returns False.
 #         Wrap in try/except so the cancel attempt never raises; log both success and failure cases.
 # FIX 4D (FIX 9) — Deleted dead code line `sent_cfg = SentimentConfig(cfg.sentiment) if False else cfg.sentiment`.
+# SAFETY-GATE — Enhanced close_all_positions_for_weekend() with triple-gate protection:
+#               1. live_trading_enabled must be True (config-level gate)
+#               2. env_mode must be "LIVE" (environment-level gate)
+#               3. Confirmation log emitted before atomic close (audit trail)
+#               Prevents accidental weekend liquidation during paper testing or dev work on Fridays.
 
 import logging
 import time
@@ -185,7 +190,11 @@ class OrderExecutor:
       no fill-confirmation is needed for a flat-position-close.
 
     Weekend liquidation path (close_all_positions_for_weekend):
-      AUDIT: cancel_all_orders() precedes close_all_positions() in the primary
+      AUDIT: Triple-gate protection prevents accidental liquidation:
+        1. live_trading_enabled must be True (config-level gate)
+        2. env_mode must be "LIVE" (environment-level gate)
+        3. Confirmation log emitted before atomic close (audit trail)
+      cancel_all_orders() precedes close_all_positions() in the primary
       (atomic) path.  The broker handles the atomic close; no fill-confirmation
       is needed.  The per-symbol fallback delegates to close_position_due_to_sentiment()
       which already cancels orders internally.
@@ -409,12 +418,56 @@ class OrderExecutor:
         positions: Dict[str, PositionInfo],
         env_mode: str,
     ) -> None:
-        """Force-close all positions before weekend."""
+        """
+        Force-close all positions before weekend.
+
+        SAFETY-GATE: Triple-gate protection prevents accidental liquidation:
+          1. live_trading_enabled must be True (config-level gate).
+          2. env_mode must be "LIVE" (environment-level gate).
+          3. Confirmation log emitted at WARNING level before atomic close.
+
+        The first two gates ensure weekend liquidation NEVER fires in paper mode
+        or during dev/testing work on Friday afternoons, even when the bot is
+        running with live credentials. The confirmation log creates an audit
+        trail showing exactly when and why the liquidation was triggered.
+
+        Rationale:
+        - live_trading_enabled=False: already prevents ALL order submission
+          in the current codebase, but the paper mode log message was insufficient
+          for weekend liquidation (it should be a hard stop, not a warning).
+        - env_mode != "LIVE": adds an explicit environment check so that running
+          the bot in PAPER mode with LIVE_TRADING_ENABLED=true (for example to
+          test other features) will NOT trigger weekend liquidation.
+        - Confirmation log: operators can grep logs for "WEEKEND LIQUIDATION CONFIRMED"
+          to audit when this critical path fires.
+
+        If either gate fails, the method returns immediately and logs the reason.
+        When both gates pass, cancel_all_orders() precedes close_all_positions()
+        in the atomic path, and any failure falls back to per-symbol close via
+        close_position_due_to_sentiment().
+        """
+        # SAFETY-GATE 1: live_trading_enabled check (config-level)
         if not self.live_trading_enabled:
-            logger.info("[PAPER MODE] Would close all positions for weekend.")
+            logger.info(
+                "[PAPER MODE GUARD] Weekend liquidation blocked: "
+                "live_trading_enabled=False. All positions preserved."
+            )
             return
 
-        logger.warning("WEEKEND CLOSE: Closing all positions.")
+        # SAFETY-GATE 2: env_mode check (environment-level)
+        if env_mode.upper() != "LIVE":
+            logger.warning(
+                f"[ENV MODE GUARD] Weekend liquidation blocked: "
+                f"env_mode={env_mode} (expected LIVE). All positions preserved. "
+                f"If you intended to liquidate, set APCA_API_ENV=LIVE and restart."
+            )
+            return
+
+        # Both gates passed — emit confirmation log before proceeding
+        logger.warning(
+            "WEEKEND LIQUIDATION CONFIRMED: live_trading_enabled=True AND env_mode=LIVE. "
+            "Closing all positions now."
+        )
 
         try:
             self.adapter.cancel_all_orders()
