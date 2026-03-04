@@ -1,26 +1,11 @@
 # CHANGES:
 # CRASH-2 FIX — Populate avg_entry_price in the PositionInfo constructor.
-#
-#   order_executor._check_and_exit_on_sentiment() reads pos.avg_entry_price to
-#   compute unrealised P&L for PnL-coupled threshold scaling.  The field now
-#   exists in PositionInfo (added in core/risk_engine.py), but it must also be
-#   populated from the raw Alpaca position object here.
-#
-#   Added inside the per-position try block:
-#     avg_entry_price: float = float(getattr(pos, "avg_entry_price", 0.0))
-#
-#   getattr with default 0.0 means:
-#     - If the Alpaca SDK returns the field (as it does for real positions),
-#       the true entry price is captured and PnL scaling works correctly.
-#     - If the field is absent (e.g. mock/test objects), the value is 0.0,
-#       which causes the `if pos.avg_entry_price > 0.0` guard in
-#       order_executor.py to skip scaling — identical to legacy behaviour.
-#
-#   avg_entry_price is passed as a keyword argument to the PositionInfo
-#   constructor so the field ordering in the dataclass is respected.
-#
-# All prior changes (opening_compound patching from opening_compounds dict)
-# are preserved unchanged.
+# CONFIDENCE-STORE — opening_compound now represents a tuple (compound, confidence) rather than
+#                    a scalar. PositionInfo.opening_compound remains a scalar for backward
+#                    compatibility, but the registry (Dict[str, tuple]) stores both values.
+#                    The confidence value is reserved for future delta-exit threshold scaling.
+#                    get_positions() unpacks the tuple and stores only the compound in the
+#                    dataclass; the confidence is preserved in the main registry.
 
 import logging
 from typing import Dict, Optional
@@ -42,6 +27,7 @@ class PositionManager:
         so downstream sentiment-exit logic has a valid entry-time baseline.
       - Populate avg_entry_price from the Alpaca position object so that
         PnL-coupled sentiment-exit threshold scaling has a valid denominator.
+      - CONFIDENCE-STORE: Unpack (compound, confidence) tuples from the registry.
     """
 
     def __init__(self, adapter: AlpacaAdapter) -> None:
@@ -49,7 +35,7 @@ class PositionManager:
 
     def get_positions(
         self,
-        opening_compounds: Optional[Dict[str, float]] = None,
+        opening_compounds: Optional[Dict[str, tuple]] = None,
     ) -> Dict[str, PositionInfo]:
         """
         Fetch and map all open Alpaca positions.
@@ -57,9 +43,10 @@ class PositionManager:
         Parameters
         ----------
         opening_compounds : dict, optional
-            Registry of {symbol: entry_sentiment_score} maintained by main.
-            When provided, each PositionInfo.opening_compound is populated
-            so that _check_and_exit_on_sentiment() can compute a meaningful delta.
+            Registry of {symbol: (entry_sentiment_score, confidence)} maintained
+            by main. When provided, each PositionInfo.opening_compound is populated
+            with the compound score (the confidence is stored separately and not
+            passed to the dataclass).
 
         Returns
         -------
@@ -77,12 +64,18 @@ class PositionManager:
                 side: str = str(pos.side)  # "long" or "short"
                 notional: float = abs(qty * market_price)
 
+                # CONFIDENCE-STORE: unpack tuple; fallback to (0.0, 0.0) if missing
                 opening_compound: float = 0.0
                 if opening_compounds is not None:
-                    opening_compound = float(opening_compounds.get(symbol, 0.0))
+                    opening_data = opening_compounds.get(symbol, (0.0, 0.0))
+                    if isinstance(opening_data, tuple):
+                        opening_compound = float(opening_data[0])
+                    else:
+                        # Legacy scalar — treat as compound only
+                        opening_compound = float(opening_data)
 
                 # CRASH-2 FIX: read avg_entry_price from the raw Alpaca position
-                # object.  getattr with default 0.0 is safe for mock/test objects
+                # object. getattr with default 0.0 is safe for mock/test objects
                 # that omit this attribute; the guard in order_executor.py
                 # (`if pos.avg_entry_price > 0.0`) treats 0.0 as "not available"
                 # and skips PnL scaling, preserving legacy behaviour exactly.

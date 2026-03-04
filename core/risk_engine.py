@@ -6,6 +6,10 @@
 #                 This allows Kelly-sized positions to use a much lower floor (default 0.001 = 0.1%)
 #                 instead of being constrained by the 0.5% fixed-fractional floor. The fixed-fractional
 #                 path remains unchanged and continues to use min_risk_per_trade_pct.
+# NEUTRAL-BAND-ZERO-FIX — Added explicit abs(s) < neutral_band → return 0.0 region in sentiment_scale().
+#                          When abs(sentiment score) < neutral_band, position sizing is blocked entirely.
+#                          This prevents barely-positive AND barely-negative AI-neutral scores from
+#                          producing minimal positions. Only |s| ≥ neutral_band opens trades.
 
 import math
 from collections import deque
@@ -114,42 +118,49 @@ class RiskEngine:
 
     def sentiment_scale(self, s: float) -> float:
         """
-        FIX 5: Piecewise-linear sentiment scale with neutral_band floor.
+        Piecewise-linear sentiment scale with neutral_band zero-return region.
 
-        Four regions:
-          1. s < no_trade_negative_threshold                     → return 0.0 (hard block)
-          2. no_trade_negative_threshold ≤ s < 0.0              → interpolate 0.0 → min_scale
-          3. 0.0 ≤ s ≤ neutral_band                             → return min_scale (flat floor)
-          4. s > neutral_band                                    → interpolate min_scale → max_scale
+        NEUTRAL-BAND-ZERO-FIX: Absolute value filter ensures that sentiment scores
+        with |s| < neutral_band produce ZERO scale, blocking position entry entirely.
+        This captures both barely-positive and barely-negative AI-neutral scores.
 
-        Region 3 is the correction: AI-neutral scores (s ≈ 0) produce the
-        MINIMUM permissible size rather than a gradually increasing one.
-        Previously, sentiment_scale(0.05) would produce a size larger than
-        min_scale, admitting barely-positive signals. The flat floor ensures
-        that no additional sizing reward is granted until sentiment exceeds
-        neutral_band (default 0.1).
+        Regions (with defaults no_trade_negative_threshold=-0.3, neutral_band=0.1):
+
+          1. s < no_trade_negative_threshold             → return 0.0 (hard bearish block)
+          2. abs(s) < neutral_band                       → return 0.0 (neutral block)
+          3. no_trade_negative_threshold ≤ s < -neutral_band
+                                                        → interpolate 0.0 → min_scale
+          4. neutral_band ≤ s ≤ 1.0                      → interpolate min_scale → max_scale
+
+        Region 2 is the critical fix: AI-neutral scores (e.g. s=0.05, s=-0.08) now
+        produce zero scale instead of min_scale, ensuring no position is opened unless
+        sentiment conviction exceeds neutral_band (default 0.1).
+
+        Previous logic allowed s ∈ (0, neutral_band) to jump to min_scale, admitting
+        barely-positive signals. The abs() check now blocks BOTH sides of the neutral
+        zone symmetrically.
         """
         no_trade_neg = self.sentiment_cfg.no_trade_negative_threshold
         neutral_band = self.sentiment_cfg.neutral_band
         min_sc = self.sentiment_cfg.min_scale
         max_sc = self.sentiment_cfg.max_scale
 
-        # Region 1: hard block
+        # Region 1: hard bearish block
         if s < no_trade_neg:
             return 0.0
 
-        # Region 2: interpolate from 0.0 at no_trade_neg to min_sc at 0.0
+        # Region 2: NEUTRAL-BAND-ZERO-FIX — block both barely-positive and barely-negative
+        if abs(s) < neutral_band:
+            return 0.0
+
+        # Region 3: bearish but above hard floor → interpolate 0.0 → min_scale
         if s < 0.0:
-            band_width = 0.0 - no_trade_neg
+            band_width = -neutral_band - no_trade_neg
             if band_width == 0.0:
                 return 0.0
             return min_sc * (s - no_trade_neg) / band_width
 
-        # Region 3: flat floor for neutral sentiment
-        if s <= neutral_band:
-            return min_sc
-
-        # Region 4: interpolate from min_sc at neutral_band to max_sc at 1.0
+        # Region 4: bullish conviction → interpolate min_scale → max_scale
         span = max_sc - min_sc
         denominator = 1.0 - neutral_band
         if denominator == 0.0:

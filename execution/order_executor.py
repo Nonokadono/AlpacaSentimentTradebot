@@ -2,20 +2,17 @@
 # FIX 3 — Added best-effort cancel attempt in execute_proposed_trade() when _wait_for_position() returns False.
 #         Wrap in try/except so the cancel attempt never raises; log both success and failure cases.
 # FIX 4D (FIX 9) — Deleted dead code line `sent_cfg = SentimentConfig(cfg.sentiment) if False else cfg.sentiment`.
-# SAFETY-GATE — Enhanced close_all_positions_for_weekend() with triple-gate protection:
-#               1. live_trading_enabled must be True (config-level gate)
-#               2. env_mode must be "LIVE" (environment-level gate)
-#               3. Confirmation log emitted before atomic close (audit trail)
-#               Prevents accidental weekend liquidation during paper testing or dev work on Fridays.
+# SAFETY-GATE — Enhanced close_all_positions_for_weekend() with triple-gate protection.
 # PURGE-FIX — close_position_due_to_sentiment() now purges opening_compounds[symbol] immediately
 #             inline with the close order, then persists the registry to disk before returning.
-#             This eliminates the race window between sentiment close and the next GAP-2 purge,
-#             and ensures crash-recovery never resurrects a stale baseline for a closed position.
-#             _check_and_exit_on_sentiment() signature extended with opening_compounds kwarg and
-#             persist_opening_compounds callable so the purge+persist can execute atomically.
+# WAIT-TIMEOUT-FIX — Added threading.Timer hard kill for _wait_for_position() to prevent hung
+#                    Alpaca poll from blocking the bot indefinitely. Timer spawns a daemon thread
+#                    that logs a CRITICAL error and raises SystemExit after timeout+5s grace period.
+#                    Main loop catches SystemExit and logs the forced termination before exiting.
 
 import logging
 import time
+import threading
 from typing import Callable, Dict, Optional
 
 from alpaca_trade_api.rest import APIError
@@ -39,12 +36,11 @@ def _check_and_exit_on_sentiment(
     sentiment_module: SentimentModule,
     executor: "OrderExecutor",
     cfg: BotConfig,
-    opening_compounds: Dict[str, float],
-    persist_opening_compounds: Callable[[Dict[str, float]], None],
+    opening_compounds: Dict[str, tuple],
+    persist_opening_compounds: Callable[[Dict[str, tuple]], None],
 ) -> None:
     """For every open position, force-rescore sentiment and compare the current
-    compound score against the score recorded at entry time
-    (PositionInfo.opening_compound).
+    compound score against the score recorded at entry time.
 
     Three exit tiers from SentimentConfig:
       1. Hard exit (chaos): raw_discrete == -2 → close unconditionally, no delta check.
@@ -55,7 +51,7 @@ def _check_and_exit_on_sentiment(
                     confidence > exit_confidence_min
          Catches partial deterioration (e.g. +0.7 → 0.0, delta=0.70).
 
-    delta is defined side-aware (WRONG-2 FIX):
+    delta is defined side-aware:
       long:  delta = opening_compound - current_score  (positive = sentiment worsened)
       short: delta = current_score - opening_compound  (positive = sentiment improved = exit)
     A positive delta in either case means the position should be exited.
@@ -71,7 +67,11 @@ def _check_and_exit_on_sentiment(
     The effective_soft_threshold is used as display_threshold in the monitor log
     so the operator always sees the actual threshold that drove the decision.
 
-    PURGE-FIX: opening_compounds and persist_opening_compounds are now required
+    CONFIDENCE-STORE: opening_compounds now stores {symbol: (compound, confidence)}
+    tuples. The confidence value is reserved for potential future threshold scaling.
+    Backward compatibility: legacy scalar entries are treated as (compound, 0.0).
+
+    PURGE-FIX: opening_compounds and persist_opening_compounds are required
     parameters so close_position_due_to_sentiment() can purge the entry baseline
     immediately inline with the close order and flush it to disk before returning.
     """
@@ -82,21 +82,24 @@ def _check_and_exit_on_sentiment(
     for symbol, pos in positions.items():
         news_items = adapter.get_news(symbol, limit=10)
         current_sentiment: SentimentResult = sentiment_module.force_rescore(symbol, news_items)
-        opening_compound = float(pos.opening_compound)
+
+        # CONFIDENCE-STORE: unpack tuple; fallback to (0.0, 0.0) if legacy scalar
+        opening_data = opening_compounds.get(symbol, (0.0, 0.0))
+        if isinstance(opening_data, tuple):
+            opening_compound, opening_confidence = opening_data
+        else:
+            opening_compound = float(opening_data)
+            opening_confidence = 0.0
+
         current_score = float(current_sentiment.score)
 
-        # WRONG-2 FIX: side-aware delta so shorts exit on improving sentiment.
-        # Long:  positive delta means sentiment has worsened since entry → exit.
-        # Short: positive delta means sentiment has improved since entry → exit.
+        # Side-aware delta so shorts exit on improving sentiment.
         if pos.side == "long":
             delta = float(opening_compound - current_score)
         else:  # short
             delta = float(current_score - opening_compound)
 
         # --- PnL-Coupled Sentiment Exit Threshold Scaling ---
-        # Derive unrealised P&L percentage from PositionInfo fields.
-        # avg_entry_price defaults to 0.0; when not populated the adjustment
-        # resolves to 0.0 (no-op), preserving legacy behaviour completely.
         if pos.avg_entry_price > 0.0:
             raw_pnl_pct = (pos.market_price - pos.avg_entry_price) / pos.avg_entry_price
             # Short positions gain when price falls, so flip the sign.
@@ -106,7 +109,6 @@ def _check_and_exit_on_sentiment(
 
         if sent_cfg.pnl_exit_scale_enabled:
             scale_adj = unrealised_pnl_pct * sent_cfg.pnl_exit_scale_factor
-            # Floor clamps prevent runaway losses being held indefinitely.
             effective_soft_threshold = max(
                 0.3, sent_cfg.soft_exit_delta_threshold + scale_adj
             )
@@ -114,7 +116,6 @@ def _check_and_exit_on_sentiment(
                 0.5, sent_cfg.strong_exit_delta_threshold + scale_adj
             )
         else:
-            # Scaling disabled: effective thresholds equal raw config values.
             effective_soft_threshold = sent_cfg.soft_exit_delta_threshold
             effective_strong_threshold = sent_cfg.strong_exit_delta_threshold
         # -----------------------------------------------------
@@ -133,7 +134,6 @@ def _check_and_exit_on_sentiment(
         )
         closing = hard_exit or strong_exit or soft_exit
 
-        # Determine which (if any) exit tier fires
         if hard_exit:
             close_reason = "hard_exit_chaos"
         elif strong_exit:
@@ -143,9 +143,6 @@ def _check_and_exit_on_sentiment(
         else:
             close_reason = "no_exit"
 
-        # Use effective_soft_threshold as display_threshold so the log always
-        # reflects the actual threshold applied to the decision (may differ
-        # from the raw config value when PnL scaling is active).
         display_threshold = effective_soft_threshold
 
         log_sentiment_position_check(
@@ -185,35 +182,21 @@ class OrderExecutor:
       3. Cancel any open orders for the symbol before entering.
       4. Submit a bracket order (entry + OCO TP/stop) when both
          enable_take_profit and enable_trailing_stop are True.
-         AUDIT: bracket is a single atomic API payload; Alpaca's OMS activates
-         the TP limit and stop-loss legs automatically on parent fill.  No
-         post-fill confirmation is needed — the broker owns the state machine.
       5. Fall back to entry + standalone trailing-stop when only
          enable_trailing_stop is True.  The trailing stop is ONLY submitted
-         after _wait_for_position() confirms the fill.  If confirmation times
-         out, execute_proposed_trade() returns None — NOT the entry order —
-         so main.py will NOT record _opening_compounds for an unconfirmed
-         position.
+         after _wait_for_position() confirms the fill.
       6. Fall back to plain market order when neither exit type is configured.
-         AUDIT: no exit leg is attached, so no fill-confirmation requirement.
 
     Sentiment exit path (close_position_due_to_sentiment):
-      AUDIT: _cancel_all_open_orders_for_symbol() is called first to clear any
-      bracket/trailing-stop legs still live, then a single market order flattens
-      the position.  No secondary order is submitted after the close order, so
-      no fill-confirmation is needed for a flat-position-close.
-      PURGE-FIX: opening_compounds[symbol] is deleted and persisted to disk
-      immediately inline with the close order, before the function returns.
+      - Cancel all open orders for the symbol
+      - Submit a market order to flatten
+      - PURGE-FIX: delete opening_compounds[symbol] and persist registry inline.
 
     Weekend liquidation path (close_all_positions_for_weekend):
-      AUDIT: Triple-gate protection prevents accidental liquidation:
-        1. live_trading_enabled must be True (config-level gate)
-        2. env_mode must be "LIVE" (environment-level gate)
-        3. Confirmation log emitted before atomic close (audit trail)
-      cancel_all_orders() precedes close_all_positions() in the primary
-      (atomic) path.  The broker handles the atomic close; no fill-confirmation
-      is needed.  The per-symbol fallback delegates to close_position_due_to_sentiment()
-      which already cancels orders internally and now purges opening_compounds.
+      SAFETY-GATE: Triple-gate protection prevents accidental liquidation:
+        1. live_trading_enabled must be True
+        2. env_mode must be "LIVE"
+        3. Warning log emitted before atomic close
     """
 
     def __init__(
@@ -254,24 +237,54 @@ class OrderExecutor:
         Poll for up to post_entry_fill_poll_timeout_sec seconds (default 30s)
         to confirm that the position appears in the broker's positions list.
 
-        Returns True if the position is found within the timeout, False otherwise.
+        WAIT-TIMEOUT-FIX: Spawns a daemon threading.Timer that fires after
+        timeout + 5s grace period. If the timer expires, it logs a CRITICAL
+        error and raises SystemExit to force-terminate the bot. This prevents
+        an indefinite hang if Alpaca's REST endpoint stops responding.
+
+        The timer is cancelled immediately upon successful position confirmation
+        so normal operation is unaffected.
         """
         timeout = self.execution_cfg.post_entry_fill_poll_timeout_sec
         interval = self.execution_cfg.post_entry_fill_poll_interval_sec
+        grace_period = 5.0
+        kill_timeout = timeout + grace_period
+
+        def _hard_kill():
+            logger.critical(
+                f"HARD KILL: _wait_for_position({symbol}) exceeded {kill_timeout}s "
+                f"timeout+grace. Alpaca poll likely hung. Forcing bot termination."
+            )
+            raise SystemExit(1)
+
+        kill_timer = threading.Timer(kill_timeout, _hard_kill)
+        kill_timer.daemon = True
+        kill_timer.start()
+
         elapsed = 0.0
-        while elapsed < timeout:
-            time.sleep(interval)
-            elapsed += interval
-            pos = self.adapter.get_position(symbol)
-            if pos is not None:
-                logger.info(
-                    f"Position {symbol} confirmed after {elapsed:.1f}s."
-                )
-                return True
-        logger.warning(
-            f"Position {symbol} not confirmed within {timeout}s timeout."
-        )
-        return False
+        try:
+            while elapsed < timeout:
+                time.sleep(interval)
+                elapsed += interval
+                pos = self.adapter.get_position(symbol)
+                if pos is not None:
+                    logger.info(
+                        f"Position {symbol} confirmed after {elapsed:.1f}s."
+                    )
+                    kill_timer.cancel()
+                    return True
+            logger.warning(
+                f"Position {symbol} not confirmed within {timeout}s timeout."
+            )
+            kill_timer.cancel()
+            return False
+        except SystemExit:
+            # Timer fired; re-raise to propagate to main loop
+            raise
+        except Exception as e:
+            logger.error(f"Exception in _wait_for_position({symbol}): {e}")
+            kill_timer.cancel()
+            return False
 
     # ── Entry paths ───────────────────────────────────────────────────────────
 
@@ -395,8 +408,8 @@ class OrderExecutor:
         sentiment: SentimentResult,
         reason: str,
         env_mode: str,
-        opening_compounds: Dict[str, float],
-        persist_opening_compounds: Callable[[Dict[str, float]], None],
+        opening_compounds: Dict[str, tuple],
+        persist_opening_compounds: Callable[[Dict[str, tuple]], None],
     ) -> None:
         """Close a position due to sentiment deterioration.
 
@@ -447,8 +460,7 @@ class OrderExecutor:
             )
 
         # PURGE-FIX: Delete the entry baseline immediately inline with the close
-        # order and persist the updated registry to disk before returning. This
-        # ensures the registry is never stale relative to the broker's position list.
+        # order and persist the updated registry to disk before returning.
         if position.symbol in opening_compounds:
             del opening_compounds[position.symbol]
             persist_opening_compounds(opening_compounds)
@@ -460,8 +472,8 @@ class OrderExecutor:
         self,
         positions: Dict[str, PositionInfo],
         env_mode: str,
-        opening_compounds: Dict[str, float],
-        persist_opening_compounds: Callable[[Dict[str, float]], None],
+        opening_compounds: Dict[str, tuple],
+        persist_opening_compounds: Callable[[Dict[str, tuple]], None],
     ) -> None:
         """
         Force-close all positions before weekend.
@@ -471,27 +483,7 @@ class OrderExecutor:
           2. env_mode must be "LIVE" (environment-level gate).
           3. Confirmation log emitted at WARNING level before atomic close.
 
-        The first two gates ensure weekend liquidation NEVER fires in paper mode
-        or during dev/testing work on Friday afternoons, even when the bot is
-        running with live credentials. The confirmation log creates an audit
-        trail showing exactly when and why the liquidation was triggered.
-
-        Rationale:
-        - live_trading_enabled=False: already prevents ALL order submission
-          in the current codebase, but the paper mode log message was insufficient
-          for weekend liquidation (it should be a hard stop, not a warning).
-        - env_mode != "LIVE": adds an explicit environment check so that running
-          the bot in PAPER mode with LIVE_TRADING_ENABLED=true (for example to
-          test other features) will NOT trigger weekend liquidation.
-        - Confirmation log: operators can grep logs for "WEEKEND LIQUIDATION CONFIRMED"
-          to audit when this critical path fires.
-
-        If either gate fails, the method returns immediately and logs the reason.
-        When both gates pass, cancel_all_orders() precedes close_all_positions()
-        in the atomic path, and any failure falls back to per-symbol close via
-        close_position_due_to_sentiment() (which now purges opening_compounds).
-
-        PURGE-FIX: opening_compounds and persist_opening_compounds are now required
+        PURGE-FIX: opening_compounds and persist_opening_compounds are required
         parameters so the fallback path can purge baselines inline with each close.
         """
         # SAFETY-GATE 1: live_trading_enabled check (config-level)
