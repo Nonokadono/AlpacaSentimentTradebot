@@ -162,7 +162,9 @@ class OrderExecutor:
       4. Submit a bracket order (entry + OCO TP/stop) when both
          enable_take_profit and enable_trailing_stop are True.
       5. Fall back to entry + standalone trailing-stop when only
-         enable_trailing_stop is True.
+         enable_trailing_stop is True.  The trailing stop is only submitted
+         after _wait_for_position() confirms the fill; if confirmation times
+         out the entry order is returned and no stop is attached.
       6. Fall back to plain market order when neither exit type is configured.
 
     Sentiment exit path (close_position_due_to_sentiment):
@@ -210,6 +212,59 @@ class OrderExecutor:
     def _exit_side(self, position_side: str) -> str:
         """Return the closing side for a given position side."""
         return "sell" if position_side == "long" else "buy"
+
+    def _wait_for_position(
+        self,
+        symbol: str,
+        expected_qty: float,
+        timeout_sec: int = 30,
+        poll_interval_sec: float = 2.0,
+    ) -> bool:
+        """Poll adapter.list_positions() until the fill for *symbol* is confirmed.
+
+        A position is "confirmed" when an entry for *symbol* exists in the
+        broker's position list AND abs(qty) >= expected_qty * 0.95, allowing
+        for a 5 % partial-fill tolerance before attaching the trailing stop.
+
+        Args:
+            symbol:            Ticker to watch.
+            expected_qty:      Order quantity submitted to the entry market order.
+            timeout_sec:       Hard deadline in seconds (default 30).
+            poll_interval_sec: Sleep between successive list_positions() calls
+                               (default 2.0 s).
+
+        Returns:
+            True  — position confirmed within timeout_sec.
+            False — deadline expired without confirmation.  Emits a WARNING
+                    that includes symbol, expected_qty, and elapsed time.
+
+        Never raises — every exception inside the polling loop is caught and
+        logged at WARNING level so the caller always gets a bool back.
+        """
+        start = time.monotonic()
+        deadline = start + timeout_sec
+
+        while time.monotonic() < deadline:
+            try:
+                positions = self.adapter.list_positions()
+                for pos in positions:
+                    pos_symbol = getattr(pos, "symbol", None)
+                    pos_qty = getattr(pos, "qty", None)
+                    if pos_symbol == symbol and pos_qty is not None:
+                        if abs(float(pos_qty)) >= expected_qty * 0.95:
+                            return True
+            except Exception as e:
+                logger.warning(
+                    f"_wait_for_position poll error for {symbol}: {e}"
+                )
+            time.sleep(poll_interval_sec)
+
+        elapsed = time.monotonic() - start
+        logger.warning(
+            f"_wait_for_position: position fill not confirmed for {symbol} "
+            f"(expected_qty={expected_qty}, elapsed={elapsed:.1f}s)"
+        )
+        return False
 
     # ── Entry execution ───────────────────────────────────────────────────────
 
@@ -270,8 +325,34 @@ class OrderExecutor:
                     f"Market order submitted for {symbol}: side={side} qty={qty} "
                     f"order_id={getattr(order, 'id', 'N/A')}"
                 )
-                # Wait briefly for fill before attaching stop.
-                time.sleep(self.execution_cfg.post_entry_fill_timeout_sec)
+
+                # Resolve timeout and interval from the new poll fields,
+                # falling back to the deprecated legacy field so serialised
+                # configs that only carry post_entry_fill_timeout_sec still work.
+                poll_timeout = getattr(
+                    self.execution_cfg,
+                    "post_entry_fill_poll_timeout_sec",
+                    getattr(self.execution_cfg, "post_entry_fill_timeout_sec", 30),
+                )
+                poll_interval = getattr(
+                    self.execution_cfg, "post_entry_fill_poll_interval_sec", 2.0
+                )
+
+                # Actively poll for fill confirmation before attaching the stop.
+                # Replaces the blind time.sleep() that previously allowed orphan
+                # trailing stops to be submitted against unfilled/rejected orders.
+                filled = self._wait_for_position(
+                    symbol,
+                    qty,
+                    timeout_sec=poll_timeout,
+                    poll_interval_sec=poll_interval,
+                )
+                if not filled:
+                    logger.warning(
+                        f"Position fill not confirmed for {symbol} after "
+                        f"{poll_timeout}s — skipping trailing stop submission."
+                    )
+                    return order
 
                 exit_side = self._exit_side(side)
                 try:

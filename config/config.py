@@ -1,24 +1,3 @@
-# CHANGES:
-# CRASH-1 FIX — Added two missing fields to SentimentConfig:
-#
-#   pnl_exit_scale_enabled: bool = False
-#     Gate flag for PnL-coupled sentiment-exit threshold scaling.
-#     Default False preserves byte-identical legacy behaviour: the else-branch
-#     in _check_and_exit_on_sentiment() sets effective thresholds directly
-#     from the raw config values, so no existing test or logic is affected.
-#
-#   pnl_exit_scale_factor: float = 0.5
-#     Multiplier applied to unrealised_pnl_pct when computing scale_adj.
-#     Only read when pnl_exit_scale_enabled=True, so the default is irrelevant
-#     under legacy operation.
-#
-#   Without these fields every call that has an open position raised
-#   AttributeError on `sent_cfg.pnl_exit_scale_enabled`, crashing the bot
-#   on the very first loop iteration that found a live position.
-#
-# All prior changes (TASK IC-RANKING, FIX 7, Fix L3, Change 2, Change 4)
-# are preserved unchanged.
-
 import os
 import yaml
 from pathlib import Path
@@ -142,6 +121,16 @@ class ExecutionConfig:
     enable_take_profit: bool = True
     exit_time_in_force: str = "day"
     entry_time_in_force: str = "day"
+    # WAIT-FOR-POSITION: primary timeout for the _wait_for_position() polling
+    # loop.  Raised from 15 → 30 seconds to give the active poller adequate
+    # time for slow or queued market-order fills.
+    post_entry_fill_poll_timeout_sec: int = 30
+    # Interval between successive adapter.list_positions() calls in the loop.
+    post_entry_fill_poll_interval_sec: float = 2.0
+    # DEPRECATED — retained for backward compatibility only.
+    # Any serialised config or external writer that still uses this key will
+    # not cause a TypeError.  OrderExecutor reads post_entry_fill_poll_timeout_sec
+    # first; this field has no runtime effect.  Do NOT remove.
     post_entry_fill_timeout_sec: int = 15
 
 
