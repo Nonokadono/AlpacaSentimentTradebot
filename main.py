@@ -1,14 +1,3 @@
-# CHANGES:
-# WRONG-3 FIX — get_equity_snapshot_from_account():
-#   Removed `high_watermark_equity = equity` from inside the
-#   `if last_day != today_str:` block.
-#   Rationale: resetting the watermark to the current equity at the start of
-#   every calendar day made max_drawdown_pct an intraday-only protection. A bot
-#   that lost 8% on Monday would start Tuesday with a fresh watermark equal to
-#   its depleted equity, so the cumulative drawdown guard would never fire.
-#   The subsequent `if equity > high_watermark_equity: high_watermark_equity = equity`
-#   block correctly handles legitimate new all-time peaks in a monotonic,
-#   non-resetting fashion. Only `start_of_day_equity` resets on a new day.
 import json
 import logging
 import time
@@ -280,6 +269,21 @@ def main() -> None:
             persist_state(dashboard_state)
             for proposed in proposed_trades:
                 order = executor.execute_proposed_trade(proposed)
+                # FILL-CONFIRM FIX invariant — `order is not None` is a safe
+                # proxy for "fill confirmed (or confirmation not required)":
+                #
+                #   Bracket path:     atomic OCO submitted; broker activates
+                #                     TP/stop on fill automatically. order ≠ None
+                #                     ↔ the API call succeeded.
+                #   Plain market:     no exit leg; order ≠ None ↔ submitted OK.
+                #   Trailing-stop:    order_executor returns None when
+                #                     _wait_for_position() times out, so
+                #                     order ≠ None ↔ fill confirmed by polling.
+                #   Errors / paper:   all code paths return None already.
+                #
+                # Therefore recording _opening_compounds only when order is not
+                # None guarantees we never store a sentiment baseline for a
+                # position whose fill we could not confirm.
                 if order is not None and proposed.rejected_reason is None and proposed.qty > 0:
                     # Change 1a: record entry-time SENTIMENT score (proposed.sentiment_score)
                     # as the opening compound baseline — NOT proposed.signal_score.

@@ -161,19 +161,29 @@ class OrderExecutor:
       3. Cancel any open orders for the symbol before entering.
       4. Submit a bracket order (entry + OCO TP/stop) when both
          enable_take_profit and enable_trailing_stop are True.
+         AUDIT: bracket is a single atomic API payload; Alpaca's OMS activates
+         the TP limit and stop-loss legs automatically on parent fill.  No
+         post-fill confirmation is needed — the broker owns the state machine.
       5. Fall back to entry + standalone trailing-stop when only
-         enable_trailing_stop is True.  The trailing stop is only submitted
-         after _wait_for_position() confirms the fill; if confirmation times
-         out the entry order is returned and no stop is attached.
+         enable_trailing_stop is True.  The trailing stop is ONLY submitted
+         after _wait_for_position() confirms the fill.  If confirmation times
+         out, execute_proposed_trade() returns None — NOT the entry order —
+         so main.py will NOT record _opening_compounds for an unconfirmed
+         position.
       6. Fall back to plain market order when neither exit type is configured.
+         AUDIT: no exit leg is attached, so no fill-confirmation requirement.
 
     Sentiment exit path (close_position_due_to_sentiment):
-      Submits a market order to flatten the position on the opposing side,
-      cancelling open orders for the symbol first to avoid qty conflicts.
+      AUDIT: _cancel_all_open_orders_for_symbol() is called first to clear any
+      bracket/trailing-stop legs still live, then a single market order flattens
+      the position.  No secondary order is submitted after the close order, so
+      no fill-confirmation is needed for a flat-position-close.
 
     Weekend liquidation path (close_all_positions_for_weekend):
-      Atomically flattens all open positions before market close on Friday.
-      Falls back to per-symbol sentiment-close if the atomic call fails.
+      AUDIT: cancel_all_orders() precedes close_all_positions() in the primary
+      (atomic) path.  The broker handles the atomic close; no fill-confirmation
+      is needed.  The per-symbol fallback delegates to close_position_due_to_sentiment()
+      which already cancels orders internally.
     """
 
     def __init__(
@@ -272,7 +282,21 @@ class OrderExecutor:
         """
         Execute a ProposedTrade.
 
-        Returns the Alpaca order object on success, or None if skipped/failed.
+        Returns:
+            Alpaca order object — on a successful submission that main.py should
+            record in _opening_compounds.  This covers:
+              • Bracket orders (atomic OCO — no fill-confirmation needed).
+              • Plain market orders with no exit leg.
+              • Trailing-stop path where _wait_for_position() returned True.
+            None — on any of the following conditions:
+              • proposed.rejected_reason is not None or proposed.qty <= 0.
+              • live_trading_enabled is False (paper mode guard).
+              • APIError or unexpected exception during submission.
+              • Trailing-stop path where _wait_for_position() returned False
+                (fill not confirmed within timeout).  The entry order ID is
+                logged before returning None so the operator retains an audit
+                trail, but _opening_compounds is NOT updated for an unconfirmed
+                position.
         """
         log_proposed_trade(proposed, self.env_mode)
 
@@ -298,8 +322,13 @@ class OrderExecutor:
         use_ts = self.execution_cfg.enable_trailing_stop
 
         try:
+            # AUDIT 1 — BRACKET PATH ─────────────────────────────────────────
+            # submit_bracket_order() sends a single atomic payload to Alpaca.
+            # The broker creates the entry (market), TP (limit), and stop-loss
+            # as a linked OCO group.  The TP/stop legs activate automatically
+            # when the parent market order fills — the broker owns that state
+            # machine.  No post-fill polling is needed here.
             if use_tp and use_ts:
-                # Bracket order: entry market + OCO (TP limit + stop-loss).
                 order = self.adapter.submit_bracket_order(
                     symbol=symbol,
                     qty=qty,
@@ -313,8 +342,16 @@ class OrderExecutor:
                     f"stop={stop_price:.2f} tp={take_profit_price:.2f} "
                     f"order_id={getattr(order, 'id', 'N/A')}"
                 )
+
+            # AUDIT 2 — TRAILING-STOP-ONLY PATH ─────────────────────────────
+            # Entry market order is submitted first.  The trailing stop is a
+            # SEPARATE order and must only be submitted against a confirmed
+            # position.  _wait_for_position() polls until the fill appears in
+            # the broker's position list or the timeout expires.
+            # FILL-CONFIRM FIX: on timeout, return None (not the entry order)
+            # so main.py does NOT record _opening_compounds for an unconfirmed
+            # position.  The entry order ID is logged for operator audit.
             elif use_ts:
-                # Entry market order + separate trailing-stop exit.
                 order = self.adapter.submit_market_order(
                     symbol=symbol,
                     qty=qty,
@@ -348,11 +385,20 @@ class OrderExecutor:
                     poll_interval_sec=poll_interval,
                 )
                 if not filled:
+                    # FILL-CONFIRM FIX: return None, not `order`.
+                    # Returning the entry order object here caused main.py to
+                    # record _opening_compounds[symbol] even when the position
+                    # was unconfirmed, poisoning future sentiment-exit deltas.
+                    # By returning None the `if order is not None` guard in
+                    # main.py naturally suppresses _opening_compounds recording.
                     logger.warning(
                         f"Position fill not confirmed for {symbol} after "
-                        f"{poll_timeout}s — skipping trailing stop submission."
+                        f"{poll_timeout}s — returning None. "
+                        f"Entry order {getattr(order, 'id', 'N/A')} was submitted "
+                        f"but fill is unconfirmed. Trailing stop NOT attached. "
+                        f"_opening_compounds[{symbol}] will NOT be recorded."
                     )
-                    return order
+                    return None
 
                 exit_side = self._exit_side(side)
                 try:
@@ -372,8 +418,11 @@ class OrderExecutor:
                     logger.warning(
                         f"Trailing stop placement failed for {symbol}: {e}"
                     )
+
+            # AUDIT 3 — PLAIN MARKET ORDER PATH ─────────────────────────────
+            # No exit leg is submitted here.  There is no secondary order that
+            # could be orphaned, so no fill-confirmation requirement exists.
             else:
-                # Plain market order, no automated exit leg.
                 order = self.adapter.submit_market_order(
                     symbol=symbol,
                     qty=qty,
@@ -410,6 +459,11 @@ class OrderExecutor:
           2. Submit a market order for the full position qty on the exit side.
           3. Log the closure via log_sentiment_close_decision.
 
+        AUDIT: _cancel_all_open_orders_for_symbol() is always called before
+        the market close order (step 1 above).  No secondary order is submitted
+        after the close order — the position is being flattened, not replaced —
+        so no fill-confirmation is needed here.
+
         Errors are caught and logged — the method never raises so the main loop
         can continue processing other positions.
         """
@@ -435,6 +489,7 @@ class OrderExecutor:
             )
             return
 
+        # AUDIT 4: cancel-then-close — orders cleared before market close order.
         self._cancel_all_open_orders_for_symbol(symbol)
         try:
             order = self.adapter.submit_market_order(
@@ -478,6 +533,12 @@ class OrderExecutor:
              Does NOT call _cancel_all_open_orders_for_symbol() in this loop —
              close_position_due_to_sentiment() already calls it internally.
           5. Never raises under any circumstances.
+
+        AUDIT: cancel_all_orders() precedes close_all_positions() in the primary
+        path (step 3a/3b).  The broker handles the atomic close; no fill-
+        confirmation is needed.  The per-symbol fallback delegates to
+        close_position_due_to_sentiment() which already cancels orders before
+        its market order (see AUDIT 4 in that method's docstring).
         """
         try:
             n = len(positions)
@@ -491,6 +552,7 @@ class OrderExecutor:
                 return
 
             # PRIMARY PATH — atomic close
+            # AUDIT 5: cancel_all_orders() before close_all_positions() — confirmed.
             try:
                 self.adapter.cancel_all_orders()
                 self.adapter.close_all_positions()
