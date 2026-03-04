@@ -3,6 +3,9 @@
 # FIX 4B — Added positions refresh immediately before end-of-loop _check_and_exit_on_sentiment() call.
 # FIX 4C — Deleted unused acct_startup assignment.
 # OA-1 — Added OPERATOR ACTION REQUIRED comment for instrument_whitelist.yaml sector diversification.
+# MONDAY-BLACKOUT — Integrated is_monday_open_blackout() check into main loop STEP 3 alongside
+#                   is_pre_close_blackout(). New entries are suppressed for 30 minutes after
+#                   Monday market open. Existing position exits are unaffected.
 
 import json
 import logging
@@ -394,8 +397,16 @@ def main() -> None:
             time.sleep(60)
             continue
 
-        # ── STEP 3: PRE-CLOSE ENTRY BLACKOUT + BUILD AND EXECUTE NEW TRADES ─
-        if adapter.is_pre_close_blackout():
+        # ── STEP 3: PRE-CLOSE + MONDAY-OPEN ENTRY BLACKOUTS + BUILD AND EXECUTE NEW TRADES ─
+        # MONDAY-BLACKOUT: Monday open blackout takes precedence over pre-close blackout
+        # because both can theoretically be true simultaneously (rare but possible if
+        # Monday is a short session). The Monday blackout message is more specific.
+        if adapter.is_monday_open_blackout():
+            logger.info(
+                "MONDAY OPEN BLACKOUT: New position entries suppressed "
+                "(within first 30 minutes of Monday market open). Monitoring existing positions only."
+            )
+        elif adapter.is_pre_close_blackout():
             logger.info(
                 "PRE-CLOSE BLACKOUT: New position entries suppressed "
                 "(within 3 hours of market close). Monitoring existing positions only."
@@ -438,7 +449,7 @@ def main() -> None:
         # so newly entered positions are included in the current cycle's exit evaluation.
         positions = pm.get_positions(opening_compounds=_opening_compounds)
 
-        # Sentiment-exit check runs unconditionally — blackout does NOT affect exits.
+        # Sentiment-exit check runs unconditionally — blackouts do NOT affect exits.
         _check_and_exit_on_sentiment(
             positions=positions,
             adapter=adapter,

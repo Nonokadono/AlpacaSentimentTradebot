@@ -3,6 +3,10 @@
 #          isoformat() on offset-aware datetimes returns '...+00:00'; appending 'Z' created
 #          malformed '...+00:00Z' causing 400 errors. Now strip timezone and append 'Z' only
 #          when the datetime is UTC-aware, or use isoformat() as-is for naive datetimes.
+# MONDAY-BLACKOUT — Added is_monday_open_blackout() method to enforce a 30-minute trading
+#                   blackout at the start of Monday market sessions. Prevents new entries
+#                   during the first 30 minutes when Monday gap volatility and low liquidity
+#                   can produce erratic fills and whipsaw losses.
 
 import logging
 import os
@@ -119,6 +123,88 @@ class AlpacaAdapter:
         except Exception as e:
             logger.warning(f"get_market_close_time error: {e}")
             return None
+
+    def get_market_open_time(self) -> Optional[datetime]:
+        """
+        Return the most recent market open as a timezone-aware datetime (UTC),
+        or None if unavailable.
+
+        Implementation rules:
+        - Calls self.get_clock() — does NOT call self.rest.get_clock() directly.
+        - If get_clock() returns None, returns None immediately.
+        - Parses clock.next_open (an ISO 8601 string) into a timezone-aware
+          datetime using datetime.fromisoformat() or a compatible parser.
+        - When the market is currently open, next_open refers to tomorrow's
+          open. We derive today's open by subtracting 24 hours from next_open
+          when clock.is_open is True.
+        - Ensures the result is UTC-aware. If the parsed datetime is naive,
+          attaches UTC via .replace(tzinfo=timezone.utc).
+        - Catches all exceptions, logs at WARNING level, and returns None.
+        - Never raises.
+        """
+        try:
+            clock = self.get_clock()
+            if clock is None:
+                return None
+            raw_open = clock.next_open
+            # next_open may be a string or already a datetime-like object.
+            if isinstance(raw_open, datetime):
+                dt = raw_open
+            else:
+                dt = datetime.fromisoformat(str(raw_open).replace("Z", "+00:00"))
+            # Ensure offset-aware UTC.
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            # When market is currently open, next_open is tomorrow's open.
+            # Derive today's open by subtracting 24 hours.
+            if clock.is_open:
+                dt = dt - timedelta(days=1)
+            return dt
+        except Exception as e:
+            logger.warning(f"get_market_open_time error: {e}")
+            return None
+
+    def is_monday_open_blackout(self, blackout_minutes: int = 30) -> bool:
+        """
+        Return True if the market is currently open AND it is Monday AND
+        we are within the first blackout_minutes minutes after market open.
+
+        Default is 30 minutes. On a standard 09:30 ET Monday open, this
+        suppresses new entries until 10:00 ET.
+
+        Rationale:
+        - Monday gap volatility and thinner pre-10am liquidity produce
+          erratic fills and whipsaw losses.
+        - RSI/momentum signals computed from Friday's close are stale.
+        - Sentiment scores may not yet reflect weekend news flow.
+
+        Implementation rules:
+        - Calls self.get_market_open_time() to derive today's open.
+        - Uses datetime.now(timezone.utc) for the current time.
+        - Emits a single logger.info() message when returning True.
+        - Catches all exceptions, logs at WARNING level, and returns False.
+        - Never raises.
+        """
+        try:
+            if not self.get_market_open():
+                return False
+            open_time = self.get_market_open_time()
+            if open_time is None:
+                return False
+            # Check that today is Monday (weekday 0).
+            if open_time.weekday() != 0:
+                return False
+            now_utc = datetime.now(timezone.utc)
+            minutes_since_open = (now_utc - open_time).total_seconds() / 60.0
+            if 0 <= minutes_since_open <= blackout_minutes:
+                logger.info(
+                    f"MONDAY OPEN BLACKOUT active: {minutes_since_open:.1f}m since market open."
+                )
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"is_monday_open_blackout error: {e}")
+            return False
 
     def is_pre_weekend_close(self, minutes_before: int = 12) -> bool:
         """
