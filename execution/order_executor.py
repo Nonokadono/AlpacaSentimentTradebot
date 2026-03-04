@@ -1,3 +1,40 @@
+# CHANGES:
+# ─────────────────────────────────────────────────────────────────────────────
+# WRONG-2 FIX — Side-aware delta in _check_and_exit_on_sentiment()
+#
+# Root cause:
+#   The original formula `delta = float(opening_compound - current_score)` was
+#   applied unconditionally to both sides.  For SHORT positions this was
+#   inverted: improving sentiment (score rising) produced a NEGATIVE delta that
+#   never reached the exit threshold, while worsening sentiment (score falling,
+#   meaning the position is winning) produced a FALSE POSITIVE exit signal.
+#
+# Fix:
+#   Compute delta in a side-aware branch immediately after deriving
+#   opening_compound and current_score:
+#
+#     if pos.side == "long":
+#         delta = float(opening_compound - current_score)   # +ve = worsened
+#     else:  # short
+#         delta = float(current_score - opening_compound)   # +ve = improved = exit
+#
+#   All three exit-tier comparisons (hard/strong/soft) and the
+#   log_sentiment_position_check() call consume the corrected delta unchanged.
+#   The hard_exit on raw_discrete == -2 remains unconditional for both sides.
+#   The _opening_compounds registry is unaffected (stores proposed.sentiment_score
+#   regardless of side — correct for both long and short entry compound storage).
+#
+# Four-case verification (soft_exit_delta_threshold = 0.60):
+#   Case 1  LONG  opening=+0.70, current=+0.10 → delta = +0.70-0.10 = +0.60 → borderline soft_exit
+#   Case 2  LONG  opening=+0.70, current=+0.70 → delta =  0.00               → no exit ✓
+#   Case 3  SHORT opening=-0.30, current=+0.40 → delta = +0.40-(-0.30) = +0.70 → soft_exit ✓
+#   Case 4  SHORT opening=-0.30, current=-0.50 → delta = -0.50-(-0.30) = -0.20 → no exit ✓
+#
+# No variables renamed.  No new dependencies introduced.
+# The _check_and_exit_on_sentiment() docstring has been updated to reflect the
+# corrected delta semantics.  All other code is unchanged.
+# ─────────────────────────────────────────────────────────────────────────────
+
 import logging
 import time
 from typing import Dict, Optional
