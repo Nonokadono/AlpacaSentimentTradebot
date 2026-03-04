@@ -263,19 +263,38 @@ class SignalEngine:
     def _normalize_mean_reversion(self, current_price: float, bars: List, rsi: float) -> float:
         """
         Mean reversion score:
-        High RSI (>70) -> Negative score (expect pullback)
-        Low RSI (<30) -> Positive score (expect bounce)
+        High RSI (> rsi_overbought) -> Negative score (expect pullback)
+        Low RSI  (< rsi_oversold)   -> Positive score (expect bounce)
+
+        FIX-RSI-THRESH: both RSI formula branches now use config-sourced
+        threshold values instead of hardcoded literals 70 and 30.
+
+        Formulae:
+          Overbought: rsi_score = -1.0 * (rsi - rsi_overbought) / (100.0 - rsi_overbought)
+          Oversold:   rsi_score = +1.0 * (rsi_oversold - rsi) / rsi_oversold
+
+        Properties:
+          • At the threshold boundary, rsi_score = 0.0 exactly (continuous).
+          • At the extreme (RSI=100 overbought, RSI=0 oversold), rsi_score = ±1.0.
+          • Sign is always correct regardless of threshold values.
+          • With default values (rsi_overbought=70, rsi_oversold=30) the output
+            is numerically identical to the previous implementation.
 
         Also distance from MA: if price >> MA, revert down (-).
         """
-        # RSI component
+        ob = self.technicalcfg.rsi_overbought
+        os = self.technicalcfg.rsi_oversold
+
+        # RSI component — FIX-RSI-THRESH: config-sourced thresholds and denominators
         rsi_score = 0.0
-        if rsi > self.technicalcfg.rsi_overbought:
-            # e.g. 75 -> -0.5
-            rsi_score = -1.0 * (rsi - 70) / 30.0
-        elif rsi < self.technicalcfg.rsi_oversold:
-            # e.g. 25 -> +0.5
-            rsi_score = 1.0 * (30 - rsi) / 30.0
+        if rsi > ob:
+            # Normalise over the distance from threshold to maximum (100).
+            # e.g. default: RSI=75, ob=70 → -1.0*(75-70)/(100-70) = -0.167
+            rsi_score = -1.0 * (rsi - ob) / (100.0 - ob)
+        elif rsi < os:
+            # Normalise over the distance from threshold to minimum (0).
+            # e.g. default: RSI=25, os=30 → +1.0*(30-25)/30 = +0.167
+            rsi_score = 1.0 * (os - rsi) / os
 
         # MA distance component
         if len(bars) < 20:
