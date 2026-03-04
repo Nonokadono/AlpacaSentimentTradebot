@@ -231,9 +231,12 @@ class SignalEngine:
         return 100.0 - (100.0 / (1.0 + rs))
 
     def _normalize_momentum_trend(self, mom_raw: float, trend_raw: float) -> float:
-        # Scale momentum: if mom is 1%, that's huge in 5min bars.
-        # standardizing roughly: mom / 0.005 -> clamped
-        mom_score = max(-1.0, min(1.0, mom_raw / self.technicalcfg.momentum_norm_scale))
+        # WRONG-1 FIX: mom_raw is already normalised to [-1, 1] by
+        # _compute_simple_momentum_raw() via ema_crossover_norm_scale (0.10).
+        # Dividing again by momentum_norm_scale (0.05) double-normalised the
+        # signal, saturating any EMA spread > 0.5% of price to ±1.0.
+        # Direct passthrough preserves the graded signal.
+        mom_score = max(-1.0, min(1.0, mom_raw))
 
         # Combine with trend (-1 or 1)
         # 70% momentum value, 30% trend direction
@@ -522,7 +525,6 @@ class SignalEngine:
         news_items = self._get_news_items(symbol)
         sentiment_result = self.sentiment.scorenewsitems(symbol, news_items)
 
-        
         log_instrument_report(
             symbol=symbol,
             signal_score=signal_score,

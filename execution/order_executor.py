@@ -37,9 +37,10 @@ def _check_and_exit_on_sentiment(
                     confidence > exit_confidence_min
          Catches partial deterioration (e.g. +0.7 → 0.0, delta=0.70).
 
-    delta is defined as:
-      delta = opening_compound - current_sentiment.score
-    A positive delta means sentiment has worsened since entry.
+    delta is defined side-aware (WRONG-2 FIX):
+      long:  delta = opening_compound - current_score  (positive = sentiment worsened)
+      short: delta = current_score - opening_compound  (positive = sentiment improved = exit)
+    A positive delta in either case means the position should be exited.
 
     When pnl_exit_scale_enabled is True, effective thresholds are PnL-scaled:
       scale_adj               = unrealised_pnl_pct * pnl_exit_scale_factor
@@ -61,7 +62,14 @@ def _check_and_exit_on_sentiment(
         current_sentiment: SentimentResult = sentiment_module.force_rescore(symbol, news_items)
         opening_compound = float(pos.opening_compound)
         current_score = float(current_sentiment.score)
-        delta = float(opening_compound - current_score)
+
+        # WRONG-2 FIX: side-aware delta so shorts exit on improving sentiment.
+        # Long:  positive delta means sentiment has worsened since entry → exit.
+        # Short: positive delta means sentiment has improved since entry → exit.
+        if pos.side == "long":
+            delta = float(opening_compound - current_score)
+        else:  # short
+            delta = float(current_score - opening_compound)
 
         # --- PnL-Coupled Sentiment Exit Threshold Scaling ---
         # Derive unrealised P&L percentage from PositionInfo fields.

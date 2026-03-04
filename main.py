@@ -1,3 +1,14 @@
+# CHANGES:
+# WRONG-3 FIX — get_equity_snapshot_from_account():
+#   Removed `high_watermark_equity = equity` from inside the
+#   `if last_day != today_str:` block.
+#   Rationale: resetting the watermark to the current equity at the start of
+#   every calendar day made max_drawdown_pct an intraday-only protection. A bot
+#   that lost 8% on Monday would start Tuesday with a fresh watermark equal to
+#   its depleted equity, so the cumulative drawdown guard would never fire.
+#   The subsequent `if equity > high_watermark_equity: high_watermark_equity = equity`
+#   block correctly handles legitimate new all-time peaks in a monotonic,
+#   non-resetting fashion. Only `start_of_day_equity` resets on a new day.
 import json
 import logging
 import time
@@ -84,11 +95,15 @@ def get_equity_snapshot_from_account(
     start_of_day_equity = float(state.get("start_of_day_equity", equity))
     high_watermark_equity = float(state.get("high_watermark_equity", equity))
 
+    # WRONG-3 FIX: only start_of_day_equity resets on a new calendar day.
+    # high_watermark_equity is intentionally NOT reset here — doing so would
+    # restart the max-drawdown clock every morning, turning a portfolio-level
+    # protection into an intraday-only guard.
     if last_day != today_str:
         start_of_day_equity = equity
-        high_watermark_equity = equity
         state["last_trading_day"] = today_str
 
+    # Legitimate new all-time peak — monotonically update the watermark.
     if equity > high_watermark_equity:
         high_watermark_equity = equity
 
