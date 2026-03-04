@@ -1,24 +1,19 @@
 # CHANGES:
-# FIX 3 — Kelly path in pre_trade_checks() now applies min_risk_per_trade_pct as
-#   the floor for risk_pct, matching the fixed-fractional path.  Changed:
-#     max(0.0, raw_risk_pct)
-#   to:
-#     max(self.limits.min_risk_per_trade_pct, raw_risk_pct)
-#   This prevents a very low kelly_f from collapsing risk_pct to zero and
-#   producing qty=0 (silently wasted candidate evaluation).
+# CRASH-2 FIX — Added avg_entry_price: float = 0.0 to PositionInfo dataclass.
 #
-# FIX 4 — _vol_history is now a per-symbol Dict[str, deque] instead of a single
-#   shared deque.  A single shared deque caused cross-symbol vol contamination:
-#   one high-vol symbol (TSLA, NVDA) shifted the median upward and under-sized
-#   all normal-vol symbols.
-#   In __init__: self._vol_history: Dict[str, deque] = {}
-#   In _kelly_fraction(): added symbol: str = "" parameter (default preserves all
-#   existing call sites).  Inside the method, per-symbol deque is created on
-#   first use (maxlen=200) and all percentile logic uses that deque exclusively.
-#   In pre_trade_checks(): _kelly_fraction() call now passes symbol=symbol.
+#   order_executor._check_and_exit_on_sentiment() accesses pos.avg_entry_price
+#   to compute unrealised_pnl_pct for PnL-coupled threshold scaling.  Without
+#   this field every loop iteration over any open position raised AttributeError,
+#   crashing the bot unconditionally.
 #
-# All prior changes (Fix M5, Change 2, Change 4, Improvement A, Improvement C)
-# are preserved unchanged.
+#   Default of 0.0 is intentionally safe: the guarding condition
+#     `if pos.avg_entry_price > 0.0`
+#   in order_executor.py evaluates to False when the field is not populated,
+#   setting unrealised_pnl_pct = 0.0 (no-op).  Legacy behaviour is therefore
+#   fully preserved for any call site that does not populate avg_entry_price.
+#
+# All prior changes (FIX 3, FIX 4, Fix M5, Change 2, Change 4,
+# Improvement A, Improvement C) are preserved unchanged.
 
 import math
 from collections import deque
@@ -52,6 +47,13 @@ class PositionInfo:
     side: str
     notional: float
     opening_compound: float = 0.0
+    # CRASH-2 FIX: avg_entry_price was accessed in order_executor.py but did
+    # not exist in this dataclass, raising AttributeError on every position check.
+    # Default 0.0 is safe: the guarding condition `if pos.avg_entry_price > 0.0`
+    # in _check_and_exit_on_sentiment() resolves to False, so unrealised_pnl_pct
+    # stays 0.0 and PnL scaling is a no-op for any position where this field
+    # is not explicitly populated by PositionManager.
+    avg_entry_price: float = 0.0
 
 
 @dataclass

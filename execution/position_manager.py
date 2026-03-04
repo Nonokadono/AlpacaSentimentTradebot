@@ -1,8 +1,26 @@
 # CHANGES:
-# - No functional changes from baseline.
-# - get_positions() accepts an optional opening_compounds dict and patches
-#   each PositionInfo.opening_compound from it so the sentiment-exit delta
-#   check in main._check_and_exit_on_sentiment() has a valid entry baseline.
+# CRASH-2 FIX — Populate avg_entry_price in the PositionInfo constructor.
+#
+#   order_executor._check_and_exit_on_sentiment() reads pos.avg_entry_price to
+#   compute unrealised P&L for PnL-coupled threshold scaling.  The field now
+#   exists in PositionInfo (added in core/risk_engine.py), but it must also be
+#   populated from the raw Alpaca position object here.
+#
+#   Added inside the per-position try block:
+#     avg_entry_price: float = float(getattr(pos, "avg_entry_price", 0.0))
+#
+#   getattr with default 0.0 means:
+#     - If the Alpaca SDK returns the field (as it does for real positions),
+#       the true entry price is captured and PnL scaling works correctly.
+#     - If the field is absent (e.g. mock/test objects), the value is 0.0,
+#       which causes the `if pos.avg_entry_price > 0.0` guard in
+#       order_executor.py to skip scaling — identical to legacy behaviour.
+#
+#   avg_entry_price is passed as a keyword argument to the PositionInfo
+#   constructor so the field ordering in the dataclass is respected.
+#
+# All prior changes (opening_compound patching from opening_compounds dict)
+# are preserved unchanged.
 
 import logging
 from typing import Dict, Optional
@@ -22,6 +40,8 @@ class PositionManager:
       - Convert raw Alpaca position objects into PositionInfo dataclasses.
       - Patch opening_compound from the in-memory registry (_opening_compounds)
         so downstream sentiment-exit logic has a valid entry-time baseline.
+      - Populate avg_entry_price from the Alpaca position object so that
+        PnL-coupled sentiment-exit threshold scaling has a valid denominator.
     """
 
     def __init__(self, adapter: AlpacaAdapter) -> None:
@@ -61,6 +81,13 @@ class PositionManager:
                 if opening_compounds is not None:
                     opening_compound = float(opening_compounds.get(symbol, 0.0))
 
+                # CRASH-2 FIX: read avg_entry_price from the raw Alpaca position
+                # object.  getattr with default 0.0 is safe for mock/test objects
+                # that omit this attribute; the guard in order_executor.py
+                # (`if pos.avg_entry_price > 0.0`) treats 0.0 as "not available"
+                # and skips PnL scaling, preserving legacy behaviour exactly.
+                avg_entry_price: float = float(getattr(pos, "avg_entry_price", 0.0))
+
                 positions[symbol] = PositionInfo(
                     symbol=symbol,
                     qty=qty,
@@ -68,6 +95,7 @@ class PositionManager:
                     side=side,
                     notional=notional,
                     opening_compound=opening_compound,
+                    avg_entry_price=avg_entry_price,
                 )
             except Exception as e:
                 logger.warning(f"PositionManager: failed to parse position {getattr(pos, 'symbol', '?')}: {e}")

@@ -1,24 +1,23 @@
 # CHANGES:
-# TASK IC-RANKING — Added three new fields to PortfolioConfig, all with
-#   defaults so backward compatibility is fully preserved:
+# CRASH-1 FIX — Added two missing fields to SentimentConfig:
 #
-#     enable_composite_ranking: bool  = False
-#       Gate flag. False produces byte-identical sort order to the previous
-#       codebase (|signal_score| only). True activates the IC-weighted
-#       additive composite ranking in build_portfolio().
+#   pnl_exit_scale_enabled: bool = False
+#     Gate flag for PnL-coupled sentiment-exit threshold scaling.
+#     Default False preserves byte-identical legacy behaviour: the else-branch
+#     in _check_and_exit_on_sentiment() sets effective thresholds directly
+#     from the raw config values, so no existing test or logic is affected.
 #
-#     rank_weight_technical: float = 0.7
-#       Weight applied to signal_score in the composite formula.
-#       Mirrors the default split used in published IC-weighted alpha models.
+#   pnl_exit_scale_factor: float = 0.5
+#     Multiplier applied to unrealised_pnl_pct when computing scale_adj.
+#     Only read when pnl_exit_scale_enabled=True, so the default is irrelevant
+#     under legacy operation.
 #
-#     rank_weight_sentiment: float = 0.3
-#       Weight applied to sentiment_score in the composite formula.
-#       Together with rank_weight_technical they control the signed composite:
-#         rank_score = abs(w_t * signal_score + w_s * sentiment_score)
-#       so confirming pairs rank higher and contradicting pairs are demoted.
+#   Without these fields every call that has an open position raised
+#   AttributeError on `sent_cfg.pnl_exit_scale_enabled`, crashing the bot
+#   on the very first loop iteration that found a live position.
 #
-# All prior changes (FIX 7, Fix L3, Change 2, Change 4) are preserved
-# unchanged.
+# All prior changes (TASK IC-RANKING, FIX 7, Fix L3, Change 2, Change 4)
+# are preserved unchanged.
 
 import os
 import yaml
@@ -84,6 +83,18 @@ class SentimentConfig:
     # that rewards high-confidence scores more and down-weights low-confidence
     # ones.  Clamped to [1.0, 4.0] at runtime.
     confidence_gamma: float = 2.0
+    #
+    # CRASH-1 FIX: PnL-coupled sentiment-exit threshold scaling.
+    # pnl_exit_scale_enabled=False (default) means the else-branch in
+    # _check_and_exit_on_sentiment() is always taken, so effective thresholds
+    # equal soft_exit_delta_threshold / strong_exit_delta_threshold exactly —
+    # byte-identical to behaviour before this field existed.
+    # Set to True to activate PnL-coupled widening/tightening of thresholds.
+    pnl_exit_scale_enabled: bool = False
+    # Multiplier for unrealised_pnl_pct when computing scale_adj.
+    # scale_adj = unrealised_pnl_pct * pnl_exit_scale_factor
+    # Only consumed when pnl_exit_scale_enabled=True.
+    pnl_exit_scale_factor: float = 0.5
     #
     # Legacy alias kept for any downstream code that reads this field directly.
     # Points at the strong threshold so behaviour is unchanged if old code path
