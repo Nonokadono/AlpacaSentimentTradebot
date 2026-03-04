@@ -10,6 +10,9 @@
 #                          When abs(sentiment score) < neutral_band, position sizing is blocked entirely.
 #                          This prevents barely-positive AND barely-negative AI-neutral scores from
 #                          producing minimal positions. Only |s| ≥ neutral_band opens trades.
+# TASK-MAX-NOTIONAL — Replaced hardcoded 0.4 constant in step 6 (broker-aware cap) with
+#                     self.limits.max_single_trade_notional_pct. This makes the per-trade notional cap
+#                     configurable via RiskLimits instead of being a magic number.
 
 import math
 from collections import deque
@@ -362,7 +365,8 @@ class RiskEngine:
             )
 
         # 6) Broker-aware cap
-        max_notional_broker = 0.4 * snapshot.equity
+        # TASK-MAX-NOTIONAL: replaced hardcoded 0.4 with configurable field.
+        max_notional_broker = self.limits.max_single_trade_notional_pct * snapshot.equity
         projected_notional = qty * entry_price
         if projected_notional > max_notional_broker:
             max_qty_broker = int(max_notional_broker / entry_price / meta.lot_size) * meta.lot_size

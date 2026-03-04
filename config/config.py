@@ -10,6 +10,11 @@
 # NONE-RETURN-FIX — Added explicit error handling to ensure load_config() never returns None.
 #                   FileNotFoundError for missing whitelist now includes the full path in the
 #                   error message and is never silently caught. All code paths return BotConfig.
+# TASK-UNKNOWN-SECTOR — Modified _load_instrument_whitelist() to raise ValueError when
+#                        sector == "UNKNOWN" instead of silently accepting it. All symbols must
+#                        have explicit sector classifications before the bot can start.
+# TASK-MAX-NOTIONAL — Added max_single_trade_notional_pct field to RiskLimits with default 0.4
+#                     (40% of equity). Replaces the hardcoded 0.4 constant in RiskEngine.
 
 import os
 import yaml
@@ -52,6 +57,12 @@ class RiskLimits:
     # Raising this above 0.001 will block weak Kelly signals; lowering it
     # below 0.0005 risks qty=0 rounding on low-priced symbols.
     kelly_min_risk_pct: float = 0.001
+    # TASK-MAX-NOTIONAL: maximum notional value of a single trade as a fraction
+    # of equity. 0.4 = 40% cap per position. This replaces the hardcoded 0.4
+    # constant in RiskEngine.pre_trade_checks() step 6 (broker-aware cap).
+    # Raising this above 0.5 can violate Reg-T margin requirements; lowering
+    # it below 0.2 may prevent meaningful position sizes for low-volatility symbols.
+    max_single_trade_notional_pct: float = 0.4
 
 
 @dataclass
@@ -221,6 +232,12 @@ def _load_instrument_whitelist(path: Path) -> Dict[str, InstrumentMeta]:
     Raises FileNotFoundError with full path if file doesn't exist.
     This error is intentionally NOT caught — it must propagate to main()
     so the operator knows the config is incomplete.
+    
+    TASK-UNKNOWN-SECTOR: Now raises ValueError when any instrument has
+    sector == "UNKNOWN". All symbols must have an explicit sector classification
+    (TECH, FINANCE, CONSUMER, ETF_INDEX, ETF_SECTOR, ENERGY, FX, etc.) before
+    the bot can start. This ensures sector-aware diversification logic in
+    PortfolioBuilder can function correctly.
     """
     if not path.exists():
         raise FileNotFoundError(
@@ -233,6 +250,15 @@ def _load_instrument_whitelist(path: Path) -> Dict[str, InstrumentMeta]:
         data = yaml.safe_load(f) or {}
     instruments: Dict[str, InstrumentMeta] = {}
     for sym, meta in data.items():
+        sector = meta.get("sector", "UNKNOWN")
+        # TASK-UNKNOWN-SECTOR: reject UNKNOWN sector — no silent default.
+        if sector == "UNKNOWN":
+            raise ValueError(
+                f"Instrument {sym} has sector='UNKNOWN'. All symbols must have "
+                f"an explicit sector classification (TECH, FINANCE, CONSUMER, "
+                f"ETF_INDEX, ETF_SECTOR, ENERGY, FX, etc.) for sector-aware "
+                f"portfolio diversification. Update config/instrument_whitelist.yaml."
+            )
         instruments[sym] = InstrumentMeta(
             symbol=sym,
             exchange=meta.get("exchange", "NYSE"),
@@ -241,7 +267,7 @@ def _load_instrument_whitelist(path: Path) -> Dict[str, InstrumentMeta]:
             shortable=bool(meta.get("shortable", False)),
             marginable=bool(meta.get("marginable", False)),
             trading_hours=meta.get("trading_hours", "09:30-16:00"),
-            sector=meta.get("sector", "UNKNOWN"),
+            sector=sector,
         )
     return instruments
 
@@ -266,6 +292,7 @@ def load_config() -> BotConfig:
     # NONE-RETURN-FIX: _load_instrument_whitelist raises FileNotFoundError
     # if the file is missing — we do NOT catch it here. This ensures the
     # operator sees the full error message with the expected path.
+    # TASK-UNKNOWN-SECTOR: also raises ValueError if any sector == "UNKNOWN".
     instruments = _load_instrument_whitelist(wl_path)
 
     risk = RiskLimits()

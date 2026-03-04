@@ -2,6 +2,9 @@
 # BLOCKER-1 FIX — Uncommented SPY, QQQ, BAC, COST to achieve minimum 3-sector
 # diversification. Previous 100% TECH allocation violated risk calibration
 # assumptions (15 diverse positions, not 3 correlated names).
+# TASK-UNKNOWN-SECTOR — All symbols now have explicit sector classifications.
+# No sector == "UNKNOWN" entries remain. This ensures _load_instrument_whitelist()
+# in config.py will not raise ValueError.
 
 # ── Active symbols ────────────────────────────────────────────────────────────
 
