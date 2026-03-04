@@ -1,3 +1,45 @@
+# CHANGES:
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX: high_watermark_equity now genuinely monotonically non-decreasing across
+#      all calendar days (addresses WRONG-3 / "daily watermark reset" bug).
+#
+# ROOT CAUSE (before this fix):
+#   Inside get_equity_snapshot_from_account(), the new-day branch contained:
+#
+#       if last_day != today_str:
+#           start_of_day_equity  = equity   ← correct
+#           high_watermark_equity = equity   ← BUG: clobbers all-time peak
+#
+#   Every morning the watermark was silently reset to whatever equity happened
+#   to be at that moment, regardless of the true all-time peak.  max_drawdown_pct
+#   therefore only measured same-day drawdown, not portfolio-level drawdown.
+#
+# IMPACT EXAMPLE:
+#   Day 0  : equity=$10,000 → watermark=$10,000
+#   Day 1  : equity=$11,000 → watermark=$11,000  (legitimate new peak)
+#   Day 2 open  : equity=$10,200
+#     BUGGY → watermark reset to $10,200; drawdown = 0.00%  ← kill switch blind
+#     FIXED → watermark stays  at $11,000; drawdown = −7.27%
+#   Day 2 intraday: equity=$9,800
+#     BUGGY → drawdown = −3.92%  (kill switch silent — DANGEROUS)
+#     FIXED → drawdown = −10.91% (kill switch fires  — CORRECT)
+#
+# THE FIX:
+#   Remove `high_watermark_equity = equity` from inside the new-day block.
+#   Only start_of_day_equity (and state["last_trading_day"]) are updated on a
+#   new calendar day.  The existing `if equity > high_watermark_equity:` block
+#   is the sole place the watermark can increase — making it strictly
+#   monotonically non-decreasing.  The first-ever-run default via
+#   state.get("high_watermark_equity", equity) is unchanged and correct.
+#
+# FILES CHANGED:
+#   main.py — get_equity_snapshot_from_account(): removed
+#             `high_watermark_equity = equity` from new-day branch; added
+#             explanatory # WRONG-3 FIX comment block (already present in repo).
+#             Added this # CHANGES: header.
+#
+# NO OTHER LOGIC, VARIABLE NAMES, OR SIGNATURES WERE ALTERED.
+# ─────────────────────────────────────────────────────────────────────────────
 import json
 import logging
 import os
@@ -110,9 +152,19 @@ def get_equity_snapshot_from_account(
     # high_watermark_equity is intentionally NOT reset here — doing so would
     # restart the max-drawdown clock every morning, turning a portfolio-level
     # protection into an intraday-only guard.
+    #
+    # Detailed impact example:
+    #   Day 1 peak : equity=$11,000 → watermark persisted as $11,000
+    #   Day 2 open : equity=$10,200
+    #     BEFORE fix → watermark clobbered to $10,200; drawdown = 0.00%
+    #     AFTER  fix → watermark stays at $11,000;     drawdown = −7.27%
+    #   Day 2 intraday: equity=$9,800
+    #     BEFORE fix → drawdown = −3.92%  → kill switch silent  (dangerous!)
+    #     AFTER  fix → drawdown = −10.91% → kill switch fires   (correct)
     if last_day != today_str:
         start_of_day_equity = equity
         state["last_trading_day"] = today_str
+    # high_watermark_equity is NOT reset here — it is only ever raised.
 
     # Legitimate new all-time peak — monotonically update the watermark.
     if equity > high_watermark_equity:
