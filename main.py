@@ -1,5 +1,51 @@
+# CHANGES:
+# ─────────────────────────────────────────────────────────────────────────────
+# [ATOMIC-WRITE] _save_equity_state() — replaced non-atomic open("w") + json.dump
+#   with a tempfile.mkstemp + os.fsync + os.replace pattern.
+#
+#   Root cause:
+#     open("w") truncates equity_state.json to 0 bytes immediately. Any process
+#     death (SIGKILL, OOM, power loss) between truncation and flush leaves an
+#     empty or partial file. _load_equity_state() silently falls back to {},
+#     losing start_of_day_equity, high_watermark_equity, and _opening_compounds.
+#
+#   Fix:
+#     1. tempfile.mkstemp(dir=EQUITY_STATE_PATH.parent, ...) creates a sibling
+#        temp file in the SAME directory/filesystem. os.replace() across
+#        filesystems is NOT atomic; same-dir placement guarantees it is.
+#     2. json.dump → f.flush() → os.fsync(f.fileno()) ensures the bytes reach
+#        persistent storage before we attempt the rename.
+#     3. os.replace(tmp_path, EQUITY_STATE_PATH) is a single rename(2) syscall
+#        on POSIX — atomic by kernel guarantee. Windows: near-atomic (replaces
+#        the destination in one MoveFileEx call; safe for our use case).
+#     4. On any exception during the write, os.unlink(tmp_path) cleans up the
+#        temp file before re-raising, so no orphaned partials accumulate.
+#     5. The outer try/except preserves the existing logger.warning behaviour —
+#        a failed save is non-fatal (the bot logs and continues).
+#
+#   Failure mode verification:
+#     A) Killed DURING json.dump to temp file:
+#        equity_state.json is UNTOUCHED. Temp file is orphaned (harmless).
+#        Next _load_equity_state() reads the last good equity_state.json.
+#     B) Killed AFTER fdopen close, BEFORE os.replace:
+#        equity_state.json is UNTOUCHED. Temp file is complete but unreferenced.
+#        Next _load_equity_state() reads the last good equity_state.json.
+#     C) os.replace completes:
+#        equity_state.json atomically contains the new state (rename(2) guarantee).
+#        No partial state is ever observable by any reader.
+#
+#   New stdlib imports added: os, tempfile  (no third-party dependencies).
+#
+#   .gitignore recommendation (add to project root .gitignore):
+#     equity_state.json
+#     equity_state.json.tmp
+#     .equity_state_*.tmp
+# ─────────────────────────────────────────────────────────────────────────────
+
 import json
 import logging
+import os
+import tempfile
 import time
 from datetime import date
 from pathlib import Path
@@ -46,9 +92,29 @@ def _load_equity_state() -> dict:
 
 
 def _save_equity_state(state: dict) -> None:
+    """Write equity state atomically via temp file + os.replace().
+
+    The write target is a sibling temp file inside EQUITY_STATE_PATH.parent so
+    that os.replace() is guaranteed to stay on the same filesystem (rename(2)
+    is only atomic within one filesystem).  equity_state.json is never opened
+    for writing and therefore remains uncorrupted under any failure mode that
+    occurs before os.replace() completes.
+    """
     try:
-        with EQUITY_STATE_PATH.open("w") as f:
-            json.dump(state, f)
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=EQUITY_STATE_PATH.parent,
+            prefix=".equity_state_",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                json.dump(state, f)
+                f.flush()
+                os.fsync(f.fileno())   # flush OS page cache → persistent storage
+        except Exception:
+            os.unlink(tmp_path)       # clean up orphaned temp file on write failure
+            raise
+        os.replace(tmp_path, EQUITY_STATE_PATH)  # atomic on POSIX; near-atomic on Win
     except Exception as e:
         logger.warning(f"_save_equity_state error: {e}")
 
