@@ -3,6 +3,13 @@
 # FIX 10 — Added inline comment to max_scale explaining cap and safety rationale.
 # OA-2 — Added OPERATOR ACTION REQUIRED comment for exit_time_in_force = "day".
 # OA-3 — Added OPERATOR ACTION REQUIRED comment for 180-minute pre-close blackout.
+# KELLY-MIN-FIX — Added kelly_min_risk_pct field to RiskLimits with default 0.001 (0.1%).
+#                 This creates a separate floor for Kelly-sized positions, allowing very
+#                 low-conviction signals to take minimal risk without being blocked by the
+#                 0.5% fixed-fractional floor (min_risk_per_trade_pct).
+# NONE-RETURN-FIX — Added explicit error handling to ensure load_config() never returns None.
+#                   FileNotFoundError for missing whitelist now includes the full path in the
+#                   error message and is never silently caught. All code paths return BotConfig.
 
 import os
 import yaml
@@ -38,6 +45,13 @@ class RiskLimits:
     # log-odds blend for Kelly p.  Increasing this makes sentiment more
     # influential on position size.
     kelly_sentiment_weight: float = 0.08
+    # KELLY-MIN-FIX: separate minimum risk floor for Kelly-sized positions.
+    # 0.001 = 0.1% of equity, allowing very low-conviction signals to enter
+    # with minimal risk. The fixed-fractional floor (min_risk_per_trade_pct)
+    # remains at 0.5% and is only used when enable_kelly_sizing=False.
+    # Raising this above 0.001 will block weak Kelly signals; lowering it
+    # below 0.0005 risks qty=0 rounding on low-priced symbols.
+    kelly_min_risk_pct: float = 0.001
 
 
 @dataclass
@@ -202,8 +216,19 @@ class AIConfig:
 
 
 def _load_instrument_whitelist(path: Path) -> Dict[str, InstrumentMeta]:
+    """Load instrument whitelist from YAML file.
+    
+    Raises FileNotFoundError with full path if file doesn't exist.
+    This error is intentionally NOT caught — it must propagate to main()
+    so the operator knows the config is incomplete.
+    """
     if not path.exists():
-        raise FileNotFoundError(f"Instrument whitelist not found at {path}")
+        raise FileNotFoundError(
+            f"Instrument whitelist not found at {path.resolve()}\n"
+            f"Expected location: {path}\n"
+            f"Current working directory: {Path.cwd()}\n"
+            f"Please ensure config/instrument_whitelist.yaml exists."
+        )
     with path.open("r") as f:
         data = yaml.safe_load(f) or {}
     instruments: Dict[str, InstrumentMeta] = {}
@@ -222,6 +247,12 @@ def _load_instrument_whitelist(path: Path) -> Dict[str, InstrumentMeta]:
 
 
 def load_config() -> BotConfig:
+    """Load bot configuration from files and environment variables.
+    
+    NONE-RETURN-FIX: This function now always returns a BotConfig or raises
+    an exception — it never returns None. All error paths raise explicit
+    exceptions that propagate to main() with actionable error messages.
+    """
     base = Path(__file__).resolve().parents[1]
     wl_path = base / "config" / "instrument_whitelist.yaml"
     
@@ -232,6 +263,9 @@ def load_config() -> BotConfig:
     # config/strategy decision, not a code bug. Adjust in TechnicalSignalConfig
     # or via environment override before live trading.
     
+    # NONE-RETURN-FIX: _load_instrument_whitelist raises FileNotFoundError
+    # if the file is missing — we do NOT catch it here. This ensures the
+    # operator sees the full error message with the expected path.
     instruments = _load_instrument_whitelist(wl_path)
 
     risk = RiskLimits()

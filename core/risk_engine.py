@@ -2,6 +2,10 @@
 # FIX 5 — Wired neutral_band into sentiment_scale() with a flat floor at min_scale for scores in [0, neutral_band].
 #         Piecewise logic: s < no_trade_neg → 0.0; no_trade_neg ≤ s < 0.0 → interpolate 0.0→min_scale;
 #         0.0 ≤ s ≤ neutral_band → return min_scale (flat); s > neutral_band → interpolate min_scale→max_scale.
+# KELLY-MIN-FIX — Replaced min_risk_per_trade_pct floor with kelly_min_risk_pct in the Kelly sizing path.
+#                 This allows Kelly-sized positions to use a much lower floor (default 0.001 = 0.1%)
+#                 instead of being constrained by the 0.5% fixed-fractional floor. The fixed-fractional
+#                 path remains unchanged and continues to use min_risk_per_trade_pct.
 
 import math
 from collections import deque
@@ -316,11 +320,12 @@ class RiskEngine:
             # differentiates sizing within the Kelly path.
             kelly_f = kelly_f * s_scale
             raw_risk_pct = kelly_f * self.limits.max_risk_per_trade_pct
-            # FIX 3: apply min_risk_per_trade_pct floor (was max(0.0, ...)).
-            # Matches the fixed-fractional path and prevents qty=0 from a tiny kelly_f.
+            # KELLY-MIN-FIX: use kelly_min_risk_pct floor instead of min_risk_per_trade_pct.
+            # This allows Kelly-sized positions to take minimal risk (0.1% default)
+            # without being constrained by the 0.5% fixed-fractional floor.
             risk_pct = min(
                 self.limits.max_risk_per_trade_pct,
-                max(self.limits.min_risk_per_trade_pct, raw_risk_pct),
+                max(self.limits.kelly_min_risk_pct, raw_risk_pct),
             )
         else:
             raw_risk_pct = self.limits.max_risk_per_trade_pct * s_scale

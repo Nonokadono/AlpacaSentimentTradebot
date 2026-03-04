@@ -6,6 +6,8 @@
 # MONDAY-BLACKOUT — Integrated is_monday_open_blackout() check into main loop STEP 3 alongside
 #                   is_pre_close_blackout(). New entries are suppressed for 30 minutes after
 #                   Monday market open. Existing position exits are unaffected.
+# ORPHAN-ORDER-FIX — Added adapter.cancel_all_orders() immediately before portfolio execution
+#                    in STEP 3 to eliminate orphaned order risk from previous iterations.
 
 import json
 import logging
@@ -414,6 +416,13 @@ def main() -> None:
         else:
             dashboard_state.update(bot_state="SCANNING")
             persist_state(dashboard_state)
+            
+            # ORPHAN-ORDER-FIX: Cancel all open orders before building new portfolio.
+            # This eliminates orphaned orders from previous iterations that may have
+            # become stale or conflicting. Clean slate ensures execution integrity.
+            logger.info("Canceling all open orders before portfolio execution.")
+            adapter.cancel_all_orders()
+            
             open_orders     = adapter.list_orders(status="open")
             proposed_trades = portfolio_builder.build_portfolio(snapshot, positions, open_orders)
 
