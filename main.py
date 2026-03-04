@@ -1,47 +1,3 @@
-# CHANGES:
-# ─────────────────────────────────────────────────────────────────────────────
-# [ATOMIC-WRITE] _save_equity_state() — replaced non-atomic open("w") + json.dump
-#   with a tempfile.mkstemp + os.fsync + os.replace pattern.
-#
-#   Root cause:
-#     open("w") truncates equity_state.json to 0 bytes immediately. Any process
-#     death (SIGKILL, OOM, power loss) between truncation and flush leaves an
-#     empty or partial file. _load_equity_state() silently falls back to {},
-#     losing start_of_day_equity, high_watermark_equity, and _opening_compounds.
-#
-#   Fix:
-#     1. tempfile.mkstemp(dir=EQUITY_STATE_PATH.parent, ...) creates a sibling
-#        temp file in the SAME directory/filesystem. os.replace() across
-#        filesystems is NOT atomic; same-dir placement guarantees it is.
-#     2. json.dump → f.flush() → os.fsync(f.fileno()) ensures the bytes reach
-#        persistent storage before we attempt the rename.
-#     3. os.replace(tmp_path, EQUITY_STATE_PATH) is a single rename(2) syscall
-#        on POSIX — atomic by kernel guarantee. Windows: near-atomic (replaces
-#        the destination in one MoveFileEx call; safe for our use case).
-#     4. On any exception during the write, os.unlink(tmp_path) cleans up the
-#        temp file before re-raising, so no orphaned partials accumulate.
-#     5. The outer try/except preserves the existing logger.warning behaviour —
-#        a failed save is non-fatal (the bot logs and continues).
-#
-#   Failure mode verification:
-#     A) Killed DURING json.dump to temp file:
-#        equity_state.json is UNTOUCHED. Temp file is orphaned (harmless).
-#        Next _load_equity_state() reads the last good equity_state.json.
-#     B) Killed AFTER fdopen close, BEFORE os.replace:
-#        equity_state.json is UNTOUCHED. Temp file is complete but unreferenced.
-#        Next _load_equity_state() reads the last good equity_state.json.
-#     C) os.replace completes:
-#        equity_state.json atomically contains the new state (rename(2) guarantee).
-#        No partial state is ever observable by any reader.
-#
-#   New stdlib imports added: os, tempfile  (no third-party dependencies).
-#
-#   .gitignore recommendation (add to project root .gitignore):
-#     equity_state.json
-#     equity_state.json.tmp
-#     .equity_state_*.tmp
-# ─────────────────────────────────────────────────────────────────────────────
-
 import json
 import logging
 import os
@@ -227,6 +183,33 @@ def main() -> None:
     # Persisted to equity_state.json so it survives bot restarts.
     _opening_compounds: Dict[str, float] = _load_opening_compounds()
 
+    # ── GAP-1 FIX: Startup reconciliation ───────────────────────────────────
+    # After loading from disk, validate the registry against LIVE Alpaca
+    # positions. While the bot was offline, broker bracket-orders or trailing-
+    # stops may have closed positions. Those symbols must be purged NOW —
+    # before the main loop begins — so no stale baseline contaminates the
+    # delta check on a future re-entry of the same symbol.
+    #
+    # Scenario example:
+    #   disk:  {"AAPL": 0.65, "NVDA": 0.30}
+    #   live:  {"AAPL": PositionInfo(...)}         ← NVDA was bracket-stopped
+    #
+    #   stale_syms = ["NVDA"]
+    #   → del _opening_compounds["NVDA"]
+    #   → _opening_compounds is now {"AAPL": 0.65}
+    #   → _persist_opening_compounds() called exactly once (only if stale found)
+    acct_startup       = adapter.get_account()
+    positions_at_start = pm.get_positions(opening_compounds=_opening_compounds)
+    stale_syms = [s for s in list(_opening_compounds) if s not in positions_at_start]
+    if stale_syms:
+        logger.info(
+            f"Startup reconcile: purging stale opening_compounds for {stale_syms}"
+        )
+        for s in stale_syms:
+            del _opening_compounds[s]
+        _persist_opening_compounds(_opening_compounds)
+    # ── END GAP-1 FIX ───────────────────────────────────────────────────────
+
     # Improvement D: initialise adaptive sleep interval before the loop.
     # Starts at 600s (the neutral-band default); hysteresis prevents oscillation.
     _rescore_interval: int = 600
@@ -294,11 +277,19 @@ def main() -> None:
             positions = pm.get_positions(opening_compounds=_opening_compounds)
             snapshot  = get_equity_snapshot_from_account(acct, positions)
 
-            # Purge _opening_compounds for symbols no longer open, then persist.
-            for sym in list(_opening_compounds.keys()):
-                if sym not in positions:
-                    del _opening_compounds[sym]
-            _persist_opening_compounds(_opening_compounds)
+        # ── GAP-2 FIX: Purge moved OUTSIDE `if positions:` ──────────────────
+        # Previously this block was indented inside `if positions:`, meaning it
+        # was skipped entirely when no positions were open. Stale entries from a
+        # prior session (or from the GAP-1 scenario where all positions were
+        # closed overnight) would then persist in _opening_compounds indefinitely.
+        #
+        # By moving the purge here it runs unconditionally on every loop cycle,
+        # ensuring the registry stays accurate even when positions is empty {}.
+        for sym in list(_opening_compounds.keys()):
+            if sym not in positions:
+                del _opening_compounds[sym]
+        _persist_opening_compounds(_opening_compounds)
+        # ── END GAP-2 FIX ───────────────────────────────────────────────────
 
         # ── STEP 2: EXPOSURE / POSITION-COUNT GUARD ─────────────────────────
         exposure_cap_notional = snapshot.equity * cfg.risk_limits.gross_exposure_cap_pct
