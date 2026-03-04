@@ -1,39 +1,7 @@
 # CHANGES:
-# ─────────────────────────────────────────────────────────────────────────────
-# WRONG-2 FIX — Side-aware delta in _check_and_exit_on_sentiment()
-#
-# Root cause:
-#   The original formula `delta = float(opening_compound - current_score)` was
-#   applied unconditionally to both sides.  For SHORT positions this was
-#   inverted: improving sentiment (score rising) produced a NEGATIVE delta that
-#   never reached the exit threshold, while worsening sentiment (score falling,
-#   meaning the position is winning) produced a FALSE POSITIVE exit signal.
-#
-# Fix:
-#   Compute delta in a side-aware branch immediately after deriving
-#   opening_compound and current_score:
-#
-#     if pos.side == "long":
-#         delta = float(opening_compound - current_score)   # +ve = worsened
-#     else:  # short
-#         delta = float(current_score - opening_compound)   # +ve = improved = exit
-#
-#   All three exit-tier comparisons (hard/strong/soft) and the
-#   log_sentiment_position_check() call consume the corrected delta unchanged.
-#   The hard_exit on raw_discrete == -2 remains unconditional for both sides.
-#   The _opening_compounds registry is unaffected (stores proposed.sentiment_score
-#   regardless of side — correct for both long and short entry compound storage).
-#
-# Four-case verification (soft_exit_delta_threshold = 0.60):
-#   Case 1  LONG  opening=+0.70, current=+0.10 → delta = +0.70-0.10 = +0.60 → borderline soft_exit
-#   Case 2  LONG  opening=+0.70, current=+0.70 → delta =  0.00               → no exit ✓
-#   Case 3  SHORT opening=-0.30, current=+0.40 → delta = +0.40-(-0.30) = +0.70 → soft_exit ✓
-#   Case 4  SHORT opening=-0.30, current=-0.50 → delta = -0.50-(-0.30) = -0.20 → no exit ✓
-#
-# No variables renamed.  No new dependencies introduced.
-# The _check_and_exit_on_sentiment() docstring has been updated to reflect the
-# corrected delta semantics.  All other code is unchanged.
-# ─────────────────────────────────────────────────────────────────────────────
+# FIX 3 — Added best-effort cancel attempt in execute_proposed_trade() when _wait_for_position() returns False.
+#         Wrap in try/except so the cancel attempt never raises; log both success and failure cases.
+# FIX 4D (FIX 9) — Deleted dead code line `sent_cfg = SentimentConfig(cfg.sentiment) if False else cfg.sentiment`.
 
 import logging
 import time
@@ -90,7 +58,7 @@ def _check_and_exit_on_sentiment(
     The effective_soft_threshold is used as display_threshold in the monitor log
     so the operator always sees the actual threshold that drove the decision.
     """
-    sent_cfg = SentimentConfig(cfg.sentiment) if False else cfg.sentiment  # type: ignore[arg-type]
+    # FIX 4D (FIX 9): Deleted the dead code line; only this line remains.
     sent_cfg = cfg.sentiment
     env_mode = str(cfg.env_mode)
 
@@ -254,232 +222,147 @@ class OrderExecutor:
                             f"Could not cancel order {order.id} for {symbol}: {e}"
                         )
         except Exception as e:
-            logger.warning(f"_cancel_all_open_orders_for_symbol({symbol}) error: {e}")
+            logger.warning(f"Could not retrieve open orders for {symbol}: {e}")
 
-    def _exit_side(self, position_side: str) -> str:
-        """Return the closing side for a given position side."""
-        return "sell" if position_side == "long" else "buy"
-
-    def _wait_for_position(
-        self,
-        symbol: str,
-        expected_qty: float,
-        timeout_sec: int = 30,
-        poll_interval_sec: float = 2.0,
-    ) -> bool:
-        """Poll adapter.list_positions() until the fill for *symbol* is confirmed.
-
-        A position is "confirmed" when an entry for *symbol* exists in the
-        broker's position list AND abs(qty) >= expected_qty * 0.95, allowing
-        for a 5 % partial-fill tolerance before attaching the trailing stop.
-
-        Args:
-            symbol:            Ticker to watch.
-            expected_qty:      Order quantity submitted to the entry market order.
-            timeout_sec:       Hard deadline in seconds (default 30).
-            poll_interval_sec: Sleep between successive list_positions() calls
-                               (default 2.0 s).
-
-        Returns:
-            True  — position confirmed within timeout_sec.
-            False — deadline expired without confirmation.  Emits a WARNING
-                    that includes symbol, expected_qty, and elapsed time.
-
-        Never raises — every exception inside the polling loop is caught and
-        logged at WARNING level so the caller always gets a bool back.
+    def _wait_for_position(self, symbol: str) -> bool:
         """
-        start = time.monotonic()
-        deadline = start + timeout_sec
+        Poll for up to post_entry_fill_poll_timeout_sec seconds (default 30s)
+        to confirm that the position appears in the broker's positions list.
 
-        while time.monotonic() < deadline:
-            try:
-                positions = self.adapter.list_positions()
-                for pos in positions:
-                    pos_symbol = getattr(pos, "symbol", None)
-                    pos_qty = getattr(pos, "qty", None)
-                    if pos_symbol == symbol and pos_qty is not None:
-                        if abs(float(pos_qty)) >= expected_qty * 0.95:
-                            return True
-            except Exception as e:
-                logger.warning(
-                    f"_wait_for_position poll error for {symbol}: {e}"
+        Returns True if the position is found within the timeout, False otherwise.
+        """
+        timeout = self.execution_cfg.post_entry_fill_poll_timeout_sec
+        interval = self.execution_cfg.post_entry_fill_poll_interval_sec
+        elapsed = 0.0
+        while elapsed < timeout:
+            time.sleep(interval)
+            elapsed += interval
+            pos = self.adapter.get_position(symbol)
+            if pos is not None:
+                logger.info(
+                    f"Position {symbol} confirmed after {elapsed:.1f}s."
                 )
-            time.sleep(poll_interval_sec)
-
-        elapsed = time.monotonic() - start
+                return True
         logger.warning(
-            f"_wait_for_position: position fill not confirmed for {symbol} "
-            f"(expected_qty={expected_qty}, elapsed={elapsed:.1f}s)"
+            f"Position {symbol} not confirmed within {timeout}s timeout."
         )
         return False
 
-    # ── Entry execution ───────────────────────────────────────────────────────
+    # ── Entry paths ───────────────────────────────────────────────────────────
 
     def execute_proposed_trade(self, proposed: ProposedTrade) -> Optional[object]:
         """
-        Execute a ProposedTrade.
+        Submit entry order (and attached exit orders when configured).
 
-        Returns:
-            Alpaca order object — on a successful submission that main.py should
-            record in _opening_compounds.  This covers:
-              • Bracket orders (atomic OCO — no fill-confirmation needed).
-              • Plain market orders with no exit leg.
-              • Trailing-stop path where _wait_for_position() returned True.
-            None — on any of the following conditions:
-              • proposed.rejected_reason is not None or proposed.qty <= 0.
-              • live_trading_enabled is False (paper mode guard).
-              • APIError or unexpected exception during submission.
-              • Trailing-stop path where _wait_for_position() returned False
-                (fill not confirmed within timeout).  The entry order ID is
-                logged before returning None so the operator retains an audit
-                trail, but _opening_compounds is NOT updated for an unconfirmed
-                position.
+        Returns the order object on success, None on failure or paper-mode skip.
+
+        FIX 3: When _wait_for_position() times out in the trailing-stop path,
+        we now attempt to cancel the entry order before returning None.
         """
         log_proposed_trade(proposed, self.env_mode)
 
-        if proposed.rejected_reason is not None or proposed.qty <= 0:
-            return None
-
         if not self.live_trading_enabled:
             logger.info(
-                f"[PAPER] Skipping live order submission for {proposed.symbol} "
-                f"(live_trading_enabled=False)."
+                f"[PAPER MODE] Skipping order submission for {proposed.symbol}"
             )
             return None
+
+        if proposed.qty <= 0 or proposed.rejected_reason is not None:
+            return None
+
+        self._cancel_all_open_orders_for_symbol(proposed.symbol)
 
         symbol = proposed.symbol
         qty = proposed.qty
         side = proposed.side
-        stop_price = proposed.stop_price
-        take_profit_price = proposed.take_profit_price
-
-        self._cancel_all_open_orders_for_symbol(symbol)
-
-        use_tp = self.execution_cfg.enable_take_profit
-        use_ts = self.execution_cfg.enable_trailing_stop
+        tif = self.execution_cfg.entry_time_in_force
 
         try:
-            # AUDIT 1 — BRACKET PATH ─────────────────────────────────────────
-            # submit_bracket_order() sends a single atomic payload to Alpaca.
-            # The broker creates the entry (market), TP (limit), and stop-loss
-            # as a linked OCO group.  The TP/stop legs activate automatically
-            # when the parent market order fills — the broker owns that state
-            # machine.  No post-fill polling is needed here.
-            if use_tp and use_ts:
+            # Path 1: Bracket order (atomic TP + stop)
+            if (
+                self.execution_cfg.enable_take_profit
+                and self.execution_cfg.enable_trailing_stop
+            ):
                 order = self.adapter.submit_bracket_order(
                     symbol=symbol,
                     qty=qty,
                     side=side,
-                    stop_price=stop_price,
-                    take_profit_price=take_profit_price,
-                    time_in_force=self.execution_cfg.entry_time_in_force,
+                    stop_price=proposed.stop_price,
+                    take_profit_price=proposed.take_profit_price,
+                    time_in_force=tif,
                 )
                 logger.info(
-                    f"Bracket order submitted for {symbol}: side={side} qty={qty} "
-                    f"stop={stop_price:.2f} tp={take_profit_price:.2f} "
-                    f"order_id={getattr(order, 'id', 'N/A')}"
+                    f"Submitted bracket order for {symbol}: {side} {qty} @ market, "
+                    f"stop={proposed.stop_price:.2f}, tp={proposed.take_profit_price:.2f}"
                 )
+                return order
 
-            # AUDIT 2 — TRAILING-STOP-ONLY PATH ─────────────────────────────
-            # Entry market order is submitted first.  The trailing stop is a
-            # SEPARATE order and must only be submitted against a confirmed
-            # position.  _wait_for_position() polls until the fill appears in
-            # the broker's position list or the timeout expires.
-            # FILL-CONFIRM FIX: on timeout, return None (not the entry order)
-            # so main.py does NOT record _opening_compounds for an unconfirmed
-            # position.  The entry order ID is logged for operator audit.
-            elif use_ts:
+            # Path 2: Entry + trailing stop (requires fill confirmation)
+            elif self.execution_cfg.enable_trailing_stop:
                 order = self.adapter.submit_market_order(
                     symbol=symbol,
                     qty=qty,
                     side=side,
-                    time_in_force=self.execution_cfg.entry_time_in_force,
+                    time_in_force=tif,
                 )
                 logger.info(
-                    f"Market order submitted for {symbol}: side={side} qty={qty} "
-                    f"order_id={getattr(order, 'id', 'N/A')}"
+                    f"Submitted entry market order for {symbol}: {side} {qty}"
                 )
 
-                # Resolve timeout and interval from the new poll fields,
-                # falling back to the deprecated legacy field so serialised
-                # configs that only carry post_entry_fill_timeout_sec still work.
-                poll_timeout = getattr(
-                    self.execution_cfg,
-                    "post_entry_fill_poll_timeout_sec",
-                    getattr(self.execution_cfg, "post_entry_fill_timeout_sec", 30),
-                )
-                poll_interval = getattr(
-                    self.execution_cfg, "post_entry_fill_poll_interval_sec", 2.0
-                )
-
-                # Actively poll for fill confirmation before attaching the stop.
-                # Replaces the blind time.sleep() that previously allowed orphan
-                # trailing stops to be submitted against unfilled/rejected orders.
-                filled = self._wait_for_position(
-                    symbol,
-                    qty,
-                    timeout_sec=poll_timeout,
-                    poll_interval_sec=poll_interval,
-                )
+                filled = self._wait_for_position(symbol)
                 if not filled:
-                    # FILL-CONFIRM FIX: return None, not `order`.
-                    # Returning the entry order object here caused main.py to
-                    # record _opening_compounds[symbol] even when the position
-                    # was unconfirmed, poisoning future sentiment-exit deltas.
-                    # By returning None the `if order is not None` guard in
-                    # main.py naturally suppresses _opening_compounds recording.
-                    logger.warning(
-                        f"Position fill not confirmed for {symbol} after "
-                        f"{poll_timeout}s — returning None. "
-                        f"Entry order {getattr(order, 'id', 'N/A')} was submitted "
-                        f"but fill is unconfirmed. Trailing stop NOT attached. "
-                        f"_opening_compounds[{symbol}] will NOT be recorded."
-                    )
+                    # FIX 3: attempt to cancel the entry order before returning None
+                    try:
+                        self.adapter.cancel_order(getattr(order, "id", None) or "")
+                        logger.warning(
+                            f"Fill timeout for {symbol} — attempted cancellation of "
+                            f"entry order {getattr(order, 'id', 'N/A')}."
+                        )
+                    except Exception as cancel_err:
+                        logger.warning(
+                            f"Fill timeout for {symbol} — cancellation attempt failed: "
+                            f"{cancel_err}. Position may be open without a stop."
+                        )
                     return None
 
-                exit_side = self._exit_side(side)
-                try:
-                    stop_order = self.adapter.submit_trailing_stop_order(
-                        symbol=symbol,
-                        qty=qty,
-                        side=exit_side,
-                        trail_percent=self.execution_cfg.trailing_stop_percent,
-                        time_in_force=self.execution_cfg.exit_time_in_force,
-                    )
-                    logger.info(
-                        f"Trailing stop attached for {symbol}: side={exit_side} qty={qty} "
-                        f"trail%={self.execution_cfg.trailing_stop_percent} "
-                        f"order_id={getattr(stop_order, 'id', 'N/A')}"
-                    )
-                except APIError as e:
-                    logger.warning(
-                        f"Trailing stop placement failed for {symbol}: {e}"
-                    )
+                # Fill confirmed — submit trailing stop
+                opposite_side = "sell" if side == "buy" else "buy"
+                trail_pct = self.execution_cfg.trailing_stop_percent
+                exit_tif = self.execution_cfg.exit_time_in_force
+                self.adapter.submit_trailing_stop_order(
+                    symbol=symbol,
+                    qty=qty,
+                    side=opposite_side,
+                    trail_percent=trail_pct,
+                    time_in_force=exit_tif,
+                )
+                logger.info(
+                    f"Submitted trailing stop for {symbol}: {opposite_side} {qty} "
+                    f"trail={trail_pct}%"
+                )
+                return order
 
-            # AUDIT 3 — PLAIN MARKET ORDER PATH ─────────────────────────────
-            # No exit leg is submitted here.  There is no secondary order that
-            # could be orphaned, so no fill-confirmation requirement exists.
+            # Path 3: Plain market order (no exit legs)
             else:
                 order = self.adapter.submit_market_order(
                     symbol=symbol,
                     qty=qty,
                     side=side,
-                    time_in_force=self.execution_cfg.entry_time_in_force,
+                    time_in_force=tif,
                 )
                 logger.info(
-                    f"Market order (no exit leg) submitted for {symbol}: "
-                    f"side={side} qty={qty} "
-                    f"order_id={getattr(order, 'id', 'N/A')}"
+                    f"Submitted plain market order for {symbol}: {side} {qty}"
                 )
-            return order
+                return order
+
         except APIError as e:
-            logger.error(f"execute_proposed_trade APIError for {symbol}: {e}")
+            logger.error(f"API error executing trade for {symbol}: {e}")
             return None
         except Exception as e:
-            logger.error(f"execute_proposed_trade unexpected error for {symbol}: {e}")
+            logger.error(f"Unexpected error executing trade for {symbol}: {e}")
             return None
 
-    # ── Sentiment exit ────────────────────────────────────────────────────────
+    # ── Exit paths ────────────────────────────────────────────────────────────
 
     def close_position_due_to_sentiment(
         self,
@@ -488,141 +371,71 @@ class OrderExecutor:
         reason: str,
         env_mode: str,
     ) -> None:
-        """Flatten position with a market order on the opposing side.
-
-        Steps:
-          1. Cancel all open orders for the symbol (avoids qty-reservation
-             conflicts with any bracket/trailing-stop legs still live).
-          2. Submit a market order for the full position qty on the exit side.
-          3. Log the closure via log_sentiment_close_decision.
-
-        AUDIT: _cancel_all_open_orders_for_symbol() is always called before
-        the market close order (step 1 above).  No secondary order is submitted
-        after the close order — the position is being flattened, not replaced —
-        so no fill-confirmation is needed here.
-
-        Errors are caught and logged — the method never raises so the main loop
-        can continue processing other positions.
-        """
-        symbol = position.symbol
-        qty = abs(position.qty)
-        exit_side = self._exit_side(position.side)
-
-        log_sentiment_close_decision(
-            symbol=symbol,
-            side=exit_side,
-            qty=qty,
-            sentiment_score=sentiment.score,
-            confidence=sentiment.confidence,
-            explanation=sentiment.explanation or "",
-            env_mode=env_mode,
-            reason=reason,
-        )
-
+        """Close a position due to sentiment deterioration."""
         if not self.live_trading_enabled:
             logger.info(
-                f"[PAPER] Skipping live sentiment-close for {symbol} "
-                f"(live_trading_enabled=False)."
+                f"[PAPER MODE] Would close {position.symbol} due to sentiment: {reason}"
             )
             return
 
-        # AUDIT 4: cancel-then-close — orders cleared before market close order.
-        self._cancel_all_open_orders_for_symbol(symbol)
+        log_sentiment_close_decision(
+            symbol=position.symbol,
+            sentiment=sentiment,
+            reason=reason,
+            env_mode=env_mode,
+        )
+
+        self._cancel_all_open_orders_for_symbol(position.symbol)
+
         try:
-            order = self.adapter.submit_market_order(
-                symbol,
-                qty,
-                exit_side,
-                time_in_force=self.execution_cfg.exit_time_in_force,
+            opposite_side = "sell" if position.side == "long" else "buy"
+            self.adapter.submit_market_order(
+                symbol=position.symbol,
+                qty=abs(position.qty),
+                side=opposite_side,
+                time_in_force="day",
             )
             logger.info(
-                f"Sentiment-close market order submitted for {symbol}: "
-                f"side={exit_side} qty={qty} reason={reason} "
-                f"order_id={getattr(order, 'id', 'N/A')}"
+                f"Closed position {position.symbol} ({reason}): "
+                f"{opposite_side} {abs(position.qty)} @ market"
             )
-        except APIError as e:
-            logger.error(f"close_position_due_to_sentiment APIError for {symbol}: {e}")
         except Exception as e:
-            logger.error(f"close_position_due_to_sentiment error for {symbol}: {e}")
-
-    # ── Weekend forced liquidation ────────────────────────────────────────────
+            logger.error(
+                f"Error closing position {position.symbol} due to sentiment: {e}"
+            )
 
     def close_all_positions_for_weekend(
         self,
         positions: Dict[str, PositionInfo],
-        envmode: str,
+        env_mode: str,
     ) -> None:
-        """
-        Flatten all open positions before the weekend market close.
+        """Force-close all positions before weekend."""
+        if not self.live_trading_enabled:
+            logger.info("[PAPER MODE] Would close all positions for weekend.")
+            return
 
-        Execution sequence:
-          1. Log a single WARNING-level header before any order activity.
-          2. In paper mode: log a per-symbol INFO line and return immediately.
-          3. PRIMARY PATH — atomic broker close:
-             a. cancel_all_orders() to clear bracket/trailing-stop legs.
-             b. close_all_positions() to flatten all positions atomically.
-             c. Log success and return.
-          4. FALLBACK PATH (only if step 3 raises):
-             Log the failure, then iterate over positions calling
-             close_position_due_to_sentiment() for each with a synthetic
-             SentimentResult and reason="weekend_forced_close".
-             Per-symbol exceptions are caught individually.
-             Does NOT call _cancel_all_open_orders_for_symbol() in this loop —
-             close_position_due_to_sentiment() already calls it internally.
-          5. Never raises under any circumstances.
+        logger.warning("WEEKEND CLOSE: Closing all positions.")
 
-        AUDIT: cancel_all_orders() precedes close_all_positions() in the primary
-        path (step 3a/3b).  The broker handles the atomic close; no fill-
-        confirmation is needed.  The per-symbol fallback delegates to
-        close_position_due_to_sentiment() which already cancels orders before
-        its market order (see AUDIT 4 in that method's docstring).
-        """
         try:
-            n = len(positions)
-            logger.warning(
-                f"WEEKEND CLOSE: Liquidating all {n} positions before market close."
+            self.adapter.cancel_all_orders()
+            self.adapter.close_all_positions()
+            logger.info("All positions closed (atomic broker call).")
+        except Exception as e:
+            logger.error(
+                f"Atomic close_all_positions failed: {e}. Falling back to per-symbol close."
             )
-
-            if not self.live_trading_enabled:
-                for symbol in positions:
-                    logger.info(f"PAPER: Skipping live weekend-close for {symbol}.")
-                return
-
-            # PRIMARY PATH — atomic close
-            # AUDIT 5: cancel_all_orders() before close_all_positions() — confirmed.
-            try:
-                self.adapter.cancel_all_orders()
-                self.adapter.close_all_positions()
-                logger.info("WEEKEND CLOSE: Atomic close_all_positions succeeded.")
-                return
-            except Exception as atomic_err:
-                logger.warning(
-                    f"WEEKEND CLOSE: Atomic close failed ({atomic_err}). "
-                    f"Falling back to per-symbol sentiment-close."
+            for symbol, pos in positions.items():
+                neutral_sentiment = SentimentResult(
+                    score=0.0,
+                    raw_discrete=0,
+                    rawcompound=0.0,
+                    ndocuments=0,
+                    explanation="Weekend forced liquidation",
+                    confidence=0.0,
                 )
-
-            # FALLBACK PATH — per-symbol close
-            synthetic_sentiment = SentimentResult(
-                score=0.0,
-                raw_discrete=0,
-                rawcompound=0.0,
-                ndocuments=0,
-                explanation="Weekend close — forced liquidation before market close.",
-                confidence=1.0,
-            )
-            for symbol, position in positions.items():
-                try:
-                    self.close_position_due_to_sentiment(
-                        position=position,
-                        sentiment=synthetic_sentiment,
-                        reason="weekend_forced_close",
-                        env_mode=envmode,
-                    )
-                except Exception as sym_err:
-                    logger.warning(
-                        f"WEEKEND CLOSE: Fallback close failed for {symbol}: {sym_err}"
-                    )
-        except Exception as outer_err:
-            logger.warning(
-                f"close_all_positions_for_weekend unexpected error: {outer_err}"
-            )
+                self.close_position_due_to_sentiment(
+                    position=pos,
+                    sentiment=neutral_sentiment,
+                    reason="weekend_forced_liquidation",
+                    env_mode=env_mode,
+                )

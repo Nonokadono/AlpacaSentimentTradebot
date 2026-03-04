@@ -1,3 +1,9 @@
+# CHANGES:
+# FIX 11 — Corrected RFC3339 timestamp format for Alpaca Data API.
+#          isoformat() on offset-aware datetimes returns '...+00:00'; appending 'Z' created
+#          malformed '...+00:00Z' causing 400 errors. Now strip timezone and append 'Z' only
+#          when the datetime is UTC-aware, or use isoformat() as-is for naive datetimes.
+
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -6,6 +12,27 @@ from typing import Any, Dict, List, Optional
 import alpaca_trade_api as tradeapi
 
 logger = logging.getLogger("tradebot")
+
+
+def _format_timestamp_rfc3339(dt: datetime) -> str:
+    """Format datetime as RFC3339 string for Alpaca Data API.
+    
+    Alpaca requires EITHER '2026-03-04T06:44:07.157009Z' (UTC with Z suffix)
+    OR '2026-03-04T06:44:07.157009+00:00' (with explicit offset), never both.
+    
+    When dt is offset-aware and UTC, we strip the +00:00 and append Z.
+    When dt is naive, we append Z assuming it represents UTC.
+    When dt is offset-aware but NOT UTC, we use the full isoformat() with offset.
+    """
+    if dt.tzinfo is not None and dt.tzinfo.utcoffset(None) == timedelta(0):
+        # UTC-aware: strip offset and append Z
+        return dt.replace(tzinfo=None).isoformat() + "Z"
+    elif dt.tzinfo is None:
+        # Naive: assume UTC and append Z
+        return dt.isoformat() + "Z"
+    else:
+        # Non-UTC offset: use full isoformat with offset (no Z)
+        return dt.isoformat()
 
 
 class AlpacaAdapter:
@@ -109,8 +136,8 @@ class AlpacaAdapter:
 
         Implementation rules:
         - Calls self.get_market_close_time() — does NOT call get_clock() again.
-        - Uses datetime.utcnow().replace(tzinfo=timezone.utc) for the current
-          time to ensure offset-aware arithmetic.
+        - Uses datetime.now(timezone.utc) for the current time to ensure
+          offset-aware arithmetic.
         - Catches all exceptions, logs at WARNING level, and returns False.
         - Never raises.
         """
@@ -123,7 +150,7 @@ class AlpacaAdapter:
             # Check that the close falls on a Friday (weekday 4).
             if close_time.weekday() != 4:
                 return False
-            now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+            now_utc = datetime.now(timezone.utc)
             minutes_until_close = (close_time - now_utc).total_seconds() / 60.0
             return 0 <= minutes_until_close <= minutes_before
         except Exception as e:
@@ -144,8 +171,7 @@ class AlpacaAdapter:
           get_market_close_time() is shared by both is_pre_weekend_close()
           and is_pre_close_blackout(). The clock API is never called more than
           once per logical check.
-        - Uses datetime.utcnow().replace(tzinfo=timezone.utc) for the current
-          time.
+        - Uses datetime.now(timezone.utc) for the current time.
         - Emits a single logger.debug() message when returning True.
         - Catches all exceptions, logs at WARNING level, and returns False.
         - Never raises.
@@ -156,7 +182,7 @@ class AlpacaAdapter:
             close_time = self.get_market_close_time()
             if close_time is None:
                 return False
-            now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
+            now_utc = datetime.now(timezone.utc)
             minutes_until_close = (close_time - now_utc).total_seconds() / 60.0
             if 0 <= minutes_until_close <= blackout_minutes:
                 logger.debug(
@@ -172,14 +198,16 @@ class AlpacaAdapter:
 
     def get_last_quote(self, symbol: str) -> float:
         """Get a close/last price proxy via recent bars, fallback to latest trade."""
-        end = datetime.utcnow()
+        end = datetime.now(timezone.utc)
         start = end - timedelta(minutes=60)
         try:
             bars = self.rest.get_bars(
-                symbol, "5Min", start.isoformat() + "Z", end.isoformat() + "Z",
+                symbol, "5Min", 
+                _format_timestamp_rfc3339(start),  # FIX 11
+                _format_timestamp_rfc3339(end),    # FIX 11
             )
         except Exception as e:
-            print(f"get_bars error for {symbol}: {e}")
+            logger.warning(f"get_bars error for {symbol}: {e}")
             bars = []
         if not bars:
             last = self.rest.get_latest_trade(symbol)
@@ -207,15 +235,15 @@ class AlpacaAdapter:
         requested are returned, so under-fill is never silent downstream
         (RSI fallback to 50.0 etc.).
         """
-        end = datetime.utcnow()
+        end = datetime.now(timezone.utc)
         # 3-day window survives any weekend / holiday combination.
         start = end - timedelta(days=3)
         try:
             bars = self.rest.get_bars(
                 symbol,
                 timeframe,
-                start.isoformat() + "Z",
-                end.isoformat() + "Z",
+                _format_timestamp_rfc3339(start),  # FIX 11
+                _format_timestamp_rfc3339(end),    # FIX 11
                 limit=lookback_bars,
             )
         except Exception as e:
@@ -245,10 +273,10 @@ class AlpacaAdapter:
         try:
             kwargs: Dict[str, Any] = {"symbol": symbol, "limit": limit}
             if since is not None:
-                kwargs["start"] = since.isoformat() + "Z"
+                kwargs["start"] = _format_timestamp_rfc3339(since)  # FIX 11
             raw_items = self.rest.get_news(**kwargs)
         except Exception as e:
-            print(f"get_news error for {symbol}: {e}")
+            logger.warning(f"get_news error for {symbol}: {e}")
             return []
         out: List[Dict[str, str]] = []
         for n in raw_items:

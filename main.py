@@ -1,3 +1,9 @@
+# CHANGES:
+# FIX 4A — Moved _persist_opening_compounds() to immediately inside the fill-confirmation block.
+# FIX 4B — Added positions refresh immediately before end-of-loop _check_and_exit_on_sentiment() call.
+# FIX 4C — Deleted unused acct_startup assignment.
+# OA-1 — Added OPERATOR ACTION REQUIRED comment for instrument_whitelist.yaml sector diversification.
+
 import json
 import logging
 import os
@@ -221,6 +227,14 @@ def main() -> None:
     setup_logging(cfg.env_mode)
     log_environment_switch(cfg.env_mode, user="manual_start")
 
+    # OPERATOR ACTION REQUIRED (OA-1):
+    # config/instrument_whitelist.yaml — all non-TECH symbols are commented out.
+    # The portfolio is structurally 100% mega-cap tech. Before going live,
+    # uncomment at least one ETF_INDEX (SPY or QQQ) and one non-TECH equity
+    # (BAC or COST) to achieve meaningful sector diversification. Without this,
+    # risk parameters calibrated for 15 diverse positions are applied to 3
+    # correlated tech names.
+
     adapter           = AlpacaAdapter(cfg.env_mode)
     sentiment         = SentimentModule()
     signal_engine     = SignalEngine(adapter, sentiment, cfg.technical)
@@ -270,7 +284,7 @@ def main() -> None:
     #   → del _opening_compounds["NVDA"]
     #   → _opening_compounds is now {"AAPL": 0.65}
     #   → _persist_opening_compounds() called exactly once (only if stale found)
-    acct_startup       = adapter.get_account()
+    # FIX 4C: Deleted acct_startup assignment; it was never used after this block.
     positions_at_start = pm.get_positions(opening_compounds=_opening_compounds)
     stale_syms = [s for s in list(_opening_compounds) if s not in positions_at_start]
     if stale_syms:
@@ -417,8 +431,12 @@ def main() -> None:
                     # Change 1a: record entry-time SENTIMENT score (proposed.sentiment_score)
                     # as the opening compound baseline — NOT proposed.signal_score.
                     _opening_compounds[proposed.symbol] = proposed.sentiment_score
-                    # Persist immediately so a crash/restart doesn't lose the entry record.
+                    # FIX 4A: Persist immediately so a crash/restart doesn't lose the entry record.
                     _persist_opening_compounds(_opening_compounds)
+
+        # FIX 4B: Refresh positions immediately before the end-of-loop sentiment check
+        # so newly entered positions are included in the current cycle's exit evaluation.
+        positions = pm.get_positions(opening_compounds=_opening_compounds)
 
         # Sentiment-exit check runs unconditionally — blackout does NOT affect exits.
         _check_and_exit_on_sentiment(

@@ -1,3 +1,8 @@
+# CHANGES:
+# FIX 5 — Wired neutral_band into sentiment_scale() with a flat floor at min_scale for scores in [0, neutral_band].
+#         Piecewise logic: s < no_trade_neg → 0.0; no_trade_neg ≤ s < 0.0 → interpolate 0.0→min_scale;
+#         0.0 ≤ s ≤ neutral_band → return min_scale (flat); s > neutral_band → interpolate min_scale→max_scale.
+
 import math
 from collections import deque
 from dataclasses import dataclass, field
@@ -105,20 +110,48 @@ class RiskEngine:
 
     def sentiment_scale(self, s: float) -> float:
         """
-        Continuous piecewise-linear sentiment scale with no discontinuities.
-        [unchanged — see original docstring]
+        FIX 5: Piecewise-linear sentiment scale with neutral_band floor.
+
+        Four regions:
+          1. s < no_trade_negative_threshold                     → return 0.0 (hard block)
+          2. no_trade_negative_threshold ≤ s < 0.0              → interpolate 0.0 → min_scale
+          3. 0.0 ≤ s ≤ neutral_band                             → return min_scale (flat floor)
+          4. s > neutral_band                                    → interpolate min_scale → max_scale
+
+        Region 3 is the correction: AI-neutral scores (s ≈ 0) produce the
+        MINIMUM permissible size rather than a gradually increasing one.
+        Previously, sentiment_scale(0.05) would produce a size larger than
+        min_scale, admitting barely-positive signals. The flat floor ensures
+        that no additional sizing reward is granted until sentiment exceeds
+        neutral_band (default 0.1).
         """
         no_trade_neg = self.sentiment_cfg.no_trade_negative_threshold
+        neutral_band = self.sentiment_cfg.neutral_band
         min_sc = self.sentiment_cfg.min_scale
         max_sc = self.sentiment_cfg.max_scale
 
+        # Region 1: hard block
         if s < no_trade_neg:
             return 0.0
-        if s <= 0.0:
+
+        # Region 2: interpolate from 0.0 at no_trade_neg to min_sc at 0.0
+        if s < 0.0:
             band_width = 0.0 - no_trade_neg
+            if band_width == 0.0:
+                return 0.0
             return min_sc * (s - no_trade_neg) / band_width
+
+        # Region 3: flat floor for neutral sentiment
+        if s <= neutral_band:
+            return min_sc
+
+        # Region 4: interpolate from min_sc at neutral_band to max_sc at 1.0
         span = max_sc - min_sc
-        return min(max_sc, min_sc + span * s)
+        denominator = 1.0 - neutral_band
+        if denominator == 0.0:
+            return max_sc
+        frac = (s - neutral_band) / denominator
+        return min(max_sc, min_sc + span * frac)
 
     def _kelly_fraction(
         self,

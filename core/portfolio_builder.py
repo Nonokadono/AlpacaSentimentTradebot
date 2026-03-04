@@ -1,32 +1,6 @@
 # CHANGES:
-# TASK IC-RANKING — Replaced the single feasible.sort() line in
-#   build_portfolio() with a flag-guarded dual-path sort:
-#
-#   When enable_composite_ranking is False (default):
-#     feasible.sort(key=lambda t: abs(t.signal_score), reverse=True)
-#     — byte-identical to the previous codebase; no behaviour change.
-#
-#   When enable_composite_ranking is True:
-#     feasible.sort(
-#         key=lambda t: abs(w_t * t.signal_score + w_s * t.sentiment_score),
-#         reverse=True,
-#     )
-#     The composite is SIGNED before abs() so that:
-#       - Confirming pairs (same direction) produce a LARGER rank score.
-#       - Contradicting pairs (opposing direction) produce a SMALLER rank score,
-#         correctly deprioritising low-conviction set-ups.
-#     w_t and w_s are read from PortfolioConfig.rank_weight_technical /
-#     rank_weight_sentiment (defaults 0.7 / 0.3).
-#
-#   A single DEBUG-level log line is emitted immediately after the sort,
-#   once per build_portfolio() call, listing every feasible candidate's
-#   symbol, side, signal_score, sentiment_score, computed rank score, and
-#   whether enable_composite_ranking was active.
-#
-#   import logging added (stdlib only — no new third-party dependency).
-#   Module-level logger = logging.getLogger(__name__) added.
-#
-# All prior changes (FIX 1, FIX 2, Fix C4, Fix H4) are preserved unchanged.
+# FIX 2 — Replaced adapter.get_last_quote() call with entry_price = sig.last_price in _build_candidate_for_symbol().
+#         Eliminates duplicate price fetch and ensures consistent stop_distance calculation across SignalEngine and RiskEngine.
 
 import logging
 from typing import Dict, List, Any
@@ -132,7 +106,11 @@ class PortfolioBuilder:
                 rejected_reason="Signal neutral/skip",
             )
 
-        entry_price = self.adapter.get_last_quote(symbol)
+        # FIX 2: Use sig.last_price instead of fetching price a second time.
+        # This ensures that stop_distance = abs(entry_price - stop_price) is
+        # computed from the SAME price that was used in SignalEngine to derive
+        # stop_price and take_profit_price, eliminating intra-bar price drift.
+        entry_price = sig.last_price
 
         proposed = self.risk_engine.pre_trade_checks(
             snapshot=snapshot,

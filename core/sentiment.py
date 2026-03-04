@@ -1,8 +1,12 @@
+# CHANGES:
+# FIX 8 — Replaced datetime.utcnow() with datetime.now(timezone.utc) throughout to eliminate DeprecationWarning.
+#         Added timezone import; ensured naive persisted timestamps are compatible via .replace(tzinfo=None) guard.
+
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
 from ai_client import NewsReasoner
@@ -96,15 +100,25 @@ class SentimentModule:
         Malformed entries (missing keys, bad types, unparseable timestamps) are
         silently skipped — a corrupted equity_state.json must not crash the bot.
 
+        FIX 8: naive comparison guard — if the loaded ts is naive, compare against
+        a naive now. This ensures backward compatibility with equity_state.json
+        files that stored naive datetimes before FIX 8 was applied.
+
         Called by main.main() immediately after SentimentModule is constructed,
         before the main loop starts.
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         for sym, entry in data.items():
             try:
                 ts = datetime.fromisoformat(entry["ts_utc"])
+                # FIX 8: naive compatibility guard
+                if ts.tzinfo is None:
+                    # Loaded timestamp is naive — compare against naive now
+                    now_cmp = now.replace(tzinfo=None)
+                else:
+                    now_cmp = now
                 # Discard expired entries at load time — never serve stale data.
-                if now - ts > self.cache_ttl:
+                if (now_cmp - ts) > self.cache_ttl:
                     continue
                 result = SentimentResult(
                     score=float(entry["score"]),
@@ -168,12 +182,17 @@ class SentimentModule:
         TTL cache getter.
         Returns a cached sentiment only if it is within the TTL window.
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         cached = self._cache.get(symbol)
         if not cached:
             return None
         result, ts = cached
-        if now - ts <= self.cache_ttl:
+        # FIX 8: naive compatibility guard for comparison
+        if ts.tzinfo is None:
+            now_cmp = now.replace(tzinfo=None)
+        else:
+            now_cmp = now
+        if (now_cmp - ts) <= self.cache_ttl:
             return result
         return None
 
@@ -181,7 +200,7 @@ class SentimentModule:
         return self._cache.get(symbol)
 
     def _set_last_known(self, symbol: str, result: SentimentResult) -> None:
-        self._cache[symbol] = (result, datetime.utcnow())
+        self._cache[symbol] = (result, datetime.now(timezone.utc))
 
     def _call_ai(self, symbol: str, newsitems: List[dict]) -> SentimentResult:
         """
@@ -228,13 +247,18 @@ class SentimentModule:
           - If cached sentiment is still fresh (TTL), reuse it. (1)
           - If last-known sentiment is -2 and still within cooldown, reuse it. (6)
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         last_known = self._get_last_known(symbol)
 
         # (6) Chaos cooldown: if we recently deemed the symbol "unstable / -2", don't rescore.
         if last_known:
             last_res, last_ts = last_known
-            if last_res.raw_discrete == -2 and (now - last_ts) <= self.chaos_cooldown:
+            # FIX 8: naive compatibility guard
+            if last_ts.tzinfo is None:
+                now_cmp = now.replace(tzinfo=None)
+            else:
+                now_cmp = now
+            if last_res.raw_discrete == -2 and ((now_cmp - last_ts) <= self.chaos_cooldown):
                 return last_res
 
         # (2) No new news -> do not call AI; just reuse last-known sentiment if available.

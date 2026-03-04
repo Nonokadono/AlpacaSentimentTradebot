@@ -1,3 +1,8 @@
+# CHANGES:
+# FIX 2 — Added last_price: float = 0.0 field to Signal dataclass; populated in generate_signal_for_symbol().
+# FIX 6 — Replaced _compute_volatility()-based vol_px with _compute_atr() in _decide_side_and_bands().
+# FIX 7 — Changed guard from len(bars) < lookback to len(bars) < lookback + 1 in _compute_price_action_score().
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -25,9 +30,8 @@ class Signal:
     momentum_score: float
     mean_reversion_score: float
     price_action_score: float
-    # Feature 3: expose per-symbol volatility so PortfolioBuilder can forward
-    # it to RiskEngine.pre_trade_checks() for Half-Kelly sizing.
     volatility: float = 0.0
+    last_price: float = 0.0
 
 
 class SignalEngine:
@@ -281,6 +285,8 @@ class SignalEngine:
             is numerically identical to the previous implementation.
 
         Also distance from MA: if price >> MA, revert down (-).
+        FIX 6 — Added intermediate clamp of ma_score before blending to prevent
+        outlier SMA deviations from nullifying RSI contribution.
         """
         ob = self.technicalcfg.rsi_overbought
         os = self.technicalcfg.rsi_oversold
@@ -307,6 +313,8 @@ class SignalEngine:
             # if dist is +1%, score is negative (revert)
             # scale: 0.05 (5%) -> full -1.0
             ma_score = -1.0 * (dist / self.technicalcfg.ma_distance_norm_scale)
+            # FIX 6: clamp ma_score independently before blending
+            ma_score = max(-1.0, min(1.0, ma_score))
 
         return max(-1.0, min(1.0, 0.5 * rsi_score + 0.5 * ma_score))
 
@@ -316,16 +324,14 @@ class SignalEngine:
         If current price > highest of last N bars -> +1 (Breakout)
         If current price < lowest of last N bars -> -1 (Breakdown)
 
-        Fix M3: returns 0.0 immediately when the market is closed to prevent
-        the permanent -1.0 artifact that appears outside regular trading hours
-        (when the current bar's price equals the most recent close and sits
-        below the historical high of the lookback window).
+        FIX 7: guard changed from len(bars) < lookback to len(bars) < lookback + 1
+        so that the slice bars[-lookback:-1] always contains exactly lookback bars.
         """
         # Fix M3: suppress price action score when market is closed.
         if not self.adapter.get_market_open():
             return 0.0
 
-        if len(bars) < self.technicalcfg.breakout_lookback_bars:
+        if len(bars) < self.technicalcfg.breakout_lookback_bars + 1:
             return 0.0
 
         window = bars[-self.technicalcfg.breakout_lookback_bars:-1]  # exclude current
@@ -400,7 +406,7 @@ class SignalEngine:
         proper measure of true daily range.  If ATR is zero or bars are
         unavailable, falls back to 0.25% of last_price.
         The `volatility` parameter (std-dev) remains in the signature and is
-        still used downstream by _compute_volatility() -> pre_trade_checks() ->\
+        still used downstream by _compute_volatility() -> pre_trade_checks() ->
         _kelly_fraction() for Kelly sizing.
 
         Improvement B: When TechnicalSignalConfig.enable_dynamic_threshold is
@@ -556,6 +562,7 @@ class SignalEngine:
                 mean_reversion_score=mean_reversion_score,
                 price_action_score=price_action_score,
                 volatility=volatility,
+                last_price=last_trade,
             )
 
         news_items = self._get_news_items(symbol)
@@ -590,6 +597,7 @@ class SignalEngine:
                 mean_reversion_score=mean_reversion_score,
                 price_action_score=price_action_score,
                 volatility=volatility,
+                last_price=last_trade,
             )
 
         rationale = (
@@ -611,4 +619,5 @@ class SignalEngine:
             mean_reversion_score=mean_reversion_score,
             price_action_score=price_action_score,
             volatility=volatility,
+            last_price=last_trade,
         )

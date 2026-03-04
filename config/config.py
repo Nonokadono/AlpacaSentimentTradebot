@@ -1,3 +1,9 @@
+# CHANGES:
+# FIX 5 — Changed max_scale from 1.3 to 1.0 with inline comment explaining headroom safety.
+# FIX 10 — Added inline comment to max_scale explaining cap and safety rationale.
+# OA-2 — Added OPERATOR ACTION REQUIRED comment for exit_time_in_force = "day".
+# OA-3 — Added OPERATOR ACTION REQUIRED comment for 180-minute pre-close blackout.
+
 import os
 import yaml
 from pathlib import Path
@@ -38,7 +44,11 @@ class RiskLimits:
 class SentimentConfig:
     neutral_band: float = 0.1
     min_scale: float = 0.2
-    max_scale: float = 1.3
+    # FIX 10: changed from 1.3 to 1.0 to make headroom explicit and safe.
+    # 1.0 = full risk-per-trade at peak positive sentiment.
+    # Values > 1.0 are capped upstream by max_risk_per_trade_pct anyway,
+    # but keeping this at 1.0 makes the headroom explicit and safe.
+    max_scale: float = 1.0
     no_trade_negative_threshold: float = -0.4
     # --- Sentiment-exit thresholds ---
     # Hard exit: raw_discrete == -2 -> always close, no delta check (unchanged).
@@ -119,6 +129,12 @@ class ExecutionConfig:
     enable_trailing_stop: bool = True
     trailing_stop_percent: float = 5.0   # 5% trailing distance
     enable_take_profit: bool = True
+    # OPERATOR ACTION REQUIRED (OA-2):
+    # exit_time_in_force = "day" means bracket and trailing-stop orders expire
+    # at market close. After a kill-switch halt that spans overnight, open
+    # positions have no protective orders the next morning. Consider changing
+    # to "gtc" (good-till-cancelled) or implementing an order-refresh mechanism
+    # on bot startup before going live.
     exit_time_in_force: str = "day"
     entry_time_in_force: str = "day"
     # WAIT-FOR-POSITION: primary timeout for the _wait_for_position() polling
@@ -208,6 +224,14 @@ def _load_instrument_whitelist(path: Path) -> Dict[str, InstrumentMeta]:
 def load_config() -> BotConfig:
     base = Path(__file__).resolve().parents[1]
     wl_path = base / "config" / "instrument_whitelist.yaml"
+    
+    # OPERATOR ACTION REQUIRED (OA-3):
+    # TechnicalSignalConfig default is 180-minute pre-close blackout, suppressing
+    # all new entries from 13:00 ET onward (3.5-hour entry window per day).
+    # For a swing strategy, 60–90 minutes is more appropriate. This is a
+    # config/strategy decision, not a code bug. Adjust in TechnicalSignalConfig
+    # or via environment override before live trading.
+    
     instruments = _load_instrument_whitelist(wl_path)
 
     risk = RiskLimits()
