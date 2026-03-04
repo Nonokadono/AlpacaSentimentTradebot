@@ -8,6 +8,10 @@
 #                   Monday market open. Existing position exits are unaffected.
 # ORPHAN-ORDER-FIX — Added adapter.cancel_all_orders() immediately before portfolio execution
 #                    in STEP 3 to eliminate orphaned order risk from previous iterations.
+# PURGE-FIX — Updated both _check_and_exit_on_sentiment() calls to pass opening_compounds and
+#             _persist_opening_compounds as kwargs so the purge can execute atomically inline
+#             with sentiment-driven position closes. Updated close_all_positions_for_weekend()
+#             call to pass the same kwargs so weekend liquidation can purge baselines correctly.
 
 import json
 import logging
@@ -339,7 +343,14 @@ def main() -> None:
             )
             dashboard_state.update(bot_state="EXECUTING")
             persist_state(dashboard_state)
-            executor.close_all_positions_for_weekend(positions, cfg.env_mode)
+            # PURGE-FIX: Pass opening_compounds and _persist_opening_compounds
+            # so weekend liquidation can purge baselines inline with closes.
+            executor.close_all_positions_for_weekend(
+                positions,
+                cfg.env_mode,
+                opening_compounds=_opening_compounds,
+                persist_opening_compounds=_persist_opening_compounds,
+            )
             dashboard_state.update(bot_state="IDLE")
             persist_state(dashboard_state)
             # Park the bot over the weekend — poll every 60s until Monday open.
@@ -357,12 +368,16 @@ def main() -> None:
 
         # ── STEP 1: SENTIMENT CHECK ON ALL OPEN POSITIONS ───────────────────
         if positions:
+            # PURGE-FIX: Pass opening_compounds and _persist_opening_compounds
+            # so sentiment exits can purge baselines inline with closes.
             _check_and_exit_on_sentiment(
                 positions=positions,
                 adapter=adapter,
                 sentiment_module=sentiment,
                 executor=executor,
                 cfg=cfg,
+                opening_compounds=_opening_compounds,
+                persist_opening_compounds=_persist_opening_compounds,
             )
             # Refresh positions after potential closes.
             positions = pm.get_positions(opening_compounds=_opening_compounds)
@@ -376,6 +391,12 @@ def main() -> None:
         #
         # By moving the purge here it runs unconditionally on every loop cycle,
         # ensuring the registry stays accurate even when positions is empty {}.
+        #
+        # PURGE-FIX NOTE: This loop-level purge now acts as a safety net only.
+        # The primary purge happens inline inside close_position_due_to_sentiment(),
+        # so this block should typically find nothing to delete. It remains here
+        # as a defensive guard against any edge cases where a position closes via
+        # an external path (e.g. manual liquidation, broker-side stop execution).
         for sym in list(_opening_compounds.keys()):
             if sym not in positions:
                 del _opening_compounds[sym]
@@ -459,12 +480,16 @@ def main() -> None:
         positions = pm.get_positions(opening_compounds=_opening_compounds)
 
         # Sentiment-exit check runs unconditionally — blackouts do NOT affect exits.
+        # PURGE-FIX: Pass opening_compounds and _persist_opening_compounds
+        # so sentiment exits can purge baselines inline with closes.
         _check_and_exit_on_sentiment(
             positions=positions,
             adapter=adapter,
             sentiment_module=sentiment,
             executor=executor,
             cfg=cfg,
+            opening_compounds=_opening_compounds,
+            persist_opening_compounds=_persist_opening_compounds,
         )
 
         # Change D3: Refresh positions + prices in dashboard after all executions.

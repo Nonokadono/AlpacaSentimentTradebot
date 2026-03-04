@@ -7,10 +7,16 @@
 #               2. env_mode must be "LIVE" (environment-level gate)
 #               3. Confirmation log emitted before atomic close (audit trail)
 #               Prevents accidental weekend liquidation during paper testing or dev work on Fridays.
+# PURGE-FIX — close_position_due_to_sentiment() now purges opening_compounds[symbol] immediately
+#             inline with the close order, then persists the registry to disk before returning.
+#             This eliminates the race window between sentiment close and the next GAP-2 purge,
+#             and ensures crash-recovery never resurrects a stale baseline for a closed position.
+#             _check_and_exit_on_sentiment() signature extended with opening_compounds kwarg and
+#             persist_opening_compounds callable so the purge+persist can execute atomically.
 
 import logging
 import time
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from alpaca_trade_api.rest import APIError
 
@@ -33,6 +39,8 @@ def _check_and_exit_on_sentiment(
     sentiment_module: SentimentModule,
     executor: "OrderExecutor",
     cfg: BotConfig,
+    opening_compounds: Dict[str, float],
+    persist_opening_compounds: Callable[[Dict[str, float]], None],
 ) -> None:
     """For every open position, force-rescore sentiment and compare the current
     compound score against the score recorded at entry time
@@ -62,6 +70,10 @@ def _check_and_exit_on_sentiment(
 
     The effective_soft_threshold is used as display_threshold in the monitor log
     so the operator always sees the actual threshold that drove the decision.
+
+    PURGE-FIX: opening_compounds and persist_opening_compounds are now required
+    parameters so close_position_due_to_sentiment() can purge the entry baseline
+    immediately inline with the close order and flush it to disk before returning.
     """
     # FIX 4D (FIX 9): Deleted the dead code line; only this line remains.
     sent_cfg = cfg.sentiment
@@ -158,6 +170,8 @@ def _check_and_exit_on_sentiment(
                 sentiment=current_sentiment,
                 reason=close_reason,
                 env_mode=env_mode,
+                opening_compounds=opening_compounds,
+                persist_opening_compounds=persist_opening_compounds,
             )
 
 
@@ -188,6 +202,8 @@ class OrderExecutor:
       bracket/trailing-stop legs still live, then a single market order flattens
       the position.  No secondary order is submitted after the close order, so
       no fill-confirmation is needed for a flat-position-close.
+      PURGE-FIX: opening_compounds[symbol] is deleted and persisted to disk
+      immediately inline with the close order, before the function returns.
 
     Weekend liquidation path (close_all_positions_for_weekend):
       AUDIT: Triple-gate protection prevents accidental liquidation:
@@ -197,7 +213,7 @@ class OrderExecutor:
       cancel_all_orders() precedes close_all_positions() in the primary
       (atomic) path.  The broker handles the atomic close; no fill-confirmation
       is needed.  The per-symbol fallback delegates to close_position_due_to_sentiment()
-      which already cancels orders internally.
+      which already cancels orders internally and now purges opening_compounds.
     """
 
     def __init__(
@@ -379,12 +395,29 @@ class OrderExecutor:
         sentiment: SentimentResult,
         reason: str,
         env_mode: str,
+        opening_compounds: Dict[str, float],
+        persist_opening_compounds: Callable[[Dict[str, float]], None],
     ) -> None:
-        """Close a position due to sentiment deterioration."""
+        """Close a position due to sentiment deterioration.
+
+        PURGE-FIX: Immediately after closing the position (or after the paper-mode
+        log), purge opening_compounds[symbol] and persist the updated registry to
+        disk. This eliminates the race window between sentiment close and the next
+        GAP-2 purge, and ensures crash-recovery never resurrects a stale baseline.
+        """
         if not self.live_trading_enabled:
             logger.info(
                 f"[PAPER MODE] Would close {position.symbol} due to sentiment: {reason}"
             )
+            # PURGE-FIX: Even in paper mode, purge the baseline so the in-memory
+            # registry stays consistent with the (hypothetical) flat position.
+            if position.symbol in opening_compounds:
+                del opening_compounds[position.symbol]
+                persist_opening_compounds(opening_compounds)
+                logger.info(
+                    f"[PAPER MODE] Purged opening_compound for {position.symbol} "
+                    f"(hypothetical close)."
+                )
             return
 
         log_sentiment_close_decision(
@@ -413,10 +446,22 @@ class OrderExecutor:
                 f"Error closing position {position.symbol} due to sentiment: {e}"
             )
 
+        # PURGE-FIX: Delete the entry baseline immediately inline with the close
+        # order and persist the updated registry to disk before returning. This
+        # ensures the registry is never stale relative to the broker's position list.
+        if position.symbol in opening_compounds:
+            del opening_compounds[position.symbol]
+            persist_opening_compounds(opening_compounds)
+            logger.info(
+                f"Purged opening_compound for {position.symbol} after sentiment close."
+            )
+
     def close_all_positions_for_weekend(
         self,
         positions: Dict[str, PositionInfo],
         env_mode: str,
+        opening_compounds: Dict[str, float],
+        persist_opening_compounds: Callable[[Dict[str, float]], None],
     ) -> None:
         """
         Force-close all positions before weekend.
@@ -444,7 +489,10 @@ class OrderExecutor:
         If either gate fails, the method returns immediately and logs the reason.
         When both gates pass, cancel_all_orders() precedes close_all_positions()
         in the atomic path, and any failure falls back to per-symbol close via
-        close_position_due_to_sentiment().
+        close_position_due_to_sentiment() (which now purges opening_compounds).
+
+        PURGE-FIX: opening_compounds and persist_opening_compounds are now required
+        parameters so the fallback path can purge baselines inline with each close.
         """
         # SAFETY-GATE 1: live_trading_enabled check (config-level)
         if not self.live_trading_enabled:
@@ -473,6 +521,14 @@ class OrderExecutor:
             self.adapter.cancel_all_orders()
             self.adapter.close_all_positions()
             logger.info("All positions closed (atomic broker call).")
+            # PURGE-FIX: Atomic close succeeded — purge all baselines at once.
+            for symbol in list(opening_compounds.keys()):
+                if symbol in opening_compounds:
+                    del opening_compounds[symbol]
+            persist_opening_compounds(opening_compounds)
+            logger.info(
+                "Purged all opening_compounds after weekend atomic close."
+            )
         except Exception as e:
             logger.error(
                 f"Atomic close_all_positions failed: {e}. Falling back to per-symbol close."
@@ -491,4 +547,6 @@ class OrderExecutor:
                     sentiment=neutral_sentiment,
                     reason="weekend_forced_liquidation",
                     env_mode=env_mode,
+                    opening_compounds=opening_compounds,
+                    persist_opening_compounds=persist_opening_compounds,
                 )
