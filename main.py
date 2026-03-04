@@ -1,28 +1,3 @@
-# CHANGES:
-# Dashboard integration — monitoring/dashboard.py wired into the main loop.
-#
-# Change D1: Import dashboard_state, build_position_rows, build_price_rows,
-#   launch_dashboard, and persist_state from monitoring.dashboard.
-#
-# Change D2: launch_dashboard() is called ONCE before the main loop starts.
-#   It spawns a daemon thread running the PyQt5 QApplication event loop.
-#   The function returns immediately so the main loop continues unblocked.
-#   When dev_mode is True or PyQt5 is missing, launch_dashboard() logs a
-#   message and returns silently — the bot never crashes.
-#
-# Change D3: persist_state(dashboard_state) is called after every
-#   dashboard_state.update() so the pickled state file is always current for
-#   the GUI thread to poll.
-#
-# Change D4: A cycle counter _cycle_count is incremented at the top of each
-#   loop iteration and passed to dashboard_state.update() so the GUI can
-#   display "Bot Cycle: #X,XXX".
-#
-# All prior changes (Change 1a, Change 5, Improvement D, adaptive sleep
-# hysteresis, _load/_persist opening_compounds, _check_and_exit_on_sentiment,
-# get_equity_snapshot_from_account, Feature 7A, Feature 7B, etc.) are
-# preserved unchanged.
-
 import json
 import logging
 import time

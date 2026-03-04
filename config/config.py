@@ -1,13 +1,24 @@
 # CHANGES:
-# FIX 7 — Added ema_crossover_norm_scale: float = 0.10 to TechnicalSignalConfig.
-#   Previously _compute_simple_momentum_raw() divided raw EMA crossover by
-#   momentum_norm_scale (0.05), causing saturation at ±1 for high-momentum
-#   equities where the EMA spread exceeds 5%.  The new field widens the graded
-#   range to ±10%.  Existing momentum_norm_scale (used by
-#   _normalize_momentum_trend()) is unchanged.  New field carries a default so
-#   backward compatibility with all existing configs is maintained.
+# TASK IC-RANKING — Added three new fields to PortfolioConfig, all with
+#   defaults so backward compatibility is fully preserved:
 #
-# All prior changes (Fix L3, Change 2, Change 4) are preserved unchanged.
+#     enable_composite_ranking: bool  = False
+#       Gate flag. False produces byte-identical sort order to the previous
+#       codebase (|signal_score| only). True activates the IC-weighted
+#       additive composite ranking in build_portfolio().
+#
+#     rank_weight_technical: float = 0.7
+#       Weight applied to signal_score in the composite formula.
+#       Mirrors the default split used in published IC-weighted alpha models.
+#
+#     rank_weight_sentiment: float = 0.3
+#       Weight applied to sentiment_score in the composite formula.
+#       Together with rank_weight_technical they control the signed composite:
+#         rank_score = abs(w_t * signal_score + w_s * sentiment_score)
+#       so confirming pairs rank higher and contradicting pairs are demoted.
+#
+# All prior changes (FIX 7, Fix L3, Change 2, Change 4) are preserved
+# unchanged.
 
 import os
 import yaml
@@ -143,6 +154,17 @@ class PortfolioConfig:
     # Prevents the portfolio from being overweight in a single sector
     # (e.g. all 10 TECH symbols selected when only 3 are desired).
     max_positions_per_sector: int = 3
+    # TASK IC-RANKING: IC-weighted composite ranking gate and weights.
+    # enable_composite_ranking = False preserves the original |signal_score|
+    # sort order exactly (byte-identical behaviour).
+    # When True, candidates are ranked by:
+    #   abs(rank_weight_technical * signal_score
+    #       + rank_weight_sentiment * sentiment_score)
+    # The signed interior means confirming signal/sentiment pairs rank higher
+    # than contradicting pairs, so the API sentiment spend influences selection.
+    enable_composite_ranking: bool = False
+    rank_weight_technical: float = 0.7
+    rank_weight_sentiment: float = 0.3
 
 
 @dataclass

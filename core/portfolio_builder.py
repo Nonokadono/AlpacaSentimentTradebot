@@ -1,19 +1,34 @@
 # CHANGES:
-# FIX 1 — sector_counts pre-seeded from existing `positions` before the feasible
-#   candidate selection loop begins.  Iterates over every symbol in `positions`,
-#   looks up its InstrumentMeta, and increments sector_counts so that already-open
-#   TECH (or any other sector) positions are visible to the per-sector cap check.
-#   Without this, a bot restart with 3 open TECH positions would admit a 4th because
-#   the counter started empty.
+# TASK IC-RANKING — Replaced the single feasible.sort() line in
+#   build_portfolio() with a flag-guarded dual-path sort:
 #
-# FIX 2 — UNKNOWN-sector symbols (meta is None) are now exempt from the sector cap
-#   check entirely.  Previously all missing-meta symbols shared one "UNKNOWN" bucket
-#   and competed for the same cap slots, incorrectly blocking unrelated symbols.
-#   Guard changed to:  if meta is not None and sector_counts.get(...) >= cap: continue
-#   Sector counter is only incremented when meta is not None.
+#   When enable_composite_ranking is False (default):
+#     feasible.sort(key=lambda t: abs(t.signal_score), reverse=True)
+#     — byte-identical to the previous codebase; no behaviour change.
 #
-# All prior changes (Fix C4, Fix H4) are preserved unchanged.
+#   When enable_composite_ranking is True:
+#     feasible.sort(
+#         key=lambda t: abs(w_t * t.signal_score + w_s * t.sentiment_score),
+#         reverse=True,
+#     )
+#     The composite is SIGNED before abs() so that:
+#       - Confirming pairs (same direction) produce a LARGER rank score.
+#       - Contradicting pairs (opposing direction) produce a SMALLER rank score,
+#         correctly deprioritising low-conviction set-ups.
+#     w_t and w_s are read from PortfolioConfig.rank_weight_technical /
+#     rank_weight_sentiment (defaults 0.7 / 0.3).
+#
+#   A single DEBUG-level log line is emitted immediately after the sort,
+#   once per build_portfolio() call, listing every feasible candidate's
+#   symbol, side, signal_score, sentiment_score, computed rank score, and
+#   whether enable_composite_ranking was active.
+#
+#   import logging added (stdlib only — no new third-party dependency).
+#   Module-level logger = logging.getLogger(__name__) added.
+#
+# All prior changes (FIX 1, FIX 2, Fix C4, Fix H4) are preserved unchanged.
 
+import logging
 from typing import Dict, List, Any
 
 from adapters.alpaca_adapter import AlpacaAdapter
@@ -23,13 +38,17 @@ from core.risk_engine import RiskEngine, EquitySnapshot, PositionInfo, ProposedT
 from config.config import BotConfig
 from .portfolio_veto import PortfolioVeto
 
+logger = logging.getLogger(__name__)
+
 
 class PortfolioBuilder:
     """
     Portfolio-level builder:
     - Compute signal_score and side for each instrument.
     - Run pre_trade_checks -> ProposedTrade.
-    - Rank by |signal_score| and select until portfolio limits are hit.
+    - Rank by |signal_score| (or IC-weighted composite when
+      enable_composite_ranking is True) and select until portfolio limits
+      are hit.
     - Optional Sonar veto.
     """
 
@@ -160,7 +179,50 @@ class PortfolioBuilder:
         if not feasible:
             return []
 
-        feasible.sort(key=lambda t: abs(t.signal_score), reverse=True)
+        # --- IC-WEIGHTED COMPOSITE RANKING ---
+        # Read config values once so they are available for both the sort key
+        # and the subsequent DEBUG log line without repeated attribute lookups.
+        active = self.cfg.portfolio.enable_composite_ranking
+        w_t = self.cfg.portfolio.rank_weight_technical
+        w_s = self.cfg.portfolio.rank_weight_sentiment
+
+        if active:
+            # Composite is SIGNED before abs() — this is the core correctness
+            # property: confirming pairs rank higher, contradicting pairs lower.
+            #   Long  + confirming (sig=+0.60, sent=+0.50): composite=+0.57 → rank 0.57
+            #   Short + confirming (sig=-0.60, sent=-0.50): composite=-0.57 → rank 0.57
+            #   Short + contradicting (sig=-0.60, sent=+0.50): composite=-0.27 → rank 0.27
+            feasible.sort(
+                key=lambda t: abs(w_t * t.signal_score + w_s * t.sentiment_score),
+                reverse=True,
+            )
+        else:
+            # Default path: byte-identical to the previous codebase.
+            feasible.sort(key=lambda t: abs(t.signal_score), reverse=True)
+
+        # DEBUG: emit one log line per build_portfolio() call summarising the
+        # full ranked order so operators can audit selection decisions.
+        # Guarded by isEnabledFor to avoid the list comprehension cost when
+        # DEBUG logging is off.
+        if logger.isEnabledFor(logging.DEBUG):
+            ranked_log = []
+            for t in feasible:
+                rank_score = (
+                    abs(w_t * t.signal_score + w_s * t.sentiment_score)
+                    if active
+                    else abs(t.signal_score)
+                )
+                ranked_log.append(
+                    f"{t.symbol}/{t.side} "
+                    f"sig={t.signal_score:.4f} "
+                    f"sent={t.sentiment_score:.4f} "
+                    f"rank={rank_score:.4f}"
+                )
+            logger.debug(
+                "build_portfolio ranked order [enable_composite_ranking=%s]: %s",
+                active,
+                ranked_log,
+            )
 
         selected: List[ProposedTrade] = []
         current_gross = snapshot.gross_exposure
