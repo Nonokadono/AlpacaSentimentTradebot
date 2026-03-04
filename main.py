@@ -420,6 +420,12 @@ def main() -> None:
             time.sleep(60)
             continue
 
+        if not market_open:
+            logger.info("MARKET CLOSED: Skipping trading logic.")
+            time.sleep(60)
+            continue
+
+
         # ── STEP 3: PRE-CLOSE + MONDAY-OPEN ENTRY BLACKOUTS + BUILD AND EXECUTE NEW TRADES ─
         # MONDAY-BLACKOUT: Monday open blackout takes precedence over pre-close blackout
         # because both can theoretically be true simultaneously (rare but possible if

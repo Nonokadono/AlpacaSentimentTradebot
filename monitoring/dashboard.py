@@ -26,7 +26,7 @@ logger = logging.getLogger("tradebot")
 # ── dev_mode flag ──────────────────────────────────────────────────────────────
 # Set to True to run headless (raw logging, no GUI).
 # Set to False (default) to launch the full PyQt5 desktop window.
-dev_mode: bool = True
+dev_mode: bool = False
 
 # ── PyQt5 availability check ───────────────────────────────────────────────────
 try:
