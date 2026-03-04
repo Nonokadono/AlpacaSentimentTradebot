@@ -231,11 +231,28 @@ class SignalEngine:
         return 100.0 - (100.0 / (1.0 + rs))
 
     def _normalize_momentum_trend(self, mom_raw: float, trend_raw: float) -> float:
-        # WRONG-1 FIX: mom_raw is already normalised to [-1, 1] by
-        # _compute_simple_momentum_raw() via ema_crossover_norm_scale (0.10).
-        # Dividing again by momentum_norm_scale (0.05) double-normalised the
-        # signal, saturating any EMA spread > 0.5% of price to ±1.0.
-        # Direct passthrough preserves the graded signal.
+        """
+        Blend the pre-normalised EMA-crossover momentum signal with the
+        SMA-20 trend direction signal.
+
+        mom_raw is the output of _compute_simple_momentum_raw(), which already
+        returns a value in [-1, 1] normalised by ema_crossover_norm_scale (0.10).
+        It must NOT be divided by momentum_norm_scale a second time — doing so
+        would saturate any EMA spread larger than
+            ema_crossover_norm_scale * momentum_norm_scale = 0.10 * 0.05 = 0.005
+        (i.e. a 0.5% EMA spread), collapsing a graded signal into a binary
+        sign function for typical equities where spreads are 3–8%.
+
+        FIX-DBL-NORM: direct passthrough — clamp only, no rescaling.
+        momentum_norm_scale is NOT used here; it remains the normalisation
+        denominator inside _compute_simple_momentum_raw() via the getattr
+        fallback for backward compatibility.
+
+        Blend weights (unchanged):
+            70% EMA-crossover momentum  +  30% SMA-20 trend direction
+        """
+        # FIX-DBL-NORM: mom_raw is already a normalised EMA-crossover signal
+        # in [-1, 1].  Clamp defensively; do not divide by momentum_norm_scale.
         mom_score = max(-1.0, min(1.0, mom_raw))
 
         # Combine with trend (-1 or 1)
@@ -364,7 +381,7 @@ class SignalEngine:
         proper measure of true daily range.  If ATR is zero or bars are
         unavailable, falls back to 0.25% of last_price.
         The `volatility` parameter (std-dev) remains in the signature and is
-        still used downstream by _compute_volatility() -> pre_trade_checks() ->
+        still used downstream by _compute_volatility() -> pre_trade_checks() ->\
         _kelly_fraction() for Kelly sizing.
 
         Improvement B: When TechnicalSignalConfig.enable_dynamic_threshold is
