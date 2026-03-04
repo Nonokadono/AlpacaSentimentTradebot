@@ -1,20 +1,3 @@
-# CHANGES:
-# CRASH-2 FIX — Added avg_entry_price: float = 0.0 to PositionInfo dataclass.
-#
-#   order_executor._check_and_exit_on_sentiment() accesses pos.avg_entry_price
-#   to compute unrealised_pnl_pct for PnL-coupled threshold scaling.  Without
-#   this field every loop iteration over any open position raised AttributeError,
-#   crashing the bot unconditionally.
-#
-#   Default of 0.0 is intentionally safe: the guarding condition
-#     `if pos.avg_entry_price > 0.0`
-#   in order_executor.py evaluates to False when the field is not populated,
-#   setting unrealised_pnl_pct = 0.0 (no-op).  Legacy behaviour is therefore
-#   fully preserved for any call site that does not populate avg_entry_price.
-#
-# All prior changes (FIX 3, FIX 4, Fix M5, Change 2, Change 4,
-# Improvement A, Improvement C) are preserved unchanged.
-
 import math
 from collections import deque
 from dataclasses import dataclass, field
@@ -88,6 +71,37 @@ class RiskEngine:
         # Previously self._vol_history = deque(maxlen=200) was a single pool
         # that mixed all symbols' volatilities, biasing the percentile normaliser.
         self._vol_history: Dict[str, deque] = {}
+
+    # ── PERSIST-FIX: Vol history serialisation ───────────────────────────────
+
+    def export_vol_history(self) -> Dict[str, list]:
+        """Serialise per-symbol volatility deques to a JSON-safe dict.
+
+        Returns a plain {symbol: [float, ...]} mapping.  Each list preserves
+        insertion order so import_vol_history can reconstruct the deque in the
+        same order, maintaining the rolling percentile calculation integrity.
+        Called by main._persist_vol_and_sentiment() after each loop iteration.
+        """
+        return {sym: list(dq) for sym, dq in self._vol_history.items()}
+
+    def import_vol_history(self, data: Dict[str, list]) -> None:
+        """Restore per-symbol volatility deques from a previously exported dict.
+
+        Each value list is sliced to the last 200 entries before insertion so
+        we never exceed maxlen=200 even if the persisted list was somehow longer.
+        Malformed entries (wrong type, unparseable values) are silently skipped
+        so that a corrupted equity_state.json cannot crash the bot on startup.
+        Called by main.main() immediately after RiskEngine is constructed.
+        """
+        for sym, values in data.items():
+            try:
+                dq: deque = deque(maxlen=200)
+                dq.extend(values[-200:])   # cap at maxlen to be safe
+                self._vol_history[sym] = dq
+            except Exception:
+                continue   # silently skip malformed entries
+
+    # ── END PERSIST-FIX ──────────────────────────────────────────────────────
 
     def sentiment_scale(self, s: float) -> float:
         """

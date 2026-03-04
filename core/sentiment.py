@@ -1,16 +1,3 @@
-# CHANGES:
-# Fix C2 — _map_discrete_to_score() now applies confidence_gamma from
-#   SentimentConfig.  The formula changes from base * confidence (linear) to
-#   base * (confidence ** gamma) where gamma = clamp(self.cfg.confidence_gamma,
-#   1.0, 4.0).  The SentimentModule.__init__ now accepts an optional
-#   SentimentConfig parameter (cfg) with a default of None; when None a default
-#   SentimentConfig() is used.  The special case s_disc == -2 returning hard
-#   -1.0 is unchanged.  No variable renames.
-# Fix M6 — In _call_ai(), added the same int(round(float(...))) coercion to the
-#   raw sentiment value before the membership check, matching the fix applied in
-#   ai_client.py scorenews().
-# All prior changes (Change 5, Change 6) are preserved unchanged.
-
 from __future__ import annotations
 
 import os
@@ -72,6 +59,66 @@ class SentimentModule:
         # Cache is the single source of truth for last-known sentiment.
         # symbol -> (SentimentResult, timestamp_utc)
         self._cache: Dict[str, Tuple[SentimentResult, datetime]] = {}
+
+    # ── PERSIST-FIX: Cache serialisation ─────────────────────────────────────
+
+    def export_cache(self) -> Dict[str, dict]:
+        """Serialise the in-memory sentiment cache to a JSON-safe dict.
+
+        Each entry is a plain dict with all SentimentResult fields plus
+        ts_utc (ISO-format string of the naive UTC timestamp).
+        SentimentResult fields are serialised manually because the dataclass
+        is not natively JSON-serialisable (Optional[str] explanation field).
+
+        Called by main._persist_vol_and_sentiment() after each loop iteration.
+        """
+        out: Dict[str, dict] = {}
+        for sym, (result, ts) in self._cache.items():
+            out[sym] = {
+                "score":        result.score,
+                "raw_discrete": result.raw_discrete,
+                "rawcompound":  result.rawcompound,
+                "ndocuments":   result.ndocuments,
+                "explanation":  result.explanation,
+                "confidence":   result.confidence,
+                "ts_utc":       ts.isoformat(),
+            }
+        return out
+
+    def import_cache(self, data: Dict[str, dict]) -> None:
+        """Deserialise a previously exported cache dict back into _cache.
+
+        TTL filtering: only entries whose age (now - ts_utc) is still within
+        self.cache_ttl are imported. Stale entries are silently discarded so
+        that a long outage or a very large cache_ttl cannot resurrect outdated
+        sentiment scores as "fresh" after a restart.
+
+        Malformed entries (missing keys, bad types, unparseable timestamps) are
+        silently skipped — a corrupted equity_state.json must not crash the bot.
+
+        Called by main.main() immediately after SentimentModule is constructed,
+        before the main loop starts.
+        """
+        now = datetime.utcnow()
+        for sym, entry in data.items():
+            try:
+                ts = datetime.fromisoformat(entry["ts_utc"])
+                # Discard expired entries at load time — never serve stale data.
+                if now - ts > self.cache_ttl:
+                    continue
+                result = SentimentResult(
+                    score=float(entry["score"]),
+                    raw_discrete=int(entry["raw_discrete"]),
+                    rawcompound=float(entry["rawcompound"]),
+                    ndocuments=int(entry["ndocuments"]),
+                    explanation=entry.get("explanation"),
+                    confidence=float(entry.get("confidence", 0.0)),
+                )
+                self._cache[sym] = (result, ts)
+            except Exception:
+                continue   # silently skip malformed entries
+
+    # ── END PERSIST-FIX ──────────────────────────────────────────────────────
 
     def _neutral(self, reason: str, ndocs: int = 0) -> SentimentResult:
         return SentimentResult(

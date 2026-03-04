@@ -1,37 +1,3 @@
-# CHANGES:
-# ─────────────────────────────────────────────────────────────────────────────
-# FIX: start_of_day_equity now resets on US Eastern market-day boundaries
-#      instead of the server's local midnight (addresses timezone-aware
-#      daily-loss baseline bug).
-#
-# ROOT CAUSE (before this fix):
-#   Inside get_equity_snapshot_from_account():
-#       today_str = date.today().isoformat()
-#   date.today() reads the server's local timezone.  On a CET (UTC+1) host,
-#   local midnight = 23:00 UTC = 17:00 US Eastern — 30 minutes BEFORE the
-#   US market close (16:30 ET).  This resets start_of_day_equity mid-session,
-#   blinding the daily_loss_limit_pct kill-switch guard for the remainder of
-#   that trading day.
-#
-# THE FIX (three-part):
-#   1. Expand the datetime import:
-#        from datetime import date
-#      → from datetime import datetime, date
-#   2. Add stdlib ZoneInfo import with Python 3.8 fallback.
-#      The backports.zoneinfo line carries # type: ignore[import] because
-#      Pylance/pyright cannot resolve it on Python 3.9+ environments where
-#      the package is never installed — the try/except guarantees it is only
-#      executed on 3.8 runtimes where it IS present.
-#   3. Replace today_str derivation with datetime.now(tz=ET).date().isoformat().
-#
-# PREVIOUS FIX PRESERVED INTACT:
-#   high_watermark_equity remains monotonically non-decreasing (WRONG-3 fix).
-#
-# FILES CHANGED:
-#   main.py — one-word change on the backports import line (added type: ignore).
-#
-# NO OTHER LOGIC, VARIABLE NAMES, OR SIGNATURES WERE ALTERED.
-# ─────────────────────────────────────────────────────────────────────────────
 import json
 import logging
 import os
@@ -134,6 +100,31 @@ def _persist_opening_compounds(opening_compounds: Dict[str, float]) -> None:
     state = _load_equity_state()
     state["opening_compounds"] = opening_compounds
     _save_equity_state(state)
+
+
+# ── PERSIST-FIX: Combined vol-history + sentiment-cache persistence ───────────
+
+def _persist_vol_and_sentiment(
+    risk_engine: RiskEngine,
+    sentiment_module: SentimentModule,
+) -> None:
+    """Persist vol_history and sentiment_cache into equity_state.json.
+
+    Single read-modify-write: both keys are updated atomically in one
+    _save_equity_state() call to minimise I/O and avoid a window where one
+    key is written but the other is not (partial persistence).
+
+    Called once per full loop iteration, immediately before time.sleep().
+    Early-continue paths (kill-switch, weekend close, exposure cap) correctly
+    skip this call because no new vol samples or sentiment entries are produced
+    on those paths.
+    """
+    state = _load_equity_state()
+    state["vol_history"]      = risk_engine.export_vol_history()
+    state["sentiment_cache"]  = sentiment_module.export_cache()
+    _save_equity_state(state)
+
+# ── END PERSIST-FIX ──────────────────────────────────────────────────────────
 
 
 def load_equity_state() -> dict:
@@ -246,6 +237,23 @@ def main() -> None:
     # produced a semantically invalid cross-space comparison.
     # Persisted to equity_state.json so it survives bot restarts.
     _opening_compounds: Dict[str, float] = _load_opening_compounds()
+
+    # ── PERSIST-FIX: Restore vol history and sentiment cache from disk ────────
+    # Both import methods are fully safe: missing keys fall back to empty dicts,
+    # and malformed entries are silently skipped inside each method.
+    # import_vol_history() called before any trades so _kelly_fraction can use
+    # the restored per-symbol deques immediately on the first loop iteration.
+    # import_cache() called before the main loop so get_cached_sentiment() hits
+    # the warm cache on the very first sentiment check — no API burst on restart.
+    _startup_state = _load_equity_state()
+    risk_engine.import_vol_history(_startup_state.get("vol_history", {}))
+    sentiment.import_cache(_startup_state.get("sentiment_cache", {}))
+    logger.info(
+        "Startup state restored: vol_history symbols=%d  sentiment_cache symbols=%d",
+        len(risk_engine._vol_history),
+        len(sentiment._cache),
+    )
+    # ── END PERSIST-FIX ──────────────────────────────────────────────────────
 
     # ── GAP-1 FIX: Startup reconciliation ───────────────────────────────────
     # After loading from disk, validate the registry against LIVE Alpaca
@@ -430,6 +438,15 @@ def main() -> None:
             bot_state="IDLE",
         )
         persist_state(dashboard_state)
+
+        # ── PERSIST-FIX: Save vol_history and sentiment_cache ─────────────────
+        # Called here — after all trade execution and position refreshes are done
+        # for this iteration — so the persisted state always reflects the freshest
+        # vol samples (appended inside _kelly_fraction during pre_trade_checks) and
+        # the freshest sentiment entries (updated inside _call_ai / force_rescore).
+        # One atomic read-modify-write; see _persist_vol_and_sentiment() docstring.
+        _persist_vol_and_sentiment(risk_engine, sentiment)
+        # ── END PERSIST-FIX ───────────────────────────────────────────────────
 
         # ── STEP 4: ADAPTIVE SLEEP WITH HYSTERESIS ──────────────────────────
         # Change 5 / Improvement D: sleep duration is driven by the highest
