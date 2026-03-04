@@ -7,6 +7,11 @@
 #                   blackout at the start of Monday market sessions. Prevents new entries
 #                   during the first 30 minutes when Monday gap volatility and low liquidity
 #                   can produce erratic fills and whipsaw losses.
+# CHANGE 2 — Reduced is_pre_close_blackout() default from 180 to 90 minutes.
+#            180 minutes (3 hours) was too conservative for a swing strategy, suppressing
+#            entries from 13:00 ET onward (only 3.5-hour daily entry window).
+#            90 minutes (14:30 ET start of blackout) provides adequate buffer for order
+#            execution while maximizing the entry window. Updated docstring and inline comment.
 
 import logging
 import os
@@ -243,14 +248,21 @@ class AlpacaAdapter:
             logger.warning(f"is_pre_weekend_close error: {e}")
             return False
 
-    def is_pre_close_blackout(self, blackout_minutes: int = 180) -> bool:
+    def is_pre_close_blackout(self, blackout_minutes: int = 90) -> bool:
         """
         Return True if the market is currently open AND the current UTC time
         is within `blackout_minutes` minutes of the next scheduled close,
         on ANY day of the week.
 
-        Default is 180 minutes (3 hours). On a standard 09:30–16:00 ET
-        session this suppresses new entries from 13:00 ET onward.
+        CHANGE 2: Default reduced from 180 to 90 minutes.
+        180 minutes (3 hours) suppressed entries from 13:00 ET onward, leaving
+        only a 3.5-hour entry window per day — too conservative for a swing
+        strategy that holds positions for multiple days. 90 minutes provides
+        adequate buffer for order execution (avoiding 15:50 entry that may not
+        fill cleanly) while maximizing the daily entry window:
+          - Standard 09:30–16:00 ET session: entries allowed until 14:30 ET
+          - Total daily entry window: 5 hours (09:30–14:30)
+          - Previous (180min): 3.5 hours (09:30–13:00)
 
         Implementation rules:
         - Calls self.get_market_close_time() — does NOT call get_clock() again.

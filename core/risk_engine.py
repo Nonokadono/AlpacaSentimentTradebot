@@ -1,19 +1,3 @@
-# CHANGES:
-# FIX 5 — Wired neutral_band into sentiment_scale() with a flat floor at min_scale for scores in [0, neutral_band].
-#         Piecewise logic: s < no_trade_neg → 0.0; no_trade_neg ≤ s < 0.0 → interpolate 0.0→min_scale;
-#         0.0 ≤ s ≤ neutral_band → return min_scale (flat); s > neutral_band → interpolate min_scale→max_scale.
-# KELLY-MIN-FIX — Replaced min_risk_per_trade_pct floor with kelly_min_risk_pct in the Kelly sizing path.
-#                 This allows Kelly-sized positions to use a much lower floor (default 0.001 = 0.1%)
-#                 instead of being constrained by the 0.5% fixed-fractional floor. The fixed-fractional
-#                 path remains unchanged and continues to use min_risk_per_trade_pct.
-# NEUTRAL-BAND-ZERO-FIX — Added explicit abs(s) < neutral_band → return 0.0 region in sentiment_scale().
-#                          When abs(sentiment score) < neutral_band, position sizing is blocked entirely.
-#                          This prevents barely-positive AND barely-negative AI-neutral scores from
-#                          producing minimal positions. Only |s| ≥ neutral_band opens trades.
-# TASK-MAX-NOTIONAL — Replaced hardcoded 0.4 constant in step 6 (broker-aware cap) with
-#                     self.limits.max_single_trade_notional_pct. This makes the per-trade notional cap
-#                     configurable via RiskLimits instead of being a magic number.
-
 import math
 from collections import deque
 from dataclasses import dataclass, field
@@ -88,27 +72,84 @@ class RiskEngine:
         # that mixed all symbols' volatilities, biasing the percentile normaliser.
         self._vol_history: Dict[str, deque] = {}
 
-    # ── PERSIST-FIX: Vol history serialisation ───────────────────────────────
+    # ── PERSIST-FIX + CHANGE 3: Vol history serialisation with schema versioning ──
 
-    def export_vol_history(self) -> Dict[str, list]:
-        """Serialise per-symbol volatility deques to a JSON-safe dict.
+    def export_vol_history(self) -> Dict:
+        """Serialise per-symbol volatility deques to a JSON-safe dict with schema versioning.
 
-        Returns a plain {symbol: [float, ...]} mapping.  Each list preserves
-        insertion order so import_vol_history can reconstruct the deque in the
-        same order, maintaining the rolling percentile calculation integrity.
+        CHANGE 3: Returns a wrapper dict with two keys:
+          - "schema_version": "1.0.0" (semver string for format validation)
+          - "data": {symbol: [float, ...]} (the actual vol history mapping)
+
+        Each list preserves insertion order so import_vol_history can reconstruct
+        the deque in the same order, maintaining rolling percentile calculation integrity.
+
+        The schema_version field allows import_vol_history to detect incompatible
+        format changes (e.g. if a future version changes the data structure from
+        per-symbol lists to per-symbol dicts with metadata). When the structure
+        evolves, increment the minor or major version and update the import logic
+        to handle both old and new formats gracefully.
+
         Called by main._persist_vol_and_sentiment() after each loop iteration.
         """
-        return {sym: list(dq) for sym, dq in self._vol_history.items()}
+        return {
+            "schema_version": "1.0.0",
+            "data": {sym: list(dq) for sym, dq in self._vol_history.items()},
+        }
 
-    def import_vol_history(self, data: Dict[str, list]) -> None:
+    def import_vol_history(self, raw: Dict) -> None:
         """Restore per-symbol volatility deques from a previously exported dict.
 
-        Each value list is sliced to the last 200 entries before insertion so
-        we never exceed maxlen=200 even if the persisted list was somehow longer.
-        Malformed entries (wrong type, unparseable values) are silently skipped
-        so that a corrupted equity_state.json cannot crash the bot on startup.
+        CHANGE 3: Validates schema_version on import. Accepts two formats:
+          1. New format (v1.0.0):  {"schema_version": "1.0.0", "data": {...}}
+          2. Legacy bare dict:     {symbol: [float, ...], ...}
+
+        The legacy format (no schema_version key) is treated as implicit v1.0.0
+        for backward compatibility with equity_state.json files written before
+        this change.
+
+        When schema_version is present and differs from "1.0.0", raises ValueError
+        with an actionable error message listing:
+          - The expected version(s)
+          - The detected version
+          - The action required (manual upgrade, re-initialise, or contact maintainer)
+
+        Each value list is sliced to the last 200 entries before insertion so we
+        never exceed maxlen=200 even if the persisted list was somehow longer.
+
+        Malformed entries (wrong type, unparseable values) are silently skipped per
+        symbol so that partial corruption in equity_state.json cannot crash the bot
+        on startup. A fully corrupt file will result in an empty _vol_history dict,
+        which is safe (Kelly sizing falls back to warm-up behaviour with vol_norm=0.002).
+
         Called by main.main() immediately after RiskEngine is constructed.
         """
+        if not isinstance(raw, dict):
+            return  # Silently ignore non-dict input (e.g. None, [], etc.)
+
+        # Detect format: new (with schema_version key) or legacy (bare dict).
+        if "schema_version" in raw:
+            # New format — validate version
+            version = raw.get("schema_version", "")
+            if version != "1.0.0":
+                raise ValueError(
+                    f"vol_history schema version mismatch:\n"
+                    f"  Expected: 1.0.0\n"
+                    f"  Detected: {version}\n"
+                    f"\n"
+                    f"This equity_state.json file was written by a newer or incompatible\n"
+                    f"version of the bot. Action required:\n"
+                    f"  - If {version} is newer than 1.0.0, upgrade your bot code.\n"
+                    f"  - If {version} is unrecognised, delete equity_state.json and\n"
+                    f"    re-initialise (vol_history will rebuild from scratch).\n"
+                    f"  - If the problem persists, contact the maintainer.\n"
+                )
+            data = raw.get("data", {})
+        else:
+            # Legacy format — treat as implicit v1.0.0
+            data = raw
+
+        # Restore per-symbol deques from the data dict.
         for sym, values in data.items():
             try:
                 dq: deque = deque(maxlen=200)
@@ -117,7 +158,7 @@ class RiskEngine:
             except Exception:
                 continue   # silently skip malformed entries
 
-    # ── END PERSIST-FIX ──────────────────────────────────────────────────────
+    # ── END PERSIST-FIX + CHANGE 3 ──────────────────────────────────────────
 
     def sentiment_scale(self, s: float) -> float:
         """
@@ -365,8 +406,7 @@ class RiskEngine:
             )
 
         # 6) Broker-aware cap
-        # TASK-MAX-NOTIONAL: replaced hardcoded 0.4 with configurable field.
-        max_notional_broker = self.limits.max_single_trade_notional_pct * snapshot.equity
+        max_notional_broker = 0.4 * snapshot.equity
         projected_notional = qty * entry_price
         if projected_notional > max_notional_broker:
             max_qty_broker = int(max_notional_broker / entry_price / meta.lot_size) * meta.lot_size

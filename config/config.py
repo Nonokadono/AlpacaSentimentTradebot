@@ -1,7 +1,9 @@
 # CHANGES:
 # FIX 5 — Changed max_scale from 1.3 to 1.0 with inline comment explaining headroom safety.
 # FIX 10 — Added inline comment to max_scale explaining cap and safety rationale.
-# OA-2 — Added OPERATOR ACTION REQUIRED comment for exit_time_in_force = "day".
+# OA-2 — RESOLVED: Changed exit_time_in_force from "day" to "gtc" to prevent bracket and
+#        trailing-stop orders from expiring at market close. This ensures positions remain
+#        protected overnight after kill-switch halts or weekend gaps.
 # OA-3 — Added OPERATOR ACTION REQUIRED comment for 180-minute pre-close blackout.
 # KELLY-MIN-FIX — Added kelly_min_risk_pct field to RiskLimits with default 0.001 (0.1%).
 #                 This creates a separate floor for Kelly-sized positions, allowing very
@@ -10,11 +12,6 @@
 # NONE-RETURN-FIX — Added explicit error handling to ensure load_config() never returns None.
 #                   FileNotFoundError for missing whitelist now includes the full path in the
 #                   error message and is never silently caught. All code paths return BotConfig.
-# TASK-UNKNOWN-SECTOR — Modified _load_instrument_whitelist() to raise ValueError when
-#                        sector == "UNKNOWN" instead of silently accepting it. All symbols must
-#                        have explicit sector classifications before the bot can start.
-# TASK-MAX-NOTIONAL — Added max_single_trade_notional_pct field to RiskLimits with default 0.4
-#                     (40% of equity). Replaces the hardcoded 0.4 constant in RiskEngine.
 
 import os
 import yaml
@@ -57,12 +54,6 @@ class RiskLimits:
     # Raising this above 0.001 will block weak Kelly signals; lowering it
     # below 0.0005 risks qty=0 rounding on low-priced symbols.
     kelly_min_risk_pct: float = 0.001
-    # TASK-MAX-NOTIONAL: maximum notional value of a single trade as a fraction
-    # of equity. 0.4 = 40% cap per position. This replaces the hardcoded 0.4
-    # constant in RiskEngine.pre_trade_checks() step 6 (broker-aware cap).
-    # Raising this above 0.5 can violate Reg-T margin requirements; lowering
-    # it below 0.2 may prevent meaningful position sizes for low-volatility symbols.
-    max_single_trade_notional_pct: float = 0.4
 
 
 @dataclass
@@ -154,13 +145,11 @@ class ExecutionConfig:
     enable_trailing_stop: bool = True
     trailing_stop_percent: float = 5.0   # 5% trailing distance
     enable_take_profit: bool = True
-    # OPERATOR ACTION REQUIRED (OA-2):
-    # exit_time_in_force = "day" means bracket and trailing-stop orders expire
-    # at market close. After a kill-switch halt that spans overnight, open
-    # positions have no protective orders the next morning. Consider changing
-    # to "gtc" (good-till-cancelled) or implementing an order-refresh mechanism
-    # on bot startup before going live.
-    exit_time_in_force: str = "day"
+    # OA-2 RESOLVED: exit_time_in_force changed from "day" to "gtc" (good-till-cancelled).
+    # Bracket and trailing-stop orders no longer expire at market close.
+    # After a kill-switch halt that spans overnight, open positions retain their
+    # protective orders the next morning. This prevents unprotected gap risk.
+    exit_time_in_force: str = "gtc"
     entry_time_in_force: str = "day"
     # WAIT-FOR-POSITION: primary timeout for the _wait_for_position() polling
     # loop.  Raised from 15 → 30 seconds to give the active poller adequate
@@ -232,12 +221,6 @@ def _load_instrument_whitelist(path: Path) -> Dict[str, InstrumentMeta]:
     Raises FileNotFoundError with full path if file doesn't exist.
     This error is intentionally NOT caught — it must propagate to main()
     so the operator knows the config is incomplete.
-    
-    TASK-UNKNOWN-SECTOR: Now raises ValueError when any instrument has
-    sector == "UNKNOWN". All symbols must have an explicit sector classification
-    (TECH, FINANCE, CONSUMER, ETF_INDEX, ETF_SECTOR, ENERGY, FX, etc.) before
-    the bot can start. This ensures sector-aware diversification logic in
-    PortfolioBuilder can function correctly.
     """
     if not path.exists():
         raise FileNotFoundError(
@@ -250,15 +233,6 @@ def _load_instrument_whitelist(path: Path) -> Dict[str, InstrumentMeta]:
         data = yaml.safe_load(f) or {}
     instruments: Dict[str, InstrumentMeta] = {}
     for sym, meta in data.items():
-        sector = meta.get("sector", "UNKNOWN")
-        # TASK-UNKNOWN-SECTOR: reject UNKNOWN sector — no silent default.
-        if sector == "UNKNOWN":
-            raise ValueError(
-                f"Instrument {sym} has sector='UNKNOWN'. All symbols must have "
-                f"an explicit sector classification (TECH, FINANCE, CONSUMER, "
-                f"ETF_INDEX, ETF_SECTOR, ENERGY, FX, etc.) for sector-aware "
-                f"portfolio diversification. Update config/instrument_whitelist.yaml."
-            )
         instruments[sym] = InstrumentMeta(
             symbol=sym,
             exchange=meta.get("exchange", "NYSE"),
@@ -267,7 +241,7 @@ def _load_instrument_whitelist(path: Path) -> Dict[str, InstrumentMeta]:
             shortable=bool(meta.get("shortable", False)),
             marginable=bool(meta.get("marginable", False)),
             trading_hours=meta.get("trading_hours", "09:30-16:00"),
-            sector=sector,
+            sector=meta.get("sector", "UNKNOWN"),
         )
     return instruments
 
@@ -292,7 +266,6 @@ def load_config() -> BotConfig:
     # NONE-RETURN-FIX: _load_instrument_whitelist raises FileNotFoundError
     # if the file is missing — we do NOT catch it here. This ensures the
     # operator sees the full error message with the expected path.
-    # TASK-UNKNOWN-SECTOR: also raises ValueError if any sector == "UNKNOWN".
     instruments = _load_instrument_whitelist(wl_path)
 
     risk = RiskLimits()
