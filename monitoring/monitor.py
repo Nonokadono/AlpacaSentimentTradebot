@@ -1,10 +1,3 @@
-# CHANGES:
-# - No functional changes from baseline.
-# - Full file reproduced verbatim to restore all ANSI colour formatting,
-#   separator helpers, italicize_technical(), sentiment_score_fragment(),
-#   nextlinecolor cycling, and all log_* functions that were present in the
-#   original 400-line version.
-
 import logging
 import threading
 from datetime import datetime
@@ -349,11 +342,21 @@ def log_sentiment_position_check(
     env_mode: str = "PAPER",
     stop_price: Optional[float] = None,
     take_profit_price: Optional[float] = None,
+    pnl_exit_scale_enabled: bool = False,
+    pnl_exit_scale_factor: float = 0.5,
 ) -> None:
     """
     Emit a detailed per-position sentiment-check block each rescore cycle.
     Chaos exit (raw_discrete == -2) also marks triggered_tag and delta_color
     so the delta row is visually consistent with the Verdict.
+
+    pnl_exit_scale_enabled / pnl_exit_scale_factor are new optional kwargs
+    (both defaulted) added for the PnL-Coupled Sentiment Exit feature.
+    When pnl_exit_scale_enabled is True, a compact scaling fragment is appended
+    to the delta row so the operator can see at a glance that the displayed
+    delta_threshold is the PnL-adjusted effective value, not the raw config value.
+    When False (the default), the log output is byte-for-byte identical to the
+    prior version — no existing call sites are affected.
     """
     lc  = nextlinecolor()
     W   = 80
@@ -384,7 +387,7 @@ def log_sentiment_position_check(
     ec_color = SIGNALGREEN if entry_compound > 0 else SIGNALRED
     ec_str   = f"{ec_color}{entry_compound:.3f}{lc}"
 
-    sl_str = f"{stop_price:.2f}"       if stop_price       is not None else "N/A"
+    sl_str = f"{stop_price:.2f}"        if stop_price        is not None else "N/A"
     tp_str = f"{take_profit_price:.2f}" if take_profit_price is not None else "N/A"
 
     meta_row = (
@@ -405,6 +408,16 @@ def log_sentiment_position_check(
     else:
         triggered_tag = ""
 
+    # PnL-scale annotation: only emitted when the feature is active so that
+    # operators know the displayed threshold is the effective (scaled) value.
+    if pnl_exit_scale_enabled:
+        pnl_scale_tag = (
+            f"  {DEEPBLUE}pnl_scale=enabled  "
+            f"factor={pnl_exit_scale_factor:.2f}{lc}"
+        )
+    else:
+        pnl_scale_tag = ""
+
     delta_str = (
         f" Δ={delta_color}{delta:+.3f}{lc}  "
         f"threshold={delta_threshold:.3f}  "
@@ -412,6 +425,7 @@ def log_sentiment_position_check(
         f"conf_min={confidence_min:.2f}  "
         f"discrete={rd}"
         f"{triggered_tag}"
+        f"{pnl_scale_tag}"
     )
 
     expl_raw = (current_sentiment.explanation or "").replace("\n", " ").strip()

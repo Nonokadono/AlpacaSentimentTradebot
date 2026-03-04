@@ -1,31 +1,3 @@
-# CHANGES:
-# FIX 5 — generate_signal_for_symbol(): lookback_bars changed from 30 to 45.
-#   With period=14, 30 bars gave only 15 smoothing steps (minimum viable).
-#   45 bars gives 44 deltas: 14 for the Wilder seed + 30 for smoothing,
-#   meeting the conventional 3x-period stability threshold.
-#
-# FIX 6 — Added _compute_atr() private method that computes the standard
-#   Average True Range using bar.h, bar.l, and bars[i-1].c.
-#   TR(i) = max(h-l, |h - prev_c|, |l - prev_c|).  ATR = simple mean of
-#   last `period` TRs.  Requires period+1 bars; returns 0.0 if insufficient.
-#   Returns a price distance (not a ratio).
-#   In _decide_side_and_bands(): vol_px now uses atr (with 0.25% fallback)
-#   instead of the std-dev-based proxy.  The `volatility` parameter is
-#   unchanged in the signature and still used by Kelly sizing via
-#   _compute_volatility() -> pre_trade_checks().
-#   _decide_side_and_bands() now also accepts `bars` as a parameter so it can
-#   call _compute_atr().  generate_signal_for_symbol() passes bars through.
-#
-# FIX 7 — _compute_simple_momentum_raw(): EMA crossover normalisation now uses
-#   ema_crossover_norm_scale (new TechnicalSignalConfig field, default 0.10)
-#   instead of momentum_norm_scale (0.05).  Prevents saturation at ±1 for
-#   high-momentum equities where EMA divergence exceeds 5%.  getattr fallback
-#   ensures backward compatibility if the field is absent on older configs.
-#   momentum_norm_scale is still used by _normalize_momentum_trend() unchanged.
-#
-# All prior changes (Fix M1, Fix M2, Fix M3, Fix L3, Change 3, Improvement B,
-# Wilder's RSI) are preserved unchanged.
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -510,8 +482,11 @@ class SignalEngine:
 
         dampener_tag = " [CONFLICT DAMPENED]" if dampened else ""
 
-        # AI cost control (3): skip sentiment entirely when the technical signal
+        # AI cost control: skip sentiment entirely when the technical signal
         # is neutral — saves an API call.
+        # OBSERVABILITY FIX: log_instrument_report() is now called here too so
+        # technically-skipped symbols appear in the logs with their sub-scores,
+        # making it visible why they were dropped before any AI was consulted.
         if side == "skip":
             neutral_sentiment = SentimentResult(
                 score=0.0,
@@ -520,6 +495,15 @@ class SignalEngine:
                 ndocuments=0,
                 explanation="Technical signal neutral; sentiment not evaluated.",
                 confidence=0.0,
+            )
+            log_instrument_report(
+                symbol=symbol,
+                signal_score=signal_score,
+                sentiment=neutral_sentiment,
+                momentum_score=momentum_score,
+                mean_reversion_score=mean_reversion_score,
+                price_action_score=price_action_score,
+                env_mode=ENV_MODE,
             )
             return Signal(
                 symbol=symbol,
@@ -538,7 +522,19 @@ class SignalEngine:
         news_items = self._get_news_items(symbol)
         sentiment_result = self.sentiment.scorenewsitems(symbol, news_items)
 
-        # Sentiment no-trade block
+        
+        log_instrument_report(
+            symbol=symbol,
+            signal_score=signal_score,
+            sentiment=sentiment_result,
+            momentum_score=momentum_score,
+            mean_reversion_score=mean_reversion_score,
+            price_action_score=price_action_score,
+            env_mode=ENV_MODE,
+        )
+
+        # Sentiment no-trade block — now reached AFTER logging so the
+        # operator can see the negative score that caused the skip.
         if sentiment_result.score < self.sentiment.cfg.no_trade_negative_threshold:
             return Signal(
                 symbol=symbol,
@@ -563,16 +559,6 @@ class SignalEngine:
             f"mom={momentum_score:.3f} mr={mean_reversion_score:.3f} "
             f"pa={price_action_score:.3f} "
             f"sentiment={sentiment_result.score:.3f}{dampener_tag}"
-        )
-
-        log_instrument_report(
-            symbol=symbol,
-            signal_score=signal_score,
-            sentiment=sentiment_result,
-            momentum_score=momentum_score,
-            mean_reversion_score=mean_reversion_score,
-            price_action_score=price_action_score,
-            env_mode=ENV_MODE,
         )
 
         return Signal(

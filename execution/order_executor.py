@@ -1,26 +1,3 @@
-# CHANGES:
-# Feature 7A — Added close_all_positions_for_weekend() public method placed
-#   after close_position_due_to_sentiment().
-#
-#   Execution sequence:
-#     1. Logs a WARNING header with the total position count before any orders.
-#     2. In paper mode (live_trading_enabled=False): logs a per-symbol INFO
-#        line and returns immediately without submitting any orders.
-#     3. PRIMARY PATH: calls self.adapter.cancel_all_orders() to clear every
-#        open bracket/trailing-stop leg, then self.adapter.close_all_positions()
-#        to flatten all positions atomically. Logs success and returns.
-#     4. FALLBACK PATH (only if step 3 raises): logs the atomic-close failure,
-#        then iterates over positions and calls close_position_due_to_sentiment()
-#        per symbol with a synthetic SentimentResult and reason="weekend_forced_close".
-#        Does NOT call _cancel_all_open_orders_for_symbol() in the loop —
-#        close_position_due_to_sentiment() already calls it internally.
-#        Per-symbol exceptions are caught individually so one failure never
-#        blocks the rest.
-#     5. Never raises under any circumstances.
-#
-# All prior changes (execute_proposed_trade, close_position_due_to_sentiment,
-# _cancel_all_open_orders_for_symbol, _exit_side) are preserved unchanged.
-
 import logging
 import time
 from typing import Dict, Optional
@@ -53,10 +30,10 @@ def _check_and_exit_on_sentiment(
 
     Three exit tiers from SentimentConfig:
       1. Hard exit (chaos): raw_discrete == -2 → close unconditionally, no delta check.
-      2. Strong exit: delta > strong_exit_delta_threshold AND
+      2. Strong exit: delta > effective_strong_threshold AND
                       confidence > strong_exit_confidence_min
          Fires on large sentiment deterioration even at moderate confidence.
-      3. Soft exit: delta > soft_exit_delta_threshold AND
+      3. Soft exit: delta > effective_soft_threshold AND
                     confidence > exit_confidence_min
          Catches partial deterioration (e.g. +0.7 → 0.0, delta=0.70).
 
@@ -64,9 +41,16 @@ def _check_and_exit_on_sentiment(
       delta = opening_compound - current_sentiment.score
     A positive delta means sentiment has worsened since entry.
 
-    The effective delta_threshold used for the monitor log is the lowest
-    threshold that could have fired (soft wins if confidence qualifies, else
-    strong). This keeps the log display consistent with the actual decision.
+    When pnl_exit_scale_enabled is True, effective thresholds are PnL-scaled:
+      scale_adj               = unrealised_pnl_pct * pnl_exit_scale_factor
+      effective_soft_threshold   = max(0.3, soft_exit_delta_threshold   + scale_adj)
+      effective_strong_threshold = max(0.5, strong_exit_delta_threshold + scale_adj)
+    where unrealised_pnl_pct is +ve for winning positions and -ve for losing ones.
+    This widens thresholds for winners (harder to exit) and tightens them for
+    losers (easier to exit).  The hard exit is NEVER gated by these thresholds.
+
+    The effective_soft_threshold is used as display_threshold in the monitor log
+    so the operator always sees the actual threshold that drove the decision.
     """
     sent_cfg = SentimentConfig(cfg.sentiment) if False else cfg.sentiment  # type: ignore[arg-type]
     sent_cfg = cfg.sentiment
@@ -79,16 +63,42 @@ def _check_and_exit_on_sentiment(
         current_score = float(current_sentiment.score)
         delta = float(opening_compound - current_score)
 
+        # --- PnL-Coupled Sentiment Exit Threshold Scaling ---
+        # Derive unrealised P&L percentage from PositionInfo fields.
+        # avg_entry_price defaults to 0.0; when not populated the adjustment
+        # resolves to 0.0 (no-op), preserving legacy behaviour completely.
+        if pos.avg_entry_price > 0.0:
+            raw_pnl_pct = (pos.market_price - pos.avg_entry_price) / pos.avg_entry_price
+            # Short positions gain when price falls, so flip the sign.
+            unrealised_pnl_pct = -raw_pnl_pct if pos.side == "short" else raw_pnl_pct
+        else:
+            unrealised_pnl_pct = 0.0
+
+        if sent_cfg.pnl_exit_scale_enabled:
+            scale_adj = unrealised_pnl_pct * sent_cfg.pnl_exit_scale_factor
+            # Floor clamps prevent runaway losses being held indefinitely.
+            effective_soft_threshold = max(
+                0.3, sent_cfg.soft_exit_delta_threshold + scale_adj
+            )
+            effective_strong_threshold = max(
+                0.5, sent_cfg.strong_exit_delta_threshold + scale_adj
+            )
+        else:
+            # Scaling disabled: effective thresholds equal raw config values.
+            effective_soft_threshold = sent_cfg.soft_exit_delta_threshold
+            effective_strong_threshold = sent_cfg.strong_exit_delta_threshold
+        # -----------------------------------------------------
+
         hard_exit = current_sentiment.raw_discrete == -2
         strong_exit = (
             not hard_exit
-            and delta > sent_cfg.strong_exit_delta_threshold
+            and delta > effective_strong_threshold
             and current_sentiment.confidence > sent_cfg.strong_exit_confidence_min
         )
         soft_exit = (
             not hard_exit
             and not strong_exit
-            and delta > sent_cfg.soft_exit_delta_threshold
+            and delta > effective_soft_threshold
             and current_sentiment.confidence > sent_cfg.exit_confidence_min
         )
         closing = hard_exit or strong_exit or soft_exit
@@ -103,7 +113,10 @@ def _check_and_exit_on_sentiment(
         else:
             close_reason = "no_exit"
 
-        display_threshold = sent_cfg.soft_exit_delta_threshold
+        # Use effective_soft_threshold as display_threshold so the log always
+        # reflects the actual threshold applied to the decision (may differ
+        # from the raw config value when PnL scaling is active).
+        display_threshold = effective_soft_threshold
 
         log_sentiment_position_check(
             position=pos,
@@ -117,6 +130,8 @@ def _check_and_exit_on_sentiment(
             env_mode=env_mode,
             stop_price=None,
             take_profit_price=None,
+            pnl_exit_scale_enabled=sent_cfg.pnl_exit_scale_enabled,
+            pnl_exit_scale_factor=sent_cfg.pnl_exit_scale_factor,
         )
 
         if closing:
