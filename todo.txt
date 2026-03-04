@@ -6,32 +6,6 @@ Scrap upper and lower resistance with AI and use it in a viable capacity
 
 test with different weights in composit value
 
-4----------------------------------------------------------------------------------
-
-tweak lot size based on weights
-
-5----------------------------------------------------------------------------------
-
-stop loss tp stuff
-
-6----------------------------------------------------------------------------------
-
-Close all positions one iteration before market closure
-
-7----------------------------------------------------------------------------------
-The trailing stop loss doesnt work
-2026-02-27T16:07:03.659109Z PAPER PORTFOLIO OVERVIEW
-  symbol=GOOGL side=sell qty=132.0000 notional=40670.52 signal_score=-0.203 rejected=None
---------------------------------------------------------------------------------
-2026-02-27T16:07:03.659415Z PAPER ProposedTrade symbol=GOOGL sell qty=132.0000 notional=40670.52 entry=308.1100 stop=309.6970 tp=306.0853 risk_amt=3057.75 risk_pct=0.0300 sentiment=0.000 scale=1.000 rejected=None  SELL -0.203   
---------------------------------------------------------------------------------
-Trailing stop placement failed for GOOGL: insufficient qty available for order (requested: 132, available: 0)
-
-8----------------------------------------------------------------------------------
-rank portfolio builder based on tech+sent score and distribute equity accordingly in viable positions
-
-9----------------------------------------------------------------------------------
-kelly sizing needs to become default mode!
 
 
 

@@ -1,6 +1,10 @@
 # CHANGES:
 # FIX 2 — Replaced adapter.get_last_quote() call with entry_price = sig.last_price in _build_candidate_for_symbol().
 #         Eliminates duplicate price fetch and ensures consistent stop_distance calculation across SignalEngine and RiskEngine.
+# TASK 2 IMPLEMENTATION — Sector-aware portfolio diversification enforced via max_positions_per_sector cap.
+#         FIX 1: Pre-seed sector_counts with existing positions to prevent over-allocation on bot restart.
+#         FIX 2: Symbols with missing InstrumentMeta are exempt from sector cap (no "UNKNOWN" bucket).
+#         FIX 3: sector_counts only incremented when meta is not None.
 
 import logging
 from typing import Dict, List, Any
@@ -23,6 +27,7 @@ class PortfolioBuilder:
     - Rank by |signal_score| (or IC-weighted composite when
       enable_composite_ranking is True) and select until portfolio limits
       are hit.
+    - Enforce max_positions_per_sector cap to prevent over-concentration.
     - Optional Sonar veto.
     """
 
