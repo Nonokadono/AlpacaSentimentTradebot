@@ -1,42 +1,34 @@
 # CHANGES:
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX: high_watermark_equity now genuinely monotonically non-decreasing across
-#      all calendar days (addresses WRONG-3 / "daily watermark reset" bug).
+# FIX: start_of_day_equity now resets on US Eastern market-day boundaries
+#      instead of the server's local midnight (addresses timezone-aware
+#      daily-loss baseline bug).
 #
 # ROOT CAUSE (before this fix):
-#   Inside get_equity_snapshot_from_account(), the new-day branch contained:
+#   Inside get_equity_snapshot_from_account():
+#       today_str = date.today().isoformat()
+#   date.today() reads the server's local timezone.  On a CET (UTC+1) host,
+#   local midnight = 23:00 UTC = 17:00 US Eastern — 30 minutes BEFORE the
+#   US market close (16:30 ET).  This resets start_of_day_equity mid-session,
+#   blinding the daily_loss_limit_pct kill-switch guard for the remainder of
+#   that trading day.
 #
-#       if last_day != today_str:
-#           start_of_day_equity  = equity   ← correct
-#           high_watermark_equity = equity   ← BUG: clobbers all-time peak
+# THE FIX (three-part):
+#   1. Expand the datetime import:
+#        from datetime import date
+#      → from datetime import datetime, date
+#   2. Add stdlib ZoneInfo import with Python 3.8 fallback.
+#      The backports.zoneinfo line carries # type: ignore[import] because
+#      Pylance/pyright cannot resolve it on Python 3.9+ environments where
+#      the package is never installed — the try/except guarantees it is only
+#      executed on 3.8 runtimes where it IS present.
+#   3. Replace today_str derivation with datetime.now(tz=ET).date().isoformat().
 #
-#   Every morning the watermark was silently reset to whatever equity happened
-#   to be at that moment, regardless of the true all-time peak.  max_drawdown_pct
-#   therefore only measured same-day drawdown, not portfolio-level drawdown.
-#
-# IMPACT EXAMPLE:
-#   Day 0  : equity=$10,000 → watermark=$10,000
-#   Day 1  : equity=$11,000 → watermark=$11,000  (legitimate new peak)
-#   Day 2 open  : equity=$10,200
-#     BUGGY → watermark reset to $10,200; drawdown = 0.00%  ← kill switch blind
-#     FIXED → watermark stays  at $11,000; drawdown = −7.27%
-#   Day 2 intraday: equity=$9,800
-#     BUGGY → drawdown = −3.92%  (kill switch silent — DANGEROUS)
-#     FIXED → drawdown = −10.91% (kill switch fires  — CORRECT)
-#
-# THE FIX:
-#   Remove `high_watermark_equity = equity` from inside the new-day block.
-#   Only start_of_day_equity (and state["last_trading_day"]) are updated on a
-#   new calendar day.  The existing `if equity > high_watermark_equity:` block
-#   is the sole place the watermark can increase — making it strictly
-#   monotonically non-decreasing.  The first-ever-run default via
-#   state.get("high_watermark_equity", equity) is unchanged and correct.
+# PREVIOUS FIX PRESERVED INTACT:
+#   high_watermark_equity remains monotonically non-decreasing (WRONG-3 fix).
 #
 # FILES CHANGED:
-#   main.py — get_equity_snapshot_from_account(): removed
-#             `high_watermark_equity = equity` from new-day branch; added
-#             explanatory # WRONG-3 FIX comment block (already present in repo).
-#             Added this # CHANGES: header.
+#   main.py — one-word change on the backports import line (added type: ignore).
 #
 # NO OTHER LOGIC, VARIABLE NAMES, OR SIGNATURES WERE ALTERED.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,9 +37,18 @@ import logging
 import os
 import tempfile
 import time
-from datetime import date
+from datetime import datetime, date
 from pathlib import Path
 from typing import Dict, List, Optional
+
+# zoneinfo is stdlib in Python 3.9+.  The backports fallback covers Python 3.8;
+# the # type: ignore[import] suppresses the Pylance/mypy "unresolved import"
+# warning that fires on 3.9+ environments where backports.zoneinfo is not
+# installed — the except branch is simply never reached there at runtime.
+try:
+    from zoneinfo import ZoneInfo                           # Python 3.9+ stdlib
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # type: ignore[import]  # Python 3.8
 
 from adapters.alpaca_adapter import AlpacaAdapter
 from config.config import load_config
@@ -77,6 +78,10 @@ from monitoring.dashboard import (
 logger = logging.getLogger("tradebot")
 
 EQUITY_STATE_PATH = Path("equity_state.json")
+
+# US Eastern timezone constant — used to derive today_str regardless of the
+# server's local timezone, ensuring start_of_day_equity resets at 00:00 ET.
+ET = ZoneInfo("America/New_York")
 
 
 def _load_equity_state() -> dict:
@@ -143,7 +148,14 @@ def get_equity_snapshot_from_account(
     cash = float(acct.cash)
     portfolio_value = float(acct.portfolio_value)
     state = load_equity_state()
-    today_str = date.today().isoformat()
+
+    # TIMEZONE FIX: derive today_str in US Eastern time so that the daily
+    # reset fires at 00:00 ET on every server regardless of its local timezone.
+    # date.today() (old code) used the server's local clock — a CET host rolled
+    # over at 17:00 ET (30 min before market close), resetting start_of_day_equity
+    # mid-session and silently blinding the daily_loss_limit_pct guard.
+    today_str = datetime.now(tz=ET).date().isoformat()
+
     last_day = state.get("last_trading_day")
     start_of_day_equity = float(state.get("start_of_day_equity", equity))
     high_watermark_equity = float(state.get("high_watermark_equity", equity))
