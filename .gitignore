@@ -16,3 +16,11 @@ data/equity_state.json
 # Scrap / scratch files
 scrap.py
 todo.txt
+dashboard_state.pkl
+equity_state.json
+
+
+# Python cache
+__pycache__/
+*/__pycache__/
+**/__pycache__/
