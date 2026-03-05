@@ -1,4 +1,8 @@
 # CHANGES:
+# MONITOR-FIX — Passed actual `pos.stop_price` and `pos.take_profit_price` natively fetched
+#               into `log_sentiment_position_check` rather than hardcoding `None`.
+# BRACKET-TIF-FIX — Bracket orders now explicitly use `exit_time_in_force` instead of the entry TIF
+#                   so that the protective SL and TP legs persist GTC and do not expire at close.
 # FIX 3 — Added best-effort cancel attempt in execute_proposed_trade() when _wait_for_position() returns False.
 #         Wrap in try/except so the cancel attempt never raises; log both success and failure cases.
 # FIX 4D (FIX 9) — Deleted dead code line `sent_cfg = SentimentConfig(cfg.sentiment) if False else cfg.sentiment`.
@@ -155,8 +159,8 @@ def _check_and_exit_on_sentiment(
             closing=closing,
             close_reason=close_reason,
             env_mode=env_mode,
-            stop_price=None,
-            take_profit_price=None,
+            stop_price=pos.stop_price,              # MONITOR-FIX: passing active stop_price
+            take_profit_price=pos.take_profit_price, # MONITOR-FIX: passing active take_profit_price
             pnl_exit_scale_enabled=sent_cfg.pnl_exit_scale_enabled,
             pnl_exit_scale_factor=sent_cfg.pnl_exit_scale_factor,
         )
@@ -321,13 +325,15 @@ class OrderExecutor:
                 self.execution_cfg.enable_take_profit
                 and self.execution_cfg.enable_trailing_stop
             ):
+                # BRACKET-TIF-FIX: use exit_time_in_force so legs persist overnight
+                bracket_tif = self.execution_cfg.exit_time_in_force
                 order = self.adapter.submit_bracket_order(
                     symbol=symbol,
                     qty=qty,
                     side=side,
                     stop_price=proposed.stop_price,
                     take_profit_price=proposed.take_profit_price,
-                    time_in_force=tif,
+                    time_in_force=bracket_tif,
                 )
                 logger.info(
                     f"Submitted bracket order for {symbol}: {side} {qty} @ market, "

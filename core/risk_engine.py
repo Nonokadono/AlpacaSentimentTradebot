@@ -1,3 +1,9 @@
+# CHANGES:
+# MONITOR-FIX — Added stop_price and take_profit_price optional fields to PositionInfo dataclass.
+#               These fields map active protective order levels into the position state so they
+#               can be consumed by log_sentiment_position_check in the monitor.
+#               Both default to None to maintain backwards compatibility.
+
 import math
 from collections import deque
 from dataclasses import dataclass, field
@@ -37,6 +43,8 @@ class PositionInfo:
     # stays 0.0 and PnL scaling is a no-op for any position where this field
     # is not explicitly populated by PositionManager.
     avg_entry_price: float = 0.0
+    stop_price: Optional[float] = None
+    take_profit_price: Optional[float] = None
 
 
 @dataclass

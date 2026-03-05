@@ -1,10 +1,7 @@
-2----------------------------------------------------------------------------------
-
-Scrap upper and lower resistance with AI and use it in a viable capacity
-
-3----------------------------------------------------------------------------------
-
-test with different weights in composit value
+Raw discret -2 triggers chaos, sentiment is -1 at same time
+Opening compound seems to be the sentiment used at first, rather than the composit used to open the positions
+Position not actually closed when chaos exit was activated
+Stop Loss and Take profit are not being displayed in the Monitor, and are probably also not set in the bracket order
 
 
 
@@ -13,9 +10,8 @@ test with different weights in composit value
 
 
 
-You are an expert Python quant-systems auditor. I will provide you the full 
-source code of my Alpaca-based automated swing trading bot. Your task is to 
-perform a rigorous, empirical audit across the following 8 dimensions. Be 
+You are an expert Python quant-systems auditor. Use the Connector to gain insight into the Alpaca-based automated swing trading bots codebase. 
+Your task is to  perform a rigorous, empirical audit across the following 8 dimensions. Be 
 exhaustive, cite specific file names, line-level locations, and exact variable 
 or method names for every finding. Do not generalise.
 

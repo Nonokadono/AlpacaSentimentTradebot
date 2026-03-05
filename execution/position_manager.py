@@ -1,4 +1,7 @@
 # CHANGES:
+# MONITOR-FIX — PositionManager now queries open orders (`list_orders(status="open")`) alongside
+#               positions to retrieve the active trailing-stop, stop, and take-profit limits.
+#               These are mapped to `stop_price` and `take_profit_price` on PositionInfo.
 # CRASH-2 FIX — Populate avg_entry_price in the PositionInfo constructor.
 # CONFIDENCE-STORE — opening_compound now represents a tuple (compound, confidence) rather than
 #                    a scalar. PositionInfo.opening_compound remains a scalar for backward
@@ -27,6 +30,7 @@ class PositionManager:
         so downstream sentiment-exit logic has a valid entry-time baseline.
       - Populate avg_entry_price from the Alpaca position object so that
         PnL-coupled sentiment-exit threshold scaling has a valid denominator.
+      - MONITOR-FIX: Fetch open orders to bind current TP/SL prices to positions.
       - CONFIDENCE-STORE: Unpack (compound, confidence) tuples from the registry.
     """
 
@@ -54,6 +58,17 @@ class PositionManager:
             Keyed by symbol string.
         """
         raw_positions = self.adapter.list_positions()
+        
+        # MONITOR-FIX: Fetch open orders to map stop and limit prices to positions
+        open_orders = self.adapter.list_orders(status="open")
+        orders_by_symbol = {}
+        for order in open_orders:
+            sym = getattr(order, "symbol", None)
+            if sym:
+                if sym not in orders_by_symbol:
+                    orders_by_symbol[sym] = []
+                orders_by_symbol[sym].append(order)
+
         positions: Dict[str, PositionInfo] = {}
 
         for pos in raw_positions:
@@ -81,6 +96,20 @@ class PositionManager:
                 # and skips PnL scaling, preserving legacy behaviour exactly.
                 avg_entry_price: float = float(getattr(pos, "avg_entry_price", 0.0))
 
+                # MONITOR-FIX: Look up active exit legs for this position
+                current_stop: Optional[float] = None
+                current_tp: Optional[float] = None
+                for o in orders_by_symbol.get(symbol, []):
+                    o_type = getattr(o, "type", "")
+                    if o_type in ("stop", "stop_limit", "trailing_stop"):
+                        sp = getattr(o, "stop_price", None)
+                        if sp is not None:
+                            current_stop = float(sp)
+                    elif o_type == "limit":
+                        lp = getattr(o, "limit_price", None)
+                        if lp is not None:
+                            current_tp = float(lp)
+
                 positions[symbol] = PositionInfo(
                     symbol=symbol,
                     qty=qty,
@@ -89,6 +118,8 @@ class PositionManager:
                     notional=notional,
                     opening_compound=opening_compound,
                     avg_entry_price=avg_entry_price,
+                    stop_price=current_stop,
+                    take_profit_price=current_tp,
                 )
             except Exception as e:
                 logger.warning(f"PositionManager: failed to parse position {getattr(pos, 'symbol', '?')}: {e}")
