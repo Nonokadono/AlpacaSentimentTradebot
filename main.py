@@ -477,7 +477,7 @@ def main() -> None:
                 if order is not None and proposed.rejected_reason is None and proposed.qty > 0:
                     # Change 1a: record entry-time SENTIMENT score (proposed.sentiment_score)
                     # as the opening compound baseline — NOT proposed.signal_score.
-                    _opening_compounds[proposed.symbol] = proposed.sentiment_score
+                    _opening_compounds[proposed.symbol] = proposed.signal_score
                     # FIX 4A: Persist immediately so a crash/restart doesn't lose the entry record.
                     _persist_opening_compounds(_opening_compounds)
 
