@@ -1,4 +1,8 @@
 # CHANGES:
+# TASK 1.2.1 — Added Bollinger Bands configuration fields to TechnicalSignalConfig:
+#              bb_period (default 20), bb_std_dev (default 2.0), weight_rsi_mr (0.35),
+#              weight_bb_mr (0.35), weight_sma_dist_mr (0.30) for 3-factor hybrid mean
+#              reversion calculation. All fields have defaults matching task spec.
 # FIX 5 — Changed max_scale from 1.3 to 1.0 with inline comment explaining headroom safety.
 # FIX 10 — Added inline comment to max_scale explaining cap and safety rationale.
 # OA-2 — RESOLVED: Changed exit_time_in_force from "day" to "gtc" to prevent bracket and
@@ -141,6 +145,13 @@ class TechnicalSignalConfig:
     enable_volume_filter: bool = True
     obv_breakout_threshold: float = 0.0  # Minimum OBV for confirming bullish breakouts
     obv_lookback_bars: int = 20
+    # TASK 1.2.1: Bollinger Bands parameters
+    bb_period: int = 20
+    bb_std_dev: float = 2.0
+    # TASK 1.2.2: 3-factor hybrid mean reversion weights
+    weight_rsi_mr: float = 0.35      # RSI contribution to mean reversion
+    weight_bb_mr: float = 0.35       # BB contribution to mean reversion
+    weight_sma_dist_mr: float = 0.30 # SMA distance contribution (existing ma_score)
 
 
 @dataclass
