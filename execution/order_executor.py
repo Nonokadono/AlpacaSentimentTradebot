@@ -441,10 +441,15 @@ class OrderExecutor:
 
         log_sentiment_close_decision(
             symbol=position.symbol,
-            sentiment=sentiment,
-            reason=reason,
+            side=position.side,
+            qty=position.qty,
+            sentiment_score=sentiment.score,
+            confidence=sentiment.confidence,
+            explanation=sentiment.explanation,
             env_mode=env_mode,
+            reason=reason,
         )
+
 
         self._cancel_all_open_orders_for_symbol(position.symbol)
 
