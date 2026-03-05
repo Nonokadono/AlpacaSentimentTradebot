@@ -12,6 +12,9 @@
 #             _persist_opening_compounds as kwargs so the purge can execute atomically inline
 #             with sentiment-driven position closes. Updated close_all_positions_for_weekend()
 #             call to pass the same kwargs so weekend liquidation can purge baselines correctly.
+# OPENING-COMPOSITE-FIX — Modified _opening_compounds entry to save proposed.signal_score
+#                         instead of proposed.sentiment_score to check sentiment deterioration
+#                         against the technical composite used to open the position.
 
 import json
 import logging
@@ -254,10 +257,8 @@ def main() -> None:
     portfolio_builder = PortfolioBuilder(cfg, adapter, sentiment, signal_engine, risk_engine)
 
     # Registry: symbol -> sentiment_score recorded at entry time.
-    # Change 1a: stores proposed.sentiment_score (compound sentiment float) —
-    # NOT proposed.signal_score (technical composite). The exit delta check
-    # subtracts this from current sentiment.score; mixing a technical score here
-    # produced a semantically invalid cross-space comparison.
+    # OPENING-COMPOSITE-FIX: We are now saving proposed.signal_score instead of
+    # proposed.sentiment_score to check sentiment deterioration against the technical composite.
     # Persisted to equity_state.json so it survives bot restarts.
     _opening_compounds: Dict[str, float] = _load_opening_compounds()
 
@@ -475,9 +476,9 @@ def main() -> None:
                 # None guarantees we never store a sentiment baseline for a
                 # position whose fill we could not confirm.
                 if order is not None and proposed.rejected_reason is None and proposed.qty > 0:
-                    # Change 1a: record entry-time SENTIMENT score (proposed.sentiment_score)
-                    # as the opening compound baseline — NOT proposed.signal_score.
-                    _opening_compounds[proposed.symbol] = proposed.sentiment_score
+                    # OPENING-COMPOSITE-FIX: record entry-time technical composite (proposed.signal_score)
+                    # as the opening compound baseline — NOT proposed.sentiment_score.
+                    _opening_compounds[proposed.symbol] = proposed.signal_score
                     # FIX 4A: Persist immediately so a crash/restart doesn't lose the entry record.
                     _persist_opening_compounds(_opening_compounds)
 
