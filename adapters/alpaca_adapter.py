@@ -359,6 +359,29 @@ class AlpacaAdapter:
                 f"RSI/momentum may fall back to neutral defaults."
             )
         return result
+    
+    def is_pre_daily_close(self, minutes_before: int = 15) -> bool:
+        """
+        Return True if market is open AND within minutes_before of close
+        AND the close is on a weekday (Mon-Thu, weekday 0-3).
+    
+        Default 15 minutes ensures:
+        - Enough time to close all positions before 16:00 ET close
+        - Buffer for market order execution (typically 30-60 seconds)
+        - Reliable trigger within one 10-minute loop cycle
+        """
+        if not self.get_market_open():
+            return False
+        close_time = self.get_market_close_time()
+        if close_time is None:
+            return False
+        # Only fire on weekdays (Mon-Thu), not Friday (handled by is_pre_weekend_close)
+        if close_time.weekday() not in (0, 1, 2, 3):
+           return False
+        now_utc = datetime.now(timezone.utc)
+        minutes_until_close = (close_time - now_utc).total_seconds() / 60.0
+        return 0 <= minutes_until_close <= minutes_before
+
 
     # --- News sentiment inputs ---
 

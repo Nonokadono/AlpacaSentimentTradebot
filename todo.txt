@@ -1,11 +1,6 @@
-Raw discret -2 triggers chaos, sentiment is -1 at same time
-Opening compound seems to be the sentiment used at first, rather than the composit used to open the positions
+
+
 Position not actually closed when chaos exit was activated
-Stop Loss and Take profit are not being displayed in the Monitor, and are probably also not set in the bracket order
-
-
-
-
 
 
 

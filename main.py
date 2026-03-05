@@ -359,6 +359,18 @@ def main() -> None:
                 time.sleep(60)
             continue  # Re-enter the loop from a clean state on Monday open.
 
+        if adapter.is_pre_daily_close():
+            logger.warning(
+            "DAILY CLOSE DETECTED: Closing all positions before market close "
+            "to avoid overnight gap risk."
+            )
+            executor.close_all_positions_for_weekend(
+                positions,
+                cfg.env_mode,
+                opening_compounds=_opening_compounds,
+                persist_opening_compounds=_persist_opening_compounds,
+            )
+
         ks_state = kill_switch.check(snapshot)
         log_kill_switch_state(ks_state)
         if ks_state.halted:
