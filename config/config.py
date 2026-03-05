@@ -138,6 +138,9 @@ class TechnicalSignalConfig:
     # high-momentum equities (NVDA, TSLA) where EMA spread can exceed 5%.
     # 0.10 allows a graded signal up to ±10% EMA divergence.
     ema_crossover_norm_scale: float = 0.10
+    enable_volume_filter: bool = True
+    obv_breakout_threshold: float = 0.0  # Minimum OBV for confirming bullish breakouts
+    obv_lookback_bars: int = 20
 
 
 @dataclass

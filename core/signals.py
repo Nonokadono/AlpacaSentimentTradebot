@@ -192,6 +192,36 @@ class SignalEngine:
         if not recent_trs:
             return 0.0
         return sum(recent_trs) / len(recent_trs)
+    
+    def _compute_obv(self, bars: List) -> float:
+        """
+        On-Balance Volume: Cumulative volume flow weighted by price direction.
+    
+        Calculation:
+          - If close[i] > close[i-1]: OBV += volume[i]
+          - If close[i] < close[i-1]: OBV -= volume[i]
+          - If close[i] == close[i-1]: OBV unchanged
+    
+        Returns normalized OBV (divided by average volume over period).
+        """
+        if len(bars) < 2:
+            return 0.0
+    
+        obv = 0.0
+        for i in range(1, len(bars)):
+            if bars[i].c > bars[i-1].c:
+                obv += bars[i].v
+            elif bars[i].c < bars[i-1].c:
+                obv -= bars[i].v
+        # else: no change
+    
+    # Normalize by average volume to make scale-invariant
+        avg_vol = sum(b.v for b in bars) / len(bars)
+        if avg_vol == 0.0:
+            return 0.0
+    
+        return obv / avg_vol
+
 
     def _compute_rsi(self, bars: List, period: int = 14) -> float:
         """
@@ -325,12 +355,14 @@ class SignalEngine:
 
     def _compute_price_action_score(self, bars: List, current_price: float) -> float:
         """
-        Simple breakout detection:
-        If current price > highest of last N bars -> +1 (Breakout)
-        If current price < lowest of last N bars -> -1 (Breakdown)
+        WEEK 1.1: Volume-filtered breakout detection.
 
-        FIX 7: guard changed from len(bars) < lookback to len(bars) < lookback + 1
-        so that the slice bars[-lookback:-1] always contains exactly lookback bars.
+        Breakout detection with OBV confirmation:
+          1. Identify price breakout (existing logic)
+          2. If breakout detected AND enable_volume_filter=True:
+             - Calculate OBV over lookback period
+             - If OBV < threshold: return 0.0 (reject breakout)
+          3. Return ±1.0 for confirmed breakout/breakdown
         """
         # Fix M3: suppress price action score when market is closed.
         if not self.adapter.get_market_open():
@@ -346,12 +378,30 @@ class SignalEngine:
         recent_high = max(highs)
         recent_low = min(lows)
 
+        # Detect price breakout
+        breakout_signal = 0.0
         if current_price > recent_high:
-            return 1.0
+            breakout_signal = 1.0
         elif current_price < recent_low:
-            return -1.0
+           breakout_signal = -1.0
+        else:
+            return 0.0
 
-        return 0.0
+    # WEEK 1.1: Volume confirmation
+        if self.technicalcfg.enable_volume_filter and breakout_signal != 0.0:
+            obv_lookback = self.technicalcfg.obv_lookback_bars
+            obv = self._compute_obv(bars[-obv_lookback:])
+
+            # For bullish breakouts, require positive OBV trend
+            if breakout_signal > 0 and obv < self.technicalcfg.obv_breakout_threshold:
+                return 0.0  # Reject weak-volume breakout
+        
+            # For bearish breakdowns, require negative OBV trend
+            if breakout_signal < 0 and obv > -self.technicalcfg.obv_breakout_threshold:
+                return 0.0  # Reject weak-volume breakdown
+
+        return breakout_signal
+
 
     def _combine_technical_scores(
         self, mom: float, mr: float, pa: float
