@@ -1,4 +1,12 @@
 # CHANGES:
+# TASK 2.1.1 — Added MACD configuration parameters to TechnicalSignalConfig:
+#              macd_fast (default 12), macd_slow (default 26), macd_signal (default 9),
+#              macd_histogram_norm_scale (default 0.005 = 0.5% of price) for normalizing
+#              the MACD histogram component in momentum calculation.
+# TASK 2.1.2 — Added 3-factor momentum blend weights to TechnicalSignalConfig:
+#              weight_ema_mom (default 0.45), weight_macd_mom (default 0.25),
+#              weight_trend_mom (default 0.30) for composite momentum scoring.
+#              Total weights sum to 1.00 for proper normalization.
 # TASK 1.2.1 — Added Bollinger Bands configuration fields to TechnicalSignalConfig:
 #              bb_period (default 20), bb_std_dev (default 2.0), weight_rsi_mr (0.35),
 #              weight_bb_mr (0.35), weight_sma_dist_mr (0.30) for 3-factor hybrid mean
@@ -152,6 +160,15 @@ class TechnicalSignalConfig:
     weight_rsi_mr: float = 0.35      # RSI contribution to mean reversion
     weight_bb_mr: float = 0.35       # BB contribution to mean reversion
     weight_sma_dist_mr: float = 0.30 # SMA distance contribution (existing ma_score)
+    # TASK 2.1.1: MACD parameters
+    macd_fast: int = 12              # Fast EMA period for MACD line
+    macd_slow: int = 26              # Slow EMA period for MACD line
+    macd_signal: int = 9             # Signal line EMA period
+    macd_histogram_norm_scale: float = 0.005  # Normalize histogram by 0.5% of price (0.005)
+    # TASK 2.1.2: 3-factor momentum blend weights
+    weight_ema_mom: float = 0.45     # EMA crossover weight in momentum
+    weight_macd_mom: float = 0.25    # MACD histogram weight in momentum
+    weight_trend_mom: float = 0.30   # SMA-20 trend direction weight in momentum
 
 
 @dataclass
