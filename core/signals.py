@@ -1,4 +1,13 @@
 # CHANGES:
+# TASK 2.1.1 — Added _compute_macd() method implementing MACD (Moving Average Convergence Divergence)
+#              with proper EMA calculation for fast/slow lines, signal line, and histogram.
+#              Returns (macd_line, signal_line, histogram) tuple. Requires at least (slow + signal)
+#              bars for accurate calculation. Uses per-symbol MACD history for signal line EMA.
+# TASK 2.1.2 — Enhanced _normalize_momentum_trend() to compute 3-factor momentum blend:
+#              EMA crossover (45%) + MACD histogram (25%) + SMA-20 trend (30%).
+#              MACD histogram normalized by macd_histogram_norm_scale (0.005 = 0.5% of price).
+#              Positive histogram indicates bullish momentum (MACD above signal), negative indicates
+#              bearish momentum. All three factors weighted and combined into [-1, 1] range.
 # TASK 1.2.1 — Added _compute_bollinger_bands() method implementing Bollinger Bands with
 #              Bessel-corrected standard deviation. Returns (lower, middle, upper) tuple.
 # TASK 1.2.2 — Replaced static SMA-only mean reversion with 3-factor hybrid in
@@ -19,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
+from collections import defaultdict, deque
 
 import math
 
@@ -48,7 +58,7 @@ class Signal:
 class SignalEngine:
     """
     Composite technical signal engine:
-      - Momentum/trend
+      - Momentum/trend (now enhanced with MACD histogram)
       - Mean reversion (RSI / MA distance proxy)
       - Price action structure
 
@@ -66,6 +76,9 @@ class SignalEngine:
         self.adapter = adapter
         self.sentiment = sentiment
         self.technicalcfg = technicalcfg
+        # TASK 2.1.1: Per-symbol MACD history for signal line EMA smoothing
+        # Each symbol stores a deque of recent MACD line values (maxlen=50)
+        self._macd_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=50))
 
     def _compute_simple_momentum_raw(self, bars: List) -> float:
         """
@@ -134,6 +147,72 @@ class SignalEngine:
         elif current < sma:
             return -1.0
         return 0.0
+
+    def _compute_macd(self, bars: List, symbol: str = "", fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[float, float, float]:
+        """
+        TASK 2.1.1: MACD (Moving Average Convergence Divergence) calculation.
+        
+        MACD Components:
+          - MACD Line = EMA(fast) - EMA(slow)
+          - Signal Line = EMA(signal) of MACD Line
+          - Histogram = MACD Line - Signal Line
+        
+        Returns: (macd_line, signal_line, histogram)
+        
+        Requirements:
+          - Needs at least (slow + signal) bars for proper signal line calculation
+          - For production, maintains per-symbol MACD history (self._macd_history)
+          - Signal line uses Wilder's EMA smoothing over MACD line history
+        
+        MACD Semantics:
+          - Positive histogram → MACD above signal (bullish momentum)
+          - Negative histogram → MACD below signal (bearish momentum)
+          - Histogram slope change → early divergence warning
+          - Divergence: price makes new high but histogram declining → bearish signal
+        """
+        if len(bars) < slow + signal:
+            return (0.0, 0.0, 0.0)
+        
+        closes = [b.c for b in bars]
+        
+        # 1. Compute Fast EMA (default 12-period)
+        k_fast = 2.0 / (fast + 1)
+        ema_fast = sum(closes[:fast]) / fast
+        for price in closes[fast:]:
+            ema_fast = price * k_fast + ema_fast * (1.0 - k_fast)
+        
+        # 2. Compute Slow EMA (default 26-period)
+        k_slow = 2.0 / (slow + 1)
+        ema_slow = sum(closes[:slow]) / slow
+        for price in closes[slow:]:
+            ema_slow = price * k_slow + ema_slow * (1.0 - k_slow)
+        
+        # 3. MACD Line = Fast EMA - Slow EMA
+        macd_line = ema_fast - ema_slow
+        
+        # 4. Signal Line = EMA(signal) of MACD Line
+        # Use per-symbol history for proper EMA smoothing
+        if symbol:
+            hist = self._macd_history[symbol]
+            hist.append(macd_line)
+            
+            if len(hist) >= signal:
+                # Proper Wilder's EMA over MACD history
+                k_signal = 2.0 / (signal + 1)
+                signal_line = sum(list(hist)[:signal]) / signal
+                for macd_val in list(hist)[signal:]:
+                    signal_line = macd_val * k_signal + signal_line * (1.0 - k_signal)
+            else:
+                # Insufficient history: use approximation
+                signal_line = macd_line * 0.8
+        else:
+            # No symbol provided: use simplified approximation
+            signal_line = macd_line * 0.8
+        
+        # 5. Histogram = MACD Line - Signal Line
+        histogram = macd_line - signal_line
+        
+        return (macd_line, signal_line, histogram)
 
     def _compute_volatility(self, bars: List) -> float:
         """
@@ -303,35 +382,70 @@ class SignalEngine:
         rs = avg_gain / avg_loss
         return 100.0 - (100.0 / (1.0 + rs))
 
-    def _normalize_momentum_trend(self, mom_raw: float, trend_raw: float) -> float:
+    def _normalize_momentum_trend(self, mom_raw: float, trend_raw: float, bars: List, symbol: str = "") -> float:
         """
-        Blend the pre-normalised EMA-crossover momentum signal with the
-        SMA-20 trend direction signal.
-
-        mom_raw is the output of _compute_simple_momentum_raw(), which already
-        returns a value in [-1, 1] normalised by ema_crossover_norm_scale (0.10).
-        It must NOT be divided by momentum_norm_scale a second time — doing so
-        would saturate any EMA spread larger than
-            ema_crossover_norm_scale * momentum_norm_scale = 0.10 * 0.05 = 0.005
-        (i.e. a 0.5% EMA spread), collapsing a graded signal into a binary
-        sign function for typical equities where spreads are 3–8%.
-
-        FIX-DBL-NORM: direct passthrough — clamp only, no rescaling.
-        momentum_norm_scale is NOT used here; it remains the normalisation
-        denominator inside _compute_simple_momentum_raw() via the getattr
-        fallback for backward compatibility.
-
-        Blend weights (unchanged):
-            70% EMA-crossover momentum  +  30% SMA-20 trend direction
+        TASK 2.1.2: Enhanced 3-factor momentum blend.
+        
+        Momentum Components:
+          1. EMA Crossover (45%) — existing fast/slow EMA signal, already normalized
+          2. MACD Histogram (25%) — NEW: divergence and momentum confirmation
+          3. SMA-20 Trend (30%) — existing trend direction signal
+        
+        MACD Histogram Semantics:
+          - Positive histogram → bullish momentum (MACD above signal)
+          - Negative histogram → bearish momentum (MACD below signal)
+          - Histogram slope change → early divergence warning
+        
+        Normalization:
+          - Histogram typically ranges ±0.2-1.0% of price for most equities
+          - Scale by macd_histogram_norm_scale (default 0.005 = 0.5% of price)
+          - Clamp to [-1, 1] after scaling
+        
+        Blend Weights (configurable):
+          - weight_ema_mom: 0.45 (EMA crossover momentum)
+          - weight_macd_mom: 0.25 (MACD histogram)
+          - weight_trend_mom: 0.30 (SMA-20 trend direction)
         """
-        # FIX-DBL-NORM: mom_raw is already a normalised EMA-crossover signal
-        # in [-1, 1].  Clamp defensively; do not divide by momentum_norm_scale.
+        # 1. EMA Crossover Component (existing, already normalized to [-1, 1])
         mom_score = max(-1.0, min(1.0, mom_raw))
-
-        # Combine with trend (-1 or 1)
-        # 70% momentum value, 30% trend direction
-        combined = 0.7 * mom_score + 0.3 * trend_raw
-        return combined
+        
+        # 2. NEW: MACD Histogram Component
+        macd_fast = getattr(self.technicalcfg, "macd_fast", 12)
+        macd_slow = getattr(self.technicalcfg, "macd_slow", 26)
+        macd_signal = getattr(self.technicalcfg, "macd_signal", 9)
+        
+        _, _, histogram = self._compute_macd(
+            bars,
+            symbol=symbol,
+            fast=macd_fast,
+            slow=macd_slow,
+            signal=macd_signal
+        )
+        
+        macd_score = 0.0
+        last_price = bars[-1].c if bars else 0.0
+        if last_price > 0:
+            # Normalize histogram as % of price
+            macd_pct = histogram / last_price
+            macd_histogram_norm_scale = getattr(self.technicalcfg, "macd_histogram_norm_scale", 0.005)
+            macd_norm = macd_pct / macd_histogram_norm_scale
+            macd_score = max(-1.0, min(1.0, macd_norm))
+        
+        # 3. Trend Direction Component (existing SMA-20 logic, already ±1.0)
+        trend_score = trend_raw
+        
+        # Weighted blend with configurable weights
+        weight_ema_mom = getattr(self.technicalcfg, "weight_ema_mom", 0.45)
+        weight_macd_mom = getattr(self.technicalcfg, "weight_macd_mom", 0.25)
+        weight_trend_mom = getattr(self.technicalcfg, "weight_trend_mom", 0.30)
+        
+        composite = (
+            weight_ema_mom * mom_score +
+            weight_macd_mom * macd_score +
+            weight_trend_mom * trend_score
+        )
+        
+        return max(-1.0, min(1.0, composite))
 
     def _normalize_mean_reversion(self, current_price: float, bars: List, rsi: float) -> float:
         """
@@ -664,7 +778,8 @@ class SignalEngine:
         volatility = self._compute_volatility(bars)
         rsi = self._compute_rsi(bars)
 
-        momentum_score = self._normalize_momentum_trend(momentum_raw, trend_raw)
+        # TASK 2.1.2: Enhanced momentum calculation with MACD histogram (pass symbol for history)
+        momentum_score = self._normalize_momentum_trend(momentum_raw, trend_raw, bars, symbol=symbol)
         mean_reversion_score = self._normalize_mean_reversion(last_trade, bars, rsi)
         price_action_score = self._compute_price_action_score(bars, last_trade)
 
