@@ -1,4 +1,10 @@
 # CHANGES:
+# TASK 1.2.1 — Added _compute_bollinger_bands() method implementing Bollinger Bands with
+#              Bessel-corrected standard deviation. Returns (lower, middle, upper) tuple.
+# TASK 1.2.2 — Replaced static SMA-only mean reversion with 3-factor hybrid in
+#              _normalize_mean_reversion(). New blend: RSI (35%) + Bollinger Bands (35%)
+#              + SMA distance (30%). BB Z-score inverted so price near lower band → positive
+#              MR signal (expect bounce), price near upper band → negative signal (pullback).
 # FIX 2 — Added last_price: float = 0.0 field to Signal dataclass; populated in generate_signal_for_symbol().
 # FIX 6 — Replaced _compute_volatility()-based vol_px with _compute_atr() in _decide_side_and_bands().
 # FIX 7 — Changed guard from len(bars) < lookback to len(bars) < lookback + 1 in _compute_price_action_score().
@@ -222,6 +228,34 @@ class SignalEngine:
     
         return obv / avg_vol
 
+    def _compute_bollinger_bands(self, bars: List, period: int = 20, std_dev: float = 2.0) -> Tuple[float, float, float]:
+        """
+        TASK 1.2.1: Bollinger Bands calculation.
+        
+        Bollinger Bands: SMA(period) ± std_dev * StdDev(period)
+        
+        Returns: (lower_band, middle_band, upper_band)
+        
+        - Middle Band: SMA of last `period` closes
+        - Upper Band: Middle + (std_dev * standard deviation)
+        - Lower Band: Middle - (std_dev * standard deviation)
+        
+        Uses Bessel's correction for std dev (divide by n-1).
+        """
+        if len(bars) < period:
+            return (0.0, 0.0, 0.0)
+        
+        closes = [b.c for b in bars[-period:]]
+        middle = sum(closes) / period
+        
+        # Bessel-corrected standard deviation
+        variance = sum((c - middle) ** 2 for c in closes) / (period - 1)
+        std = math.sqrt(variance)
+        
+        lower = middle - std_dev * std
+        upper = middle + std_dev * std
+        
+        return (lower, middle, upper)
 
     def _compute_rsi(self, bars: List, period: int = 14) -> float:
         """
@@ -301,7 +335,15 @@ class SignalEngine:
 
     def _normalize_mean_reversion(self, current_price: float, bars: List, rsi: float) -> float:
         """
-        Mean reversion score:
+        TASK 1.2.2: Hybrid mean reversion = RSI (35%) + Bollinger Bands (35%) + SMA distance (30%)
+        
+        BB Z-Score Logic:
+          - Price near lower band → positive MR signal (expect bounce)
+          - Price near upper band → negative MR signal (expect pullback)
+          - Z-score = (price - middle) / (band_width / 4)
+          - Inverted to match MR semantics (high price → negative signal)
+        
+        RSI Component (existing logic):
         High RSI (> rsi_overbought) -> Negative score (expect pullback)
         Low RSI  (< rsi_oversold)   -> Positive score (expect bounce)
 
@@ -326,7 +368,7 @@ class SignalEngine:
         ob = self.technicalcfg.rsi_overbought
         os = self.technicalcfg.rsi_oversold
 
-        # RSI component — FIX-RSI-THRESH: config-sourced thresholds and denominators
+        # 1. RSI Component — FIX-RSI-THRESH: config-sourced thresholds and denominators
         rsi_score = 0.0
         if rsi > ob:
             # Normalise over the distance from threshold to maximum (100).
@@ -337,21 +379,43 @@ class SignalEngine:
             # e.g. default: RSI=25, os=30 → +1.0*(30-25)/30 = +0.167
             rsi_score = 1.0 * (os - rsi) / os
 
-        # MA distance component
+        # 2. NEW: Bollinger Bands Component
+        bb_period = getattr(self.technicalcfg, "bb_period", 20)
+        bb_std_dev = getattr(self.technicalcfg, "bb_std_dev", 2.0)
+        lower, middle, upper = self._compute_bollinger_bands(bars, period=bb_period, std_dev=bb_std_dev)
+        
+        bb_score = 0.0
+        if upper > lower:
+            band_width = upper - lower
+            # Z-score normalized to ±1 range (4 std devs = full band width)
+            bb_zscore = (current_price - middle) / (band_width / 4.0) if band_width > 0 else 0.0
+            # Invert: price above upper band (zscore > +1) → negative MR signal
+            bb_score = -1.0 * max(-1.0, min(1.0, bb_zscore))
+
+        # 3. SMA Distance Component (existing ma_score logic)
         if len(bars) < 20:
             ma_score = 0.0
         else:
             closes = [b.c for b in bars[-20:]]
             sma = sum(closes) / len(closes)
             # (price - sma) / sma
-            dist = (current_price - sma) / sma
+            dist = (current_price - sma) / sma if sma > 0 else 0.0
             # if dist is +1%, score is negative (revert)
             # scale: 0.05 (5%) -> full -1.0
             ma_score = -1.0 * (dist / self.technicalcfg.ma_distance_norm_scale)
             # FIX 6: clamp ma_score independently before blending
             ma_score = max(-1.0, min(1.0, ma_score))
 
-        return max(-1.0, min(1.0, 0.5 * rsi_score + 0.5 * ma_score))
+        # Weighted blend
+        weight_rsi_mr = getattr(self.technicalcfg, "weight_rsi_mr", 0.35)
+        weight_bb_mr = getattr(self.technicalcfg, "weight_bb_mr", 0.35)
+        weight_sma_dist_mr = getattr(self.technicalcfg, "weight_sma_dist_mr", 0.30)
+        
+        composite = (weight_rsi_mr * rsi_score +
+                     weight_bb_mr * bb_score +
+                     weight_sma_dist_mr * ma_score)
+        
+        return max(-1.0, min(1.0, composite))
 
     def _compute_price_action_score(self, bars: List, current_price: float) -> float:
         """
