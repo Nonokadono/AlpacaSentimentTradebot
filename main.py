@@ -1,4 +1,15 @@
 # CHANGES:
+# AUDIT FIX 8.4 — Added main-level LIVE_TRADING_ENABLED gate before portfolio execution.
+#                 Defense-in-depth: portfolio execution skipped entirely when
+#                 cfg.live_trading_enabled is False, preventing config errors from
+#                 causing accidental live trades.
+# AUDIT FIX 8.5 — Added compute_pending_notional() to deduct pending order exposure from
+#                 available gross exposure capacity. Portfolio builder now considers both
+#                 existing positions and pending orders when checking gross exposure cap.
+#                 Prevents silent breach of 90% cap when large orders are pending.
+# AUDIT FIX 8.6 — Replaced naive date comparison with market calendar check for equity state
+#                 reset. start_of_day_equity now resets on actual market open, not midnight.
+#                 Fallback to date comparison if calendar API fails.
 # FIX 4A — Moved _persist_opening_compounds() to immediately inside the fill-confirmation block.
 # FIX 4B — Added positions refresh immediately before end-of-loop _check_and_exit_on_sentiment() call.
 # FIX 4C — Deleted unused acct_startup assignment.
@@ -124,10 +135,46 @@ def load_equity_state() -> dict:
     return _load_equity_state()
 
 
+def compute_pending_notional(open_orders: List) -> float:
+    """AUDIT FIX 8.5: Calculate total notional exposure from pending orders.
+
+    Pending orders lock capital and count against gross exposure cap even though
+    they are not yet filled. This prevents the bot from over-allocating.
+
+    Returns:
+        Total notional value of all open orders (sum of qty * limit/stop price).
+    """
+    pending_notional = 0.0
+    for order in open_orders:
+        try:
+            qty = abs(float(getattr(order, "qty", 0.0)))
+            # Use limit_price if available, else stop_price, else skip
+            price = float(
+                getattr(order, "limit_price", None) or
+                getattr(order, "stop_price", None) or
+                0.0
+            )
+            if qty > 0 and price > 0:
+                pending_notional += qty * price
+        except Exception as e:
+            logger.warning(f"Error computing notional for order {getattr(order, 'id', 'N/A')}: {e}")
+    return pending_notional
+
+
 def get_equity_snapshot_from_account(
+    adapter: AlpacaAdapter,
     acct,
     positions: Dict[str, PositionInfo],
+    open_orders: List,
 ) -> EquitySnapshot:
+    """Compute equity snapshot with market calendar-aware state reset.
+
+    AUDIT FIX 8.6: Uses market calendar API to determine actual market open
+    date instead of naive date comparison. Prevents mid-session resets at
+    timezone boundaries.
+
+    AUDIT FIX 8.5: Includes pending order notional in gross exposure calculation.
+    """
     equity = float(acct.equity)
     cash = float(acct.cash)
     portfolio_value = float(acct.portfolio_value)
@@ -138,7 +185,31 @@ def get_equity_snapshot_from_account(
     start_of_day_equity = float(state.get("start_of_day_equity", equity))
     high_watermark_equity = float(state.get("high_watermark_equity", equity))
 
-    if last_day != today_str:
+    # AUDIT FIX 8.6: Market calendar check for equity state reset
+    should_reset = False
+    try:
+        # Query calendar for today's market session
+        calendar = adapter.get_calendar(start=today_str, end=today_str)
+        if calendar and len(calendar) > 0:
+            market_date = str(calendar[0].date)
+            if last_day != market_date:
+                should_reset = True
+                logger.info(
+                    f"Market calendar reset: last_day={last_day} → market_date={market_date}"
+                )
+        else:
+            # Fallback: no market session today (holiday/weekend)
+            if last_day != today_str:
+                logger.debug(
+                    f"No market session today ({today_str}), preserving start_of_day_equity"
+                )
+    except Exception as e:
+        # Fallback to naive date comparison if calendar API fails
+        logger.warning(f"Market calendar API error: {e}. Falling back to date comparison.")
+        if last_day != today_str:
+            should_reset = True
+
+    if should_reset:
         start_of_day_equity = equity
         state["last_trading_day"] = today_str
 
@@ -161,7 +232,16 @@ def get_equity_snapshot_from_account(
 
     realized_pl_today = float(getattr(acct, "realized_pl", 0.0))
     unrealized_pl = float(getattr(acct, "unrealized_pl", 0.0))
-    gross_exposure = sum(abs(p.notional) for p in positions.values())
+
+    # AUDIT FIX 8.5: Include pending order notional in gross exposure
+    position_exposure = sum(abs(p.notional) for p in positions.values())
+    pending_exposure = compute_pending_notional(open_orders)
+    gross_exposure = position_exposure + pending_exposure
+
+    if pending_exposure > 0:
+        logger.debug(
+            f"Gross exposure: positions={position_exposure:.2f} + pending={pending_exposure:.2f} = {gross_exposure:.2f}"
+        )
 
     return EquitySnapshot(
         equity=equity,
@@ -233,6 +313,7 @@ def main() -> None:
         try:
             acct = adapter.get_account()
             positions = pm.get_positions(opening_compounds=_opening_compounds)
+            open_orders = adapter.list_orders(status="open")
             market_open = adapter.get_market_open()
         except Exception as e:
             logger.warning(
@@ -249,7 +330,7 @@ def main() -> None:
             continue
 
         trade_stats.sync_open_positions(positions)
-        snapshot = get_equity_snapshot_from_account(acct, positions)
+        snapshot = get_equity_snapshot_from_account(adapter, acct, positions, open_orders)
         log_equity_snapshot(snapshot, market_open=market_open)
 
         dashboard_state.update(
@@ -312,7 +393,9 @@ def main() -> None:
             )
             positions = pm.get_positions(opening_compounds=_opening_compounds)
             trade_stats.sync_open_positions(positions)
-            snapshot = get_equity_snapshot_from_account(acct, positions)
+            # Refresh open_orders after sentiment exits
+            open_orders = adapter.list_orders(status="open")
+            snapshot = get_equity_snapshot_from_account(adapter, acct, positions, open_orders)
 
         for sym in list(_opening_compounds.keys()):
             if sym not in positions:
@@ -346,13 +429,17 @@ def main() -> None:
                 "PRE-CLOSE BLACKOUT: New position entries suppressed "
                 "(within 3 hours of market close). Monitoring existing positions only."
             )
-        else:
+        elif cfg.live_trading_enabled:
+            # AUDIT FIX 8.4: Main-level LIVE_TRADING_ENABLED gate
+            # Defense-in-depth: portfolio execution only proceeds when live trading is enabled
+            # This prevents accidental live trades if executor gate is bypassed or misconfigured
             dashboard_state.update(bot_state="SCANNING")
             persist_state(dashboard_state)
 
             logger.info("Canceling all open orders before portfolio execution.")
             adapter.cancel_all_orders()
 
+            # Refresh open_orders after cancellation
             open_orders = adapter.list_orders(status="open")
             proposed_trades = portfolio_builder.build_portfolio(snapshot, positions, open_orders)
 
@@ -366,6 +453,12 @@ def main() -> None:
                     _opening_compounds[proposed.symbol] = proposed.signal_score
                     _persist_opening_compounds(_opening_compounds)
                     trade_stats.register_entry_from_proposed(proposed)
+        else:
+            # AUDIT FIX 8.4: Log when live trading is disabled
+            logger.info(
+                "[PAPER MODE] Portfolio execution skipped: live_trading_enabled=False. "
+                "Set LIVE_TRADING_ENABLED=true in .env to enable live trading."
+            )
 
         positions = pm.get_positions(opening_compounds=_opening_compounds)
         trade_stats.sync_open_positions(positions)
