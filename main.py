@@ -1,4 +1,9 @@
 # CHANGES:
+# CLOSED-MARKET-GATE-FIX — Added a hard early-continue gate when the market is closed so the
+#                          loop cannot proceed into kill switch checks, order cancellation,
+#                          data pulls, or portfolio execution on a closed session.
+# CLOCK-CONSISTENCY-FIX — Reused the single loop market_open snapshot for the normal closed-market
+#                         path to avoid contradictory open/closed behavior within one iteration.
 # FIX 4A — Moved _persist_opening_compounds() to immediately inside the fill-confirmation block.
 # FIX 4B — Added positions refresh immediately before end-of-loop _check_and_exit_on_sentiment() call.
 # FIX 4C — Deleted unused acct_startup assignment.
@@ -278,6 +283,12 @@ def main() -> None:
             persist_state(dashboard_state)
             while not adapter.get_market_open():
                 time.sleep(60)
+            continue
+
+        if not market_open:
+            dashboard_state.update(bot_state="IDLE")
+            persist_state(dashboard_state)
+            time.sleep(60)
             continue
 
         if adapter.is_pre_daily_close():
