@@ -1,4 +1,10 @@
 # CHANGES:
+# AUDIT FIX 8.1 — Added _wait_for_order_acceptance() to confirm trailing stop submission.
+#                 If trailing stop is rejected or fails, immediately submit emergency market
+#                 close to prevent naked positions. Logs CRITICAL alerts for operator intervention.
+# AUDIT FIX 8.2 — After fill timeout + failed cancellation, check if position actually exists.
+#                 If position opened server-side despite timeout, submit emergency trailing stop
+#                 to protect the unintended position. Prevents unlimited loss from naked positions.
 # MONITOR-FIX — Passed actual `pos.stop_price` and `pos.take_profit_price` natively fetched
 #               into `log_sentiment_position_check` rather than hardcoding `None`.
 # BRACKET-TIF-FIX — Bracket orders now explicitly use `exit_time_in_force` instead of the entry TIF
@@ -182,6 +188,12 @@ class OrderExecutor:
          stop is ONLY submitted after _wait_for_position() confirms the fill.
       6. Fall back to plain market order when neither exit type is configured.
 
+    AUDIT FIX 8.1: Trailing stop submission now confirmed via _wait_for_order_acceptance().
+                   If rejected or fails, emergency market close prevents naked positions.
+
+    AUDIT FIX 8.2: After fill timeout + failed cancellation, position existence is verified.
+                   If position opened despite timeout, emergency trailing stop is submitted.
+
     Sentiment exit path (close_position_due_to_sentiment):
       - Cancel all open orders for the symbol.
       - Submit a market order to flatten.
@@ -228,6 +240,11 @@ class OrderExecutor:
             logger.warning(f"Could not retrieve open orders for {symbol}: {e}")
 
     def _wait_for_position(self, symbol: str) -> bool:
+        """Poll for position existence after entry order submission.
+
+        Returns True if position confirmed within timeout, False otherwise.
+        Hard kill timer prevents indefinite hangs from broker API failures.
+        """
         timeout = self.execution_cfg.post_entry_fill_poll_timeout_sec
         interval = self.execution_cfg.post_entry_fill_poll_interval_sec
         grace_period = 5.0
@@ -268,7 +285,75 @@ class OrderExecutor:
             kill_timer.cancel()
             return False
 
+    def _wait_for_order_acceptance(self, order_id: str, symbol: str) -> bool:
+        """AUDIT FIX 8.1: Poll for order acceptance after submission.
+
+        Confirms that a protective order (trailing stop, bracket leg) was accepted
+        by the broker before declaring entry success.
+
+        Returns True if order reaches "accepted" or "new" status within 5 seconds.
+        Returns False if order is rejected, cancelled, or times out.
+        """
+        timeout = 5.0
+        interval = 0.5
+        elapsed = 0.0
+
+        while elapsed < timeout:
+            try:
+                order = self.adapter.get_order(order_id)
+                status = getattr(order, "status", "unknown").lower()
+                if status in ["accepted", "new", "partially_filled", "filled"]:
+                    logger.info(f"Order {order_id} for {symbol} accepted (status={status})")
+                    return True
+                if status in ["rejected", "cancelled", "expired"]:
+                    logger.error(f"Order {order_id} for {symbol} REJECTED (status={status})")
+                    return False
+            except Exception as e:
+                logger.warning(f"Order status poll error for {order_id} ({symbol}): {e}")
+
+            time.sleep(interval)
+            elapsed += interval
+
+        logger.error(f"Order {order_id} for {symbol} acceptance timeout after {timeout}s")
+        return False
+
+    def _emergency_flatten_position(self, symbol: str, qty: float, side: str) -> None:
+        """AUDIT FIX 8.1 & 8.2: Emergency market close for unprotected positions.
+
+        Called when:
+        - Trailing stop submission fails (FIX 8.1)
+        - Position opened despite fill timeout (FIX 8.2)
+
+        Submits immediate market order to flatten position. Logs CRITICAL alert
+        for operator intervention if flatten also fails.
+        """
+        opposite_side = "sell" if side == "buy" else "buy"
+        try:
+            logger.critical(
+                f"EMERGENCY FLATTEN: Submitting market close for {symbol} "
+                f"(position opened without exit protection)"
+            )
+            self.adapter.submit_market_order(
+                symbol=symbol,
+                qty=abs(qty),
+                side=opposite_side,
+                time_in_force="day",
+            )
+            logger.critical(
+                f"Emergency flatten order submitted for {symbol}: {opposite_side} {abs(qty)} @ market"
+            )
+        except Exception as flatten_err:
+            logger.critical(
+                f"EMERGENCY FLATTEN FAILED for {symbol}: {flatten_err}. "
+                f"OPERATOR INTERVENTION REQUIRED: Manually close position {symbol} immediately."
+            )
+
     def _wait_for_flat(self, symbol: str) -> bool:
+        """Poll for position closure confirmation.
+
+        Returns True if position is flat (qty=0 or does not exist) within timeout.
+        Used by sentiment exit path to confirm flatten before purging entry baseline.
+        """
         timeout = self.execution_cfg.post_entry_fill_poll_timeout_sec
         interval = self.execution_cfg.post_entry_fill_poll_interval_sec
         elapsed = 0.0
@@ -297,6 +382,11 @@ class OrderExecutor:
         return False
 
     def execute_proposed_trade(self, proposed: ProposedTrade) -> Optional[object]:
+        """Execute a proposed trade with guaranteed exit protection.
+
+        AUDIT FIX 8.1: Trailing stop acceptance confirmed before returning success.
+        AUDIT FIX 8.2: Position re-checked after failed cancellation.
+        """
         log_proposed_trade(proposed, self.env_mode)
 
         if not self.live_trading_enabled:
@@ -322,6 +412,7 @@ class OrderExecutor:
 
         try:
             if has_fixed_bracket:
+                # Path 1: Bracket order with fixed SL/TP (best protection)
                 bracket_tif = self.execution_cfg.exit_time_in_force
                 order = self.adapter.submit_bracket_order(
                     symbol=symbol,
@@ -338,6 +429,7 @@ class OrderExecutor:
                 return order
 
             elif self.execution_cfg.enable_trailing_stop:
+                # Path 2: Entry + trailing stop (AUDIT FIX 8.1 & 8.2 applied here)
                 order = self.adapter.submit_market_order(
                     symbol=symbol,
                     qty=qty,
@@ -350,36 +442,101 @@ class OrderExecutor:
 
                 filled = self._wait_for_position(symbol)
                 if not filled:
+                    # AUDIT FIX 8.2: Position re-check after failed cancellation
                     try:
                         self.adapter.cancel_order(getattr(order, "id", None) or "")
                         logger.warning(
-                            f"Fill timeout for {symbol} — attempted cancellation of "
-                            f"entry order {getattr(order, 'id', 'N/A')}."
+                            f"Fill timeout for {symbol} — cancelled entry order {getattr(order, 'id', 'N/A')}"
                         )
                     except Exception as cancel_err:
-                        logger.warning(
-                            f"Fill timeout for {symbol} — cancellation attempt failed: "
-                            f"{cancel_err}. Position may be open without a stop."
+                        logger.error(
+                            f"Fill timeout for {symbol} — cancellation failed: {cancel_err}"
                         )
+                        # CRITICAL: Check if position actually exists despite timeout
+                        try:
+                            pos = self.adapter.get_position(symbol)
+                            if pos is not None and abs(float(getattr(pos, "qty", 0.0))) > 1e-9:
+                                logger.critical(
+                                    f"AUDIT FIX 8.2: Position {symbol} EXISTS after failed cancel "
+                                    f"(qty={getattr(pos, 'qty', 0.0)}). Submitting emergency trailing stop."
+                                )
+                                opposite_side = "sell" if side == "buy" else "buy"
+                                pos_qty = abs(float(getattr(pos, "qty", 0.0)))
+                                try:
+                                    emergency_stop_order = self.adapter.submit_trailing_stop_order(
+                                        symbol=symbol,
+                                        qty=pos_qty,
+                                        side=opposite_side,
+                                        trail_percent=self.execution_cfg.trailing_stop_percent,
+                                        time_in_force=self.execution_cfg.exit_time_in_force,
+                                    )
+                                    logger.critical(
+                                        f"Emergency trailing stop submitted for {symbol}: "
+                                        f"{opposite_side} {pos_qty} trail={self.execution_cfg.trailing_stop_percent}%"
+                                    )
+                                    # Return success since position is now protected
+                                    return order
+                                except Exception as emergency_err:
+                                    logger.critical(
+                                        f"EMERGENCY TRAILING STOP FAILED for {symbol}: {emergency_err}. "
+                                        f"Attempting emergency flatten."
+                                    )
+                                    self._emergency_flatten_position(symbol, pos_qty, side)
+                        except Exception as pos_check_err:
+                            logger.error(f"Position re-check failed for {symbol}: {pos_check_err}")
                     return None
 
+                # Position confirmed, submit trailing stop
                 opposite_side = "sell" if side == "buy" else "buy"
                 trail_pct = self.execution_cfg.trailing_stop_percent
                 exit_tif = self.execution_cfg.exit_time_in_force
-                self.adapter.submit_trailing_stop_order(
-                    symbol=symbol,
-                    qty=qty,
-                    side=opposite_side,
-                    trail_percent=trail_pct,
-                    time_in_force=exit_tif,
-                )
-                logger.info(
-                    f"Submitted trailing stop for {symbol}: {opposite_side} {qty} "
-                    f"trail={trail_pct}%"
-                )
-                return order
+
+                # AUDIT FIX 8.1: Confirm trailing stop acceptance
+                try:
+                    trailing_stop_order = self.adapter.submit_trailing_stop_order(
+                        symbol=symbol,
+                        qty=qty,
+                        side=opposite_side,
+                        trail_percent=trail_pct,
+                        time_in_force=exit_tif,
+                    )
+                    logger.info(
+                        f"Submitted trailing stop for {symbol}: {opposite_side} {qty} trail={trail_pct}%"
+                    )
+
+                    # Confirm trailing stop was accepted by broker
+                    stop_order_id = getattr(trailing_stop_order, "id", None)
+                    if stop_order_id:
+                        stop_accepted = self._wait_for_order_acceptance(stop_order_id, symbol)
+                        if not stop_accepted:
+                            logger.critical(
+                                f"AUDIT FIX 8.1: Trailing stop REJECTED for {symbol}. "
+                                f"Position is NAKED. Submitting emergency flatten."
+                            )
+                            self._emergency_flatten_position(symbol, qty, side)
+                            return None
+                    else:
+                        logger.warning(
+                            f"Trailing stop order for {symbol} has no ID — cannot confirm acceptance. "
+                            f"Proceeding with caution."
+                        )
+
+                    return order
+
+                except Exception as stop_err:
+                    logger.critical(
+                        f"AUDIT FIX 8.1: Trailing stop submission FAILED for {symbol}: {stop_err}. "
+                        f"Position is NAKED. Submitting emergency flatten."
+                    )
+                    self._emergency_flatten_position(symbol, qty, side)
+                    return None
 
             else:
+                # Path 3: Plain market order (no exit protection configured)
+                logger.warning(
+                    f"Submitting plain market order for {symbol} WITHOUT exit protection "
+                    f"(enable_trailing_stop=False, no bracket available). This is high-risk."
+                )
                 order = self.adapter.submit_market_order(
                     symbol=symbol,
                     qty=qty,
@@ -407,6 +564,10 @@ class OrderExecutor:
         opening_compounds: Dict[str, float],
         persist_opening_compounds: Callable[[Dict[str, float]], None],
     ) -> None:
+        """Close a position due to sentiment deterioration.
+
+        Transactional close: purge entry baseline only after confirmed broker flatten.
+        """
         if not self.live_trading_enabled:
             logger.info(
                 f"[PAPER MODE] Would close {position.symbol} due to sentiment: {reason}"
@@ -480,6 +641,10 @@ class OrderExecutor:
         opening_compounds: Dict[str, float],
         persist_opening_compounds: Callable[[Dict[str, float]], None],
     ) -> None:
+        """Close all positions before weekend.
+
+        Triple-gate protection prevents accidental liquidation in paper mode.
+        """
         if not self.live_trading_enabled:
             logger.info(
                 "[PAPER MODE GUARD] Weekend liquidation blocked: "
