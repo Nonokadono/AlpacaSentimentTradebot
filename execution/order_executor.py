@@ -17,6 +17,8 @@
 #                       are available, without incorrectly depending on enable_trailing_stop.
 # FLAT-CONFIRM-FIX — Added _wait_for_flat() and use it before declaring a close successful or
 #                    purging the persisted entry baseline.
+# TRADE-STATS-INTEGRATION — Sentiment-driven closes now notify TradeStatsTracker after confirmed
+#                           broker flatten so closed-trade analytics stay synchronized with bot exits.
 
 import logging
 import time
@@ -34,6 +36,7 @@ from monitoring.monitor import (
     log_sentiment_close_decision,
     log_sentiment_position_check,
 )
+from monitoring.trade_stats import TradeStatsTracker
 
 logger = logging.getLogger("tradebot")
 
@@ -89,16 +92,13 @@ def _check_and_exit_on_sentiment(
         opening_compound = float(opening_compounds.get(symbol, 0.0))
         current_score = float(current_sentiment.score)
 
-        # Side-aware delta so shorts exit on improving sentiment.
         if pos.side == "long":
             delta = float(opening_compound - current_score)
-        else:  # short
+        else:
             delta = float(current_score - opening_compound)
 
-        # --- PnL-Coupled Sentiment Exit Threshold Scaling ---
         if pos.avg_entry_price > 0.0:
             raw_pnl_pct = (pos.market_price - pos.avg_entry_price) / pos.avg_entry_price
-            # Short positions gain when price falls, so flip the sign.
             unrealised_pnl_pct = -raw_pnl_pct if pos.side == "short" else raw_pnl_pct
         else:
             unrealised_pnl_pct = 0.0
@@ -114,7 +114,6 @@ def _check_and_exit_on_sentiment(
         else:
             effective_soft_threshold = sent_cfg.soft_exit_delta_threshold
             effective_strong_threshold = sent_cfg.strong_exit_delta_threshold
-        # -----------------------------------------------------
 
         hard_exit = current_sentiment.raw_discrete == -2
         strong_exit = (
@@ -151,8 +150,8 @@ def _check_and_exit_on_sentiment(
             closing=closing,
             close_reason=close_reason,
             env_mode=env_mode,
-            stop_price=pos.stop_price,               # MONITOR-FIX: passing active stop_price
-            take_profit_price=pos.take_profit_price, # MONITOR-FIX: passing active take_profit_price
+            stop_price=pos.stop_price,
+            take_profit_price=pos.take_profit_price,
             pnl_exit_scale_enabled=sent_cfg.pnl_exit_scale_enabled,
             pnl_exit_scale_factor=sent_cfg.pnl_exit_scale_factor,
         )
@@ -207,8 +206,7 @@ class OrderExecutor:
         self.env_mode = env_mode
         self.live_trading_enabled = live_trading_enabled
         self.execution_cfg = execution_cfg
-
-    # ── Internal helpers ──────────────────────────────────────────────────────
+        self.trade_stats = TradeStatsTracker()
 
     def _cancel_all_open_orders_for_symbol(self, symbol: str) -> None:
         """Cancel every open order for *symbol*. Errors are logged and swallowed."""
@@ -230,18 +228,6 @@ class OrderExecutor:
             logger.warning(f"Could not retrieve open orders for {symbol}: {e}")
 
     def _wait_for_position(self, symbol: str) -> bool:
-        """
-        Poll for up to post_entry_fill_poll_timeout_sec seconds (default 30s)
-        to confirm that the position appears in the broker's positions list.
-
-        WAIT-TIMEOUT-FIX: Spawns a daemon threading.Timer that fires after
-        timeout + 5s grace period. If the timer expires, it logs a CRITICAL
-        error and raises SystemExit to force-terminate the bot. This prevents
-        an indefinite hang if Alpaca's REST endpoint stops responding.
-
-        The timer is cancelled immediately upon successful position confirmation
-        so normal operation is unaffected.
-        """
         timeout = self.execution_cfg.post_entry_fill_poll_timeout_sec
         interval = self.execution_cfg.post_entry_fill_poll_interval_sec
         grace_period = 5.0
@@ -283,13 +269,6 @@ class OrderExecutor:
             return False
 
     def _wait_for_flat(self, symbol: str) -> bool:
-        """Poll until the broker reports that *symbol* no longer has an open position.
-
-        Returns True once get_position(symbol) returns None or a zero quantity;
-        otherwise returns False after the same configured polling timeout used by
-        _wait_for_position(). Errors are logged and treated as retryable within
-        the timeout window.
-        """
         timeout = self.execution_cfg.post_entry_fill_poll_timeout_sec
         interval = self.execution_cfg.post_entry_fill_poll_interval_sec
         elapsed = 0.0
@@ -317,17 +296,7 @@ class OrderExecutor:
         )
         return False
 
-    # ── Entry paths ───────────────────────────────────────────────────────────
-
     def execute_proposed_trade(self, proposed: ProposedTrade) -> Optional[object]:
-        """
-        Submit entry order (and attached exit orders when configured).
-
-        Returns the order object on success, None on failure or paper-mode skip.
-
-        FIX 3: When _wait_for_position() times out in the trailing-stop path,
-        we now attempt to cancel the entry order before returning None.
-        """
         log_proposed_trade(proposed, self.env_mode)
 
         if not self.live_trading_enabled:
@@ -352,9 +321,7 @@ class OrderExecutor:
         )
 
         try:
-            # Path 1: Bracket order (atomic TP + stop)
             if has_fixed_bracket:
-                # BRACKET-TIF-FIX: use exit_time_in_force so legs persist overnight
                 bracket_tif = self.execution_cfg.exit_time_in_force
                 order = self.adapter.submit_bracket_order(
                     symbol=symbol,
@@ -370,7 +337,6 @@ class OrderExecutor:
                 )
                 return order
 
-            # Path 2: Entry + trailing stop (requires fill confirmation)
             elif self.execution_cfg.enable_trailing_stop:
                 order = self.adapter.submit_market_order(
                     symbol=symbol,
@@ -384,7 +350,6 @@ class OrderExecutor:
 
                 filled = self._wait_for_position(symbol)
                 if not filled:
-                    # FIX 3: attempt to cancel the entry order before returning None
                     try:
                         self.adapter.cancel_order(getattr(order, "id", None) or "")
                         logger.warning(
@@ -398,7 +363,6 @@ class OrderExecutor:
                         )
                     return None
 
-                # Fill confirmed — submit trailing stop
                 opposite_side = "sell" if side == "buy" else "buy"
                 trail_pct = self.execution_cfg.trailing_stop_percent
                 exit_tif = self.execution_cfg.exit_time_in_force
@@ -415,7 +379,6 @@ class OrderExecutor:
                 )
                 return order
 
-            # Path 3: Plain market order (no exit legs)
             else:
                 order = self.adapter.submit_market_order(
                     symbol=symbol,
@@ -435,8 +398,6 @@ class OrderExecutor:
             logger.error(f"Unexpected error executing trade for {symbol}: {e}")
             return None
 
-    # ── Exit paths ────────────────────────────────────────────────────────────
-
     def close_position_due_to_sentiment(
         self,
         position: PositionInfo,
@@ -446,13 +407,6 @@ class OrderExecutor:
         opening_compounds: Dict[str, float],
         persist_opening_compounds: Callable[[Dict[str, float]], None],
     ) -> None:
-        """Close a position due to sentiment deterioration.
-
-        PURGE-FIX: Only purge opening_compounds[symbol] after the flatten order
-        has been submitted successfully AND the broker confirms the symbol is flat.
-        This prevents destructive loss of the entry baseline when the close order
-        rejects, times out, or the position remains open.
-        """
         if not self.live_trading_enabled:
             logger.info(
                 f"[PAPER MODE] Would close {position.symbol} due to sentiment: {reason}"
@@ -498,6 +452,20 @@ class OrderExecutor:
             f"{opposite_side} {abs(position.qty)} @ market"
         )
 
+        try:
+            self.trade_stats.close_active_trade(
+                symbol=position.symbol,
+                exit_price=float(getattr(position, "market_price", 0.0) or 0.0),
+                exit_reason=reason,
+                hit_stop_loss=False,
+                hit_take_profit=False,
+                notes="explicit_sentiment_exit",
+            )
+        except Exception as stats_error:
+            logger.warning(
+                f"Trade stats close tracking failed for {position.symbol}: {stats_error}"
+            )
+
         if position.symbol in opening_compounds:
             del opening_compounds[position.symbol]
             persist_opening_compounds(opening_compounds)
@@ -512,18 +480,6 @@ class OrderExecutor:
         opening_compounds: Dict[str, float],
         persist_opening_compounds: Callable[[Dict[str, float]], None],
     ) -> None:
-        """
-        Force-close all positions before weekend.
-
-        SAFETY-GATE: Triple-gate protection prevents accidental liquidation:
-          1. live_trading_enabled must be True (config-level gate).
-          2. env_mode must be "LIVE" (environment-level gate).
-          3. Confirmation log emitted at WARNING level before atomic close.
-
-        PURGE-FIX: opening_compounds and persist_opening_compounds are required
-        parameters so the fallback path can purge baselines inline with each close.
-        """
-        # SAFETY-GATE 1: live_trading_enabled check (config-level)
         if not self.live_trading_enabled:
             logger.info(
                 "[PAPER MODE GUARD] Weekend liquidation blocked: "
@@ -531,7 +487,6 @@ class OrderExecutor:
             )
             return
 
-        # SAFETY-GATE 2: env_mode check (environment-level)
         if env_mode.upper() != "LIVE":
             logger.warning(
                 f"[ENV MODE GUARD] Weekend liquidation blocked: "
@@ -540,7 +495,6 @@ class OrderExecutor:
             )
             return
 
-        # Both gates passed — emit confirmation log before proceeding
         logger.warning(
             "WEEKEND LIQUIDATION CONFIRMED: live_trading_enabled=True AND env_mode=LIVE. "
             "Closing all positions now."

@@ -8,7 +8,8 @@
 # - HARDENED the protected-entry regression test by stubbing execution.order_executor.log_proposed_trade
 #   to a no-op, so the test validates execution behavior directly and cannot fail because of unrelated
 #   logging-field drift.
-# - The fixture still provides the key ProposedTrade-like fields used by the executor path.
+# - Added static integration regression checks for TradeStatsTracker wiring in main.py and
+#   execution/order_executor.py.
 # - This file is self-contained and runnable with: python test.py
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ ROOT = Path(__file__).resolve().parent
 MAIN_PATH = ROOT / "main.py"
 ORDER_EXECUTOR_PATH = ROOT / "execution" / "order_executor.py"
 ADAPTER_PATH = ROOT / "adapters" / "alpaca_adapter.py"
+TRADE_STATS_PATH = ROOT / "monitoring" / "trade_stats.py"
 
 
 class ContractFailure(AssertionError):
@@ -63,6 +65,7 @@ def test_repo_layout() -> None:
     assert_true(MAIN_PATH.exists(), "main.py not found.")
     assert_true(ORDER_EXECUTOR_PATH.exists(), "execution/order_executor.py not found.")
     assert_true(ADAPTER_PATH.exists(), "adapters/alpaca_adapter.py not found.")
+    assert_true(TRADE_STATS_PATH.exists(), "monitoring/trade_stats.py not found.")
 
 
 def test_main_saves_opening_compound_from_signal_score() -> None:
@@ -206,7 +209,7 @@ def test_close_failure_does_not_purge_opening_baseline() -> None:
         execution_cfg=execution_cfg,
     )
 
-    position = SimpleNamespace(symbol="AMD", side="long", qty=10.0)
+    position = SimpleNamespace(symbol="AMD", side="long", qty=10.0, market_price=99.0)
     sentiment = SimpleNamespace(score=-0.7, confidence=0.9, explanation="bad news")
     opening_compounds = {"AMD": 0.42}
 
@@ -284,6 +287,22 @@ def test_main_loop_handles_broker_connection_errors() -> None:
     )
 
 
+def test_main_integrates_trade_stats_tracker() -> None:
+    text = read_text(MAIN_PATH)
+    assert_true("from monitoring.trade_stats import TradeStatsTracker" in text, "main.py must import TradeStatsTracker.")
+    assert_true("trade_stats = TradeStatsTracker()" in text, "main.py must instantiate TradeStatsTracker.")
+    assert_true("trade_stats.register_entry_from_proposed(proposed)" in text, "main.py must register accepted entries with TradeStatsTracker.")
+    assert_true("trade_stats.sync_open_positions(positions" in text or "trade_stats.sync_open_positions(positions_at_start)" in text, "main.py must reconcile active trade stats with current positions.")
+    assert_true("trade_stats.update_watched_trade_outcomes" in text, "main.py must update watched stop-exit outcomes from live prices.")
+
+
+def test_order_executor_integrates_trade_stats_on_close() -> None:
+    text = read_text(ORDER_EXECUTOR_PATH)
+    assert_true("from monitoring.trade_stats import TradeStatsTracker" in text, "order_executor.py must import TradeStatsTracker.")
+    assert_true("self.trade_stats = TradeStatsTracker()" in text, "OrderExecutor must own a TradeStatsTracker instance.")
+    assert_true("self.trade_stats.close_active_trade(" in text, "Sentiment closes must be recorded in trade stats after confirmed flatten.")
+
+
 def run() -> int:
     tests = [
         test_repo_layout,
@@ -292,6 +311,8 @@ def run() -> int:
         test_close_failure_does_not_purge_opening_baseline,
         test_close_path_requires_flat_confirmation_before_purge,
         test_main_loop_handles_broker_connection_errors,
+        test_main_integrates_trade_stats_tracker,
+        test_order_executor_integrates_trade_stats_on_close,
     ]
 
     failures: list[str] = []
