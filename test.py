@@ -5,6 +5,9 @@
 #   3) destructive purge of opening baseline on failed close,
 #   4) missing flat-position confirmation before state purge,
 #   5) missing network guard around main loop broker bootstrap.
+# - FIXED the protected-entry test fixture so it provides the full ProposedTrade
+#   surface used by monitoring.log_proposed_trade(), including sentiment_score,
+#   entry_price, risk_amount, risk_pct_of_equity, and sentiment_scale.
 # - This file is self-contained and runnable with: python test.py
 
 from __future__ import annotations
@@ -134,6 +137,12 @@ def test_entry_uses_protective_orders_when_stop_and_tp_exist() -> None:
         stop_price=95.0,
         take_profit_price=110.0,
         rejected_reason=None,
+        sentiment_score=0.25,
+        signal_score=0.78,
+        entry_price=100.0,
+        risk_amount=50.0,
+        risk_pct_of_equity=0.005,
+        sentiment_scale=1.0,
     )
 
     order = executor.execute_proposed_trade(proposed)
