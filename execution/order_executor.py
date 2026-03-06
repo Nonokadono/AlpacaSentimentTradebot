@@ -4,15 +4,19 @@
 # BRACKET-TIF-FIX — Bracket orders now explicitly use `exit_time_in_force` instead of the entry TIF
 #                   so that the protective SL and TP legs persist GTC and do not expire at close.
 # FIX 3 — Added best-effort cancel attempt in execute_proposed_trade() when _wait_for_position() returns False.
-#         Wrap in try/except so the cancel attempt never raises; log both success and failure cases.
 # FIX 4D (FIX 9) — Deleted dead code line `sent_cfg = SentimentConfig(cfg.sentiment) if False else cfg.sentiment`.
 # SAFETY-GATE — Enhanced close_all_positions_for_weekend() with triple-gate protection.
-# PURGE-FIX — close_position_due_to_sentiment() now purges opening_compounds[symbol] immediately
-#             inline with the close order, then persists the registry to disk before returning.
+# PURGE-FIX — close_position_due_to_sentiment() now purges opening_compounds[symbol] only after
+#             a confirmed flat position, and retains the baseline on close failure.
 # WAIT-TIMEOUT-FIX — Added threading.Timer hard kill for _wait_for_position() to prevent hung
 #                    Alpaca poll from blocking the bot indefinitely. Timer spawns a daemon thread
 #                    that logs a CRITICAL error and raises SystemExit after timeout+5s grace period.
 #                    Main loop catches SystemExit and logs the forced termination before exiting.
+# PROTECTION-PATH-FIX — Fixed entry execution gating so fixed stop-loss / take-profit bracket
+#                       orders are submitted whenever proposed.stop_price and proposed.take_profit_price
+#                       are available, without incorrectly depending on enable_trailing_stop.
+# FLAT-CONFIRM-FIX — Added _wait_for_flat() and use it before declaring a close successful or
+#                    purging the persisted entry baseline.
 
 import logging
 import time
@@ -22,7 +26,7 @@ from typing import Callable, Dict, Optional
 from alpaca_trade_api.rest import APIError
 
 from adapters.alpaca_adapter import AlpacaAdapter
-from config.config import BotConfig, ExecutionConfig, SentimentConfig
+from config.config import BotConfig, ExecutionConfig
 from core.risk_engine import PositionInfo, ProposedTrade
 from core.sentiment import SentimentModule, SentimentResult
 from monitoring.monitor import (
@@ -40,20 +44,20 @@ def _check_and_exit_on_sentiment(
     sentiment_module: SentimentModule,
     executor: "OrderExecutor",
     cfg: BotConfig,
-    opening_compounds: Dict[str, tuple],
-    persist_opening_compounds: Callable[[Dict[str, tuple]], None],
+    opening_compounds: Dict[str, float],
+    persist_opening_compounds: Callable[[Dict[str, float]], None],
 ) -> None:
     """For every open position, force-rescore sentiment and compare the current
-    compound score against the score recorded at entry time.
+    sentiment score against the technical composite recorded at entry time.
 
     Three exit tiers from SentimentConfig:
       1. Hard exit (chaos): raw_discrete == -2 → close unconditionally, no delta check.
       2. Strong exit: delta > effective_strong_threshold AND
                       confidence > strong_exit_confidence_min
-         Fires on large sentiment deterioration even at moderate confidence.
+         Fires on large deterioration versus the entry technical composite.
       3. Soft exit: delta > effective_soft_threshold AND
                     confidence > exit_confidence_min
-         Catches partial deterioration (e.g. +0.7 → 0.0, delta=0.70).
+         Catches partial deterioration relative to the entry technical composite.
 
     delta is defined side-aware:
       long:  delta = opening_compound - current_score  (positive = sentiment worsened)
@@ -61,25 +65,20 @@ def _check_and_exit_on_sentiment(
     A positive delta in either case means the position should be exited.
 
     When pnl_exit_scale_enabled is True, effective thresholds are PnL-scaled:
-      scale_adj               = unrealised_pnl_pct * pnl_exit_scale_factor
+      scale_adj                  = unrealised_pnl_pct * pnl_exit_scale_factor
       effective_soft_threshold   = max(0.3, soft_exit_delta_threshold   + scale_adj)
       effective_strong_threshold = max(0.5, strong_exit_delta_threshold + scale_adj)
     where unrealised_pnl_pct is +ve for winning positions and -ve for losing ones.
     This widens thresholds for winners (harder to exit) and tightens them for
-    losers (easier to exit).  The hard exit is NEVER gated by these thresholds.
+    losers (easier to exit). The hard exit is NEVER gated by these thresholds.
 
     The effective_soft_threshold is used as display_threshold in the monitor log
     so the operator always sees the actual threshold that drove the decision.
 
-    CONFIDENCE-STORE: opening_compounds now stores {symbol: (compound, confidence)}
-    tuples. The confidence value is reserved for potential future threshold scaling.
-    Backward compatibility: legacy scalar entries are treated as (compound, 0.0).
-
     PURGE-FIX: opening_compounds and persist_opening_compounds are required
     parameters so close_position_due_to_sentiment() can purge the entry baseline
-    immediately inline with the close order and flush it to disk before returning.
+    only after the flatten has actually succeeded.
     """
-    # FIX 4D (FIX 9): Deleted the dead code line; only this line remains.
     sent_cfg = cfg.sentiment
     env_mode = str(cfg.env_mode)
 
@@ -87,14 +86,7 @@ def _check_and_exit_on_sentiment(
         news_items = adapter.get_news(symbol, limit=10)
         current_sentiment: SentimentResult = sentiment_module.force_rescore(symbol, news_items)
 
-        # CONFIDENCE-STORE: unpack tuple; fallback to (0.0, 0.0) if legacy scalar
-        opening_data = opening_compounds.get(symbol, (0.0, 0.0))
-        if isinstance(opening_data, tuple):
-            opening_compound, opening_confidence = opening_data
-        else:
-            opening_compound = float(opening_data)
-            opening_confidence = 0.0
-
+        opening_compound = float(opening_compounds.get(symbol, 0.0))
         current_score = float(current_sentiment.score)
 
         # Side-aware delta so shorts exit on improving sentiment.
@@ -159,7 +151,7 @@ def _check_and_exit_on_sentiment(
             closing=closing,
             close_reason=close_reason,
             env_mode=env_mode,
-            stop_price=pos.stop_price,              # MONITOR-FIX: passing active stop_price
+            stop_price=pos.stop_price,               # MONITOR-FIX: passing active stop_price
             take_profit_price=pos.take_profit_price, # MONITOR-FIX: passing active take_profit_price
             pnl_exit_scale_enabled=sent_cfg.pnl_exit_scale_enabled,
             pnl_exit_scale_factor=sent_cfg.pnl_exit_scale_factor,
@@ -184,17 +176,18 @@ class OrderExecutor:
       1. Log the proposed trade.
       2. If live_trading_enabled is False (paper mode guard), skip submission.
       3. Cancel any open orders for the symbol before entering.
-      4. Submit a bracket order (entry + OCO TP/stop) when both
-         enable_take_profit and enable_trailing_stop are True.
-      5. Fall back to entry + standalone trailing-stop when only
-         enable_trailing_stop is True.  The trailing stop is ONLY submitted
-         after _wait_for_position() confirms the fill.
+      4. Submit a bracket order (entry + OCO TP/stop) whenever both
+         proposed.stop_price and proposed.take_profit_price are available.
+      5. Fall back to entry + standalone trailing-stop when fixed bracket
+         protection is unavailable and trailing stops are enabled. The trailing
+         stop is ONLY submitted after _wait_for_position() confirms the fill.
       6. Fall back to plain market order when neither exit type is configured.
 
     Sentiment exit path (close_position_due_to_sentiment):
-      - Cancel all open orders for the symbol
-      - Submit a market order to flatten
-      - PURGE-FIX: delete opening_compounds[symbol] and persist registry inline.
+      - Cancel all open orders for the symbol.
+      - Submit a market order to flatten.
+      - Wait for broker confirmation that the position is flat.
+      - Purge opening_compounds[symbol] only after the flat confirmation succeeds.
 
     Weekend liquidation path (close_all_positions_for_weekend):
       SAFETY-GATE: Triple-gate protection prevents accidental liquidation:
@@ -218,7 +211,7 @@ class OrderExecutor:
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _cancel_all_open_orders_for_symbol(self, symbol: str) -> None:
-        """Cancel every open order for *symbol*.  Errors are logged and swallowed."""
+        """Cancel every open order for *symbol*. Errors are logged and swallowed."""
         try:
             open_orders = self.adapter.list_orders(status="open")
             for order in open_orders:
@@ -283,12 +276,46 @@ class OrderExecutor:
             kill_timer.cancel()
             return False
         except SystemExit:
-            # Timer fired; re-raise to propagate to main loop
             raise
         except Exception as e:
             logger.error(f"Exception in _wait_for_position({symbol}): {e}")
             kill_timer.cancel()
             return False
+
+    def _wait_for_flat(self, symbol: str) -> bool:
+        """Poll until the broker reports that *symbol* no longer has an open position.
+
+        Returns True once get_position(symbol) returns None or a zero quantity;
+        otherwise returns False after the same configured polling timeout used by
+        _wait_for_position(). Errors are logged and treated as retryable within
+        the timeout window.
+        """
+        timeout = self.execution_cfg.post_entry_fill_poll_timeout_sec
+        interval = self.execution_cfg.post_entry_fill_poll_interval_sec
+        elapsed = 0.0
+
+        while elapsed < timeout:
+            try:
+                pos = self.adapter.get_position(symbol)
+                if pos is None:
+                    logger.info(f"Position {symbol} confirmed flat after {elapsed:.1f}s.")
+                    return True
+
+                qty_raw = getattr(pos, "qty", 0.0)
+                qty = float(qty_raw)
+                if abs(qty) <= 1e-9:
+                    logger.info(f"Position {symbol} quantity reached zero after {elapsed:.1f}s.")
+                    return True
+            except Exception as e:
+                logger.warning(f"_wait_for_flat poll error for {symbol}: {e}")
+
+            time.sleep(interval)
+            elapsed += interval
+
+        logger.warning(
+            f"Position {symbol} still not flat after {timeout}s timeout."
+        )
+        return False
 
     # ── Entry paths ───────────────────────────────────────────────────────────
 
@@ -318,13 +345,15 @@ class OrderExecutor:
         qty = proposed.qty
         side = proposed.side
         tif = self.execution_cfg.entry_time_in_force
+        has_fixed_bracket = (
+            self.execution_cfg.enable_take_profit
+            and proposed.stop_price is not None
+            and proposed.take_profit_price is not None
+        )
 
         try:
             # Path 1: Bracket order (atomic TP + stop)
-            if (
-                self.execution_cfg.enable_take_profit
-                and self.execution_cfg.enable_trailing_stop
-            ):
+            if has_fixed_bracket:
                 # BRACKET-TIF-FIX: use exit_time_in_force so legs persist overnight
                 bracket_tif = self.execution_cfg.exit_time_in_force
                 order = self.adapter.submit_bracket_order(
@@ -414,29 +443,20 @@ class OrderExecutor:
         sentiment: SentimentResult,
         reason: str,
         env_mode: str,
-        opening_compounds: Dict[str, tuple],
-        persist_opening_compounds: Callable[[Dict[str, tuple]], None],
+        opening_compounds: Dict[str, float],
+        persist_opening_compounds: Callable[[Dict[str, float]], None],
     ) -> None:
         """Close a position due to sentiment deterioration.
 
-        PURGE-FIX: Immediately after closing the position (or after the paper-mode
-        log), purge opening_compounds[symbol] and persist the updated registry to
-        disk. This eliminates the race window between sentiment close and the next
-        GAP-2 purge, and ensures crash-recovery never resurrects a stale baseline.
+        PURGE-FIX: Only purge opening_compounds[symbol] after the flatten order
+        has been submitted successfully AND the broker confirms the symbol is flat.
+        This prevents destructive loss of the entry baseline when the close order
+        rejects, times out, or the position remains open.
         """
         if not self.live_trading_enabled:
             logger.info(
                 f"[PAPER MODE] Would close {position.symbol} due to sentiment: {reason}"
             )
-            # PURGE-FIX: Even in paper mode, purge the baseline so the in-memory
-            # registry stays consistent with the (hypothetical) flat position.
-            if position.symbol in opening_compounds:
-                del opening_compounds[position.symbol]
-                persist_opening_compounds(opening_compounds)
-                logger.info(
-                    f"[PAPER MODE] Purged opening_compound for {position.symbol} "
-                    f"(hypothetical close)."
-                )
             return
 
         log_sentiment_close_decision(
@@ -450,7 +470,6 @@ class OrderExecutor:
             reason=reason,
         )
 
-
         self._cancel_all_open_orders_for_symbol(position.symbol)
 
         try:
@@ -461,30 +480,37 @@ class OrderExecutor:
                 side=opposite_side,
                 time_in_force="day",
             )
-            logger.info(
-                f"Closed position {position.symbol} ({reason}): "
-                f"{opposite_side} {abs(position.qty)} @ market"
-            )
         except Exception as e:
             logger.error(
                 f"Error closing position {position.symbol} due to sentiment: {e}"
             )
+            return
 
-        # PURGE-FIX: Delete the entry baseline immediately inline with the close
-        # order and persist the updated registry to disk before returning.
+        if not self._wait_for_flat(position.symbol):
+            logger.warning(
+                f"Close submitted for {position.symbol} ({reason}) but position is not yet flat; "
+                "retaining opening_compound baseline."
+            )
+            return
+
+        logger.info(
+            f"Closed position {position.symbol} ({reason}): "
+            f"{opposite_side} {abs(position.qty)} @ market"
+        )
+
         if position.symbol in opening_compounds:
             del opening_compounds[position.symbol]
             persist_opening_compounds(opening_compounds)
             logger.info(
-                f"Purged opening_compound for {position.symbol} after sentiment close."
+                f"Purged opening_compound for {position.symbol} after confirmed close."
             )
 
     def close_all_positions_for_weekend(
         self,
         positions: Dict[str, PositionInfo],
         env_mode: str,
-        opening_compounds: Dict[str, tuple],
-        persist_opening_compounds: Callable[[Dict[str, tuple]], None],
+        opening_compounds: Dict[str, float],
+        persist_opening_compounds: Callable[[Dict[str, float]], None],
     ) -> None:
         """
         Force-close all positions before weekend.
@@ -524,7 +550,6 @@ class OrderExecutor:
             self.adapter.cancel_all_orders()
             self.adapter.close_all_positions()
             logger.info("All positions closed (atomic broker call).")
-            # PURGE-FIX: Atomic close succeeded — purge all baselines at once.
             for symbol in list(opening_compounds.keys()):
                 if symbol in opening_compounds:
                     del opening_compounds[symbol]

@@ -12,9 +12,10 @@
 #             _persist_opening_compounds as kwargs so the purge can execute atomically inline
 #             with sentiment-driven position closes. Updated close_all_positions_for_weekend()
 #             call to pass the same kwargs so weekend liquidation can purge baselines correctly.
-# OPENING-COMPOSITE-FIX — Modified _opening_compounds entry to save proposed.signal_score
-#                         instead of proposed.sentiment_score to check sentiment deterioration
-#                         against the technical composite used to open the position.
+# OPENING-COMPOSITE-FIX — Persist the technical entry composite via proposed.signal_score.
+# NETWORK-GUARD-FIX — Wrapped broker bootstrap calls in the main loop with try/except so
+#                     transient Alpaca connectivity failures log, back off, and continue
+#                     instead of terminating the bot.
 
 import json
 import logging
@@ -138,8 +139,8 @@ def _persist_vol_and_sentiment(
     on those paths.
     """
     state = _load_equity_state()
-    state["vol_history"]      = risk_engine.export_vol_history()
-    state["sentiment_cache"]  = sentiment_module.export_cache()
+    state["vol_history"] = risk_engine.export_vol_history()
+    state["sentiment_cache"] = sentiment_module.export_cache()
     _save_equity_state(state)
 
 # ── END PERSIST-FIX ──────────────────────────────────────────────────────────
@@ -247,19 +248,19 @@ def main() -> None:
     # risk parameters calibrated for 15 diverse positions are applied to 3
     # correlated tech names.
 
-    adapter           = AlpacaAdapter(cfg.env_mode)
-    sentiment         = SentimentModule()
-    signal_engine     = SignalEngine(adapter, sentiment, cfg.technical)
-    risk_engine       = RiskEngine(cfg.risk_limits, cfg.sentiment, cfg.instruments)
-    pm                = PositionManager(adapter)
-    executor          = OrderExecutor(adapter, cfg.env_mode, cfg.live_trading_enabled, cfg.execution)
-    kill_switch       = KillSwitch(cfg.risk_limits)
+    adapter = AlpacaAdapter(cfg.env_mode)
+    sentiment = SentimentModule()
+    signal_engine = SignalEngine(adapter, sentiment, cfg.technical)
+    risk_engine = RiskEngine(cfg.risk_limits, cfg.sentiment, cfg.instruments)
+    pm = PositionManager(adapter)
+    executor = OrderExecutor(adapter, cfg.env_mode, cfg.live_trading_enabled, cfg.execution)
+    kill_switch = KillSwitch(cfg.risk_limits)
     portfolio_builder = PortfolioBuilder(cfg, adapter, sentiment, signal_engine, risk_engine)
 
-    # Registry: symbol -> sentiment_score recorded at entry time.
-    # OPENING-COMPOSITE-FIX: We are now saving proposed.signal_score instead of
-    # proposed.sentiment_score to check sentiment deterioration against the technical composite.
-    # Persisted to equity_state.json so it survives bot restarts.
+    # Registry: symbol -> technical composite recorded at entry time.
+    # OPENING-COMPOSITE-FIX: The persisted opening baseline is now the
+    # technical composite used to open the trade (proposed.signal_score), not
+    # the sentiment score observed at entry time.
     _opening_compounds: Dict[str, float] = _load_opening_compounds()
 
     # ── PERSIST-FIX: Restore vol history and sentiment cache from disk ────────
@@ -320,10 +321,25 @@ def main() -> None:
     while True:
         _cycle_count += 1
 
-        acct        = adapter.get_account()
-        positions   = pm.get_positions(opening_compounds=_opening_compounds)
-        snapshot    = get_equity_snapshot_from_account(acct, positions)
-        market_open = adapter.get_market_open()
+        try:
+            acct = adapter.get_account()
+            positions = pm.get_positions(opening_compounds=_opening_compounds)
+            market_open = adapter.get_market_open()
+        except Exception as e:
+            logger.warning(
+                f"Broker connectivity issue during loop bootstrap: {e}. "
+                "Sleeping 60s and continuing."
+            )
+            dashboard_state.update(
+                cycle_count=_cycle_count,
+                market_open=False,
+                bot_state="IDLE",
+            )
+            persist_state(dashboard_state)
+            time.sleep(60)
+            continue
+
+        snapshot = get_equity_snapshot_from_account(acct, positions)
         log_equity_snapshot(snapshot, market_open=market_open)
 
         # Change D3: Push account + market state into the dashboard.
@@ -361,8 +377,8 @@ def main() -> None:
 
         if adapter.is_pre_daily_close():
             logger.warning(
-            "DAILY CLOSE DETECTED: Closing all positions before market close "
-            "to avoid overnight gap risk."
+                "DAILY CLOSE DETECTED: Closing all positions before market close "
+                "to avoid overnight gap risk."
             )
             executor.close_all_positions_for_weekend(
                 positions,
@@ -394,7 +410,7 @@ def main() -> None:
             )
             # Refresh positions after potential closes.
             positions = pm.get_positions(opening_compounds=_opening_compounds)
-            snapshot  = get_equity_snapshot_from_account(acct, positions)
+            snapshot = get_equity_snapshot_from_account(acct, positions)
 
         # ── GAP-2 FIX: Purge moved OUTSIDE `if positions:` ──────────────────
         # Previously this block was indented inside `if positions:`, meaning it
@@ -438,7 +454,6 @@ def main() -> None:
         #    time.sleep(60)
         #    continue
 
-
         # ── STEP 3: PRE-CLOSE + MONDAY-OPEN ENTRY BLACKOUTS + BUILD AND EXECUTE NEW TRADES ─
         # MONDAY-BLACKOUT: Monday open blackout takes precedence over pre-close blackout
         # because both can theoretically be true simultaneously (rare but possible if
@@ -456,14 +471,14 @@ def main() -> None:
         else:
             dashboard_state.update(bot_state="SCANNING")
             persist_state(dashboard_state)
-            
+
             # ORPHAN-ORDER-FIX: Cancel all open orders before building new portfolio.
             # This eliminates orphaned orders from previous iterations that may have
             # become stale or conflicting. Clean slate ensures execution integrity.
             logger.info("Canceling all open orders before portfolio execution.")
             adapter.cancel_all_orders()
-            
-            open_orders     = adapter.list_orders(status="open")
+
+            open_orders = adapter.list_orders(status="open")
             proposed_trades = portfolio_builder.build_portfolio(snapshot, positions, open_orders)
 
             log_portfolio_overview(proposed_trades, cfg.env_mode)
@@ -485,12 +500,10 @@ def main() -> None:
                 #   Errors / paper:   all code paths return None already.
                 #
                 # Therefore recording _opening_compounds only when order is not
-                # None guarantees we never store a sentiment baseline for a
-                # position whose fill we could not confirm.
+                # None guarantees we never store a baseline for a position whose
+                # fill we could not confirm.
                 if order is not None and proposed.rejected_reason is None and proposed.qty > 0:
-                    # Change 1a: record entry-time SENTIMENT score (proposed.sentiment_score)
-                    # as the opening compound baseline — NOT proposed.signal_score.
-                    _opening_compounds[proposed.symbol] = proposed.sentiment_score
+                    _opening_compounds[proposed.symbol] = proposed.signal_score
                     # FIX 4A: Persist immediately so a crash/restart doesn't lose the entry record.
                     _persist_opening_compounds(_opening_compounds)
 
