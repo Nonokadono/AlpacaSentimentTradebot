@@ -1,12 +1,9 @@
 # CHANGES:
-# GROQ MIGRATION — Replace Gemini with Groq (llama-3.1-8b-instant).
-#   - _GROQ_URL points to Groq's OpenAI-compat endpoint.
-#   - apikey reads GROQ_API_KEY env var.
-#   - model changed to "llama-3.1-8b-instant" (30 RPM / 14,400 RPD free tier).
-#   - _INTER_CALL_DELAY_SEC reduced from 6.0 to 2.0 — Groq allows 30 RPM so
-#     2s spacing gives comfortable headroom for 8 symbols/loop.
-#   - max_tokens kept at 1024 to prevent truncation.
-#   - All error handling, markdown fence stripping, and parse logic unchanged.
+# FIX SENTIMENT-FLOAT-CONTRACT — Preserve model-provided float sentiment in [-1, 1]
+# rather than rounding to {-1, 0, 1} and then recomputing score from confidence.
+# Chaos remains the only sentinel and is represented by the exact integer -2.
+# Added _normalize_model_sentiment() helper and updated prompts / docstrings to
+# request a direct float sentiment contract from the model.
 
 import json
 import logging
@@ -22,13 +19,34 @@ _GROQ_MODEL = "llama-3.1-8b-instant"
 _INTER_CALL_DELAY_SEC = 2.0
 
 
+def _normalize_model_sentiment(raw_sentiment):
+    """
+    Preserve the model's continuous sentiment contract.
+
+    Valid outputs:
+      - exact -2 for chaos / do-not-trade
+      - otherwise a float clamped to [-1.0, 1.0]
+
+    Any malformed value falls back to neutral 0.0.
+    """
+    try:
+        sentiment = float(raw_sentiment)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if sentiment == -2.0:
+        return -2
+
+    return max(-1.0, min(1.0, sentiment))
+
+
 class NewsReasoner:
     """
     Uses Groq (llama-3.1-8b-instant) via the OpenAI-compatible endpoint
     to score short-term news sentiment.
 
     Returns a dict with keys:
-        - sentiment: int in {-2, -1, 0, 1}
+        - sentiment: float in [-1, 1], or exact integer -2 for chaos
         - confidence: float in [0, 1]
         - explanation: str
     """
@@ -39,7 +57,7 @@ class NewsReasoner:
         if not self.apikey:
             logger.warning(
                 "GROQ_API_KEY is not set — NewsReasoner disabled. "
-                "All sentiment scores will be neutral (0) until the key is provided."
+                "All sentiment scores will be neutral (0.0) until the key is provided."
             )
             self.disabled = True
         else:
@@ -52,13 +70,13 @@ class NewsReasoner:
             newsitems: list of dicts from Alpaca news API
 
         Output dict:
-            - sentiment: -2, -1, 0, or 1
+            - sentiment: float in [-1, 1], or exact integer -2 for chaos
             - confidence: float 0-1
             - explanation: str
         """
         if self.disabled:
             return {
-                "sentiment": 0,
+                "sentiment": 0.0,
                 "confidence": 0.0,
                 "explanation": "NewsReasoner disabled (GROQ_API_KEY not set).",
             }
@@ -71,7 +89,7 @@ class NewsReasoner:
             # No news -> neutral, low confidence
             if not newsitems:
                 return {
-                    "sentiment": 0,
+                    "sentiment": 0.0,
                     "confidence": 0.0,
                     "explanation": "No recent news.",
                 }
@@ -87,7 +105,7 @@ class NewsReasoner:
                 summaries.append(text[:300])
             if not summaries:
                 return {
-                    "sentiment": 0,
+                    "sentiment": 0.0,
                     "confidence": 0.0,
                     "explanation": "No usable news text.",
                 }
@@ -97,12 +115,12 @@ class NewsReasoner:
                 f"Evaluate the SHORT-TERM (next few trading days) impact of the following news "
                 f"on {symbol} stock.\n"
                 f"Return a single JSON object with keys:\n"
-                f'  sentiment: -2, -1, 0, or 1\n'
-                f'    -2 for extremely unstable / utterly undesirable to trade now (e.g. chaotic, '
+                f'  sentiment: exact integer -2 for chaos / do-not-trade, otherwise a float between -1 and 1\n'
+                f'    -2 means extremely unstable / utterly undesirable to trade now (e.g. chaotic, '\
                 f'        very high uncertainty, extreme event risk),\n'
-                f'    -1 for clearly negative,\n'
-                f'     0 for neutral or mixed,\n'
-                f'     1 for clearly positive.\n'
+                f'    values near -1 are strongly negative,\n'
+                f'    values near 0 are neutral or mixed,\n'
+                f'    values near 1 are strongly positive.\n'
                 f'  confidence: a number between 0 and 1\n'
                 f'  explanation: short textual explanation (1-3 sentences).\n\n'
                 f"News:\n- " + "\n- ".join(summaries)
@@ -140,7 +158,7 @@ class NewsReasoner:
                     f"Check free-tier RPM/RPD quota."
                 )
                 return {
-                    "sentiment": 0,
+                    "sentiment": 0.0,
                     "confidence": 0.0,
                     "explanation": "Groq API rate limit hit; treating sentiment as neutral.",
                 }
@@ -150,7 +168,7 @@ class NewsReasoner:
                     f"Groq API error {resp.status_code} for {symbol} — treating sentiment as neutral."
                 )
                 return {
-                    "sentiment": 0,
+                    "sentiment": 0.0,
                     "confidence": 0.0,
                     "explanation": "Error from AI API, treating sentiment as neutral.",
                 }
@@ -177,21 +195,12 @@ class NewsReasoner:
                     result = json.loads(rawcontent[start:end])
                 except Exception:
                     return {
-                        "sentiment": 0,
+                        "sentiment": 0.0,
                         "confidence": 0.0,
                         "explanation": "Could not parse model output, treating as neutral.",
                     }
 
-            sentiment = result.get("sentiment", 0)
-            # Fix M6: coerce to int before membership check so float strings
-            # like "-1.0" or bare floats from the model are handled correctly.
-            try:
-                sentiment = int(round(float(sentiment)))
-            except (TypeError, ValueError):
-                sentiment = 0
-            # Normalize sentiment to allowed set {-2, -1, 0, 1}
-            if sentiment not in (-2, -1, 0, 1):
-                sentiment = 0
+            sentiment = _normalize_model_sentiment(result.get("sentiment", 0.0))
 
             try:
                 confidence = float(result.get("confidence", 0.0))
@@ -211,7 +220,7 @@ class NewsReasoner:
             # Normalize fields on any unexpected error
             logger.warning(f"scorenews error for {symbol}: {e}")
             return {
-                "sentiment": 0,
+                "sentiment": 0.0,
                 "confidence": 0.0,
                 "explanation": "Exception in sentiment analysis, treating as neutral.",
             }

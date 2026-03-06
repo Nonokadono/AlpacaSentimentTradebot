@@ -1,4 +1,9 @@
 # CHANGES:
+# FIX SENTIMENT-FLOAT-CONTRACT — Preserve direct float sentiment from the model
+# instead of reconstructing score from a rounded discrete class and confidence.
+# Added raw_model_score to SentimentResult so the exact model sentiment is stored.
+# Chaos remains an explicit sentinel (-2) via raw_model_score / raw_discrete while
+# score stays bounded for risk sizing and downstream safety.
 # FIX 8 — Replaced datetime.utcnow() with datetime.now(timezone.utc) throughout to eliminate DeprecationWarning.
 #         Added timezone import; ensured naive persisted timestamps are compatible via .replace(tzinfo=None) guard.
 
@@ -16,15 +21,17 @@ from config.config import SentimentConfig
 @dataclass
 class SentimentResult:
     """
-    score: continuous sentiment score in [-1, 1] for risk sizing.
-           -1 strongly negative, +1 strongly positive.
-           For discrete -2 (utterly undesirable / unstable), score is fixed at -1
-           and should trigger no-trade / forced exit logic at the risk engine level.
-    raw_discrete: the raw discrete value from the model in {-2, -1, 0, 1}
-    rawcompound: legacy field; kept for compatibility, here = score
-    ndocuments: number of news items used
-    explanation: optional short explanation
-    confidence: model-reported confidence in [0, 1]
+    score: authoritative continuous sentiment score used by the bot.
+           For normal operation this is the direct model-provided float in [-1, 1].
+           For chaos, score is bounded at -1.0 for risk sizing safety while
+           raw_model_score preserves the exact chaos sentinel -2.0.
+    raw_discrete: legacy compatibility field.
+           -2 for chaos, -1 for negative float sentiment, 0 for neutral, 1 for positive.
+    rawcompound: legacy field; kept for compatibility, here = score.
+    raw_model_score: exact model-provided sentiment, either -2.0 for chaos or a float in [-1, 1].
+    ndocuments: number of news items used.
+    explanation: optional short explanation.
+    confidence: model-reported confidence in [0, 1]; retained as metadata only.
     """
     score: float
     raw_discrete: int
@@ -32,6 +39,7 @@ class SentimentResult:
     ndocuments: int
     explanation: Optional[str] = None
     confidence: float = 0.0
+    raw_model_score: float = 0.0
 
 
 class SentimentModule:
@@ -47,9 +55,6 @@ class SentimentModule:
 
     def __init__(self, cfg: Optional[SentimentConfig] = None) -> None:
         self.reasoner = NewsReasoner()
-        # Fix C2: store SentimentConfig so _map_discrete_to_score can read
-        # confidence_gamma.  Default to a fresh SentimentConfig() if not supplied
-        # so all existing call sites (which pass no argument) remain unchanged.
         self.cfg: SentimentConfig = cfg if cfg is not None else SentimentConfig()
 
         ttl_min = int(os.getenv("SENTIMENT_CACHE_TTL_MIN", "30"))
@@ -79,13 +84,14 @@ class SentimentModule:
         out: Dict[str, dict] = {}
         for sym, (result, ts) in self._cache.items():
             out[sym] = {
-                "score":        result.score,
+                "score": result.score,
                 "raw_discrete": result.raw_discrete,
-                "rawcompound":  result.rawcompound,
-                "ndocuments":   result.ndocuments,
-                "explanation":  result.explanation,
-                "confidence":   result.confidence,
-                "ts_utc":       ts.isoformat(),
+                "rawcompound": result.rawcompound,
+                "raw_model_score": result.raw_model_score,
+                "ndocuments": result.ndocuments,
+                "explanation": result.explanation,
+                "confidence": result.confidence,
+                "ts_utc": ts.isoformat(),
             }
         return out
 
@@ -111,15 +117,13 @@ class SentimentModule:
         for sym, entry in data.items():
             try:
                 ts = datetime.fromisoformat(entry["ts_utc"])
-                # FIX 8: naive compatibility guard
                 if ts.tzinfo is None:
-                    # Loaded timestamp is naive — compare against naive now
                     now_cmp = now.replace(tzinfo=None)
                 else:
                     now_cmp = now
-                # Discard expired entries at load time — never serve stale data.
                 if (now_cmp - ts) > self.cache_ttl:
                     continue
+                raw_model_score = float(entry.get("raw_model_score", entry.get("score", 0.0)))
                 result = SentimentResult(
                     score=float(entry["score"]),
                     raw_discrete=int(entry["raw_discrete"]),
@@ -127,10 +131,11 @@ class SentimentModule:
                     ndocuments=int(entry["ndocuments"]),
                     explanation=entry.get("explanation"),
                     confidence=float(entry.get("confidence", 0.0)),
+                    raw_model_score=raw_model_score,
                 )
                 self._cache[sym] = (result, ts)
             except Exception:
-                continue   # silently skip malformed entries
+                continue
 
     # ── END PERSIST-FIX ──────────────────────────────────────────────────────
 
@@ -139,43 +144,51 @@ class SentimentModule:
             score=0.0,
             raw_discrete=0,
             rawcompound=0.0,
+            raw_model_score=0.0,
             ndocuments=ndocs,
             explanation=reason,
             confidence=0.0,
         )
 
-    def _map_discrete_to_score(self, s_disc: int, confidence: float) -> float:
+    def _coerce_model_sentiment(self, raw_sentiment) -> Tuple[float, int]:
         """
-        Map discrete sentiment {-2, -1, 0, 1} plus confidence into a continuous score in [-1, 1].
+        Preserve the direct model sentiment contract.
 
-        Fix C2: applies confidence_gamma from SentimentConfig.
-          gamma = clamp(self.cfg.confidence_gamma, 1.0, 4.0)
-          score = base * (confidence ** gamma)
-        gamma=1.0 reproduces the previous linear behaviour.
-        gamma=2.0 (default) applies convex weighting: high-confidence scores are
-        amplified relative to low-confidence ones.
-
-        Change 6: s_disc == -2 returns -1.0 explicitly and unconditionally.
-        Confidence is irrelevant for the chaos case — the score is used as a
-        sizing input and -1.0 is already the semantic floor.
+        Returns:
+          - raw_model_score: -2.0 for chaos, otherwise a float in [-1.0, 1.0]
+          - raw_discrete: legacy compatibility bucket (-2, -1, 0, 1)
         """
-        confidence = max(0.0, min(1.0, confidence))
+        try:
+            model_score = float(raw_sentiment)
+        except (TypeError, ValueError):
+            return 0.0, 0
 
-        if s_disc == -2:
-            return -1.0          # chaos: always floor, confidence irrelevant
+        if model_score == -2.0:
+            return -2.0, -2
 
-        if s_disc == -1:
-            base = -1.0
-        elif s_disc == 0:
-            base = 0.0
-        elif s_disc == 1:
-            base = 1.0
+        model_score = max(-1.0, min(1.0, model_score))
+        if abs(model_score) < 1e-12:
+            model_score = 0.0
+
+        if model_score > 0.0:
+            raw_discrete = 1
+        elif model_score < 0.0:
+            raw_discrete = -1
         else:
-            base = 0.0
+            raw_discrete = 0
+        return model_score, raw_discrete
 
-        # Fix C2: power-law confidence weighting.
-        gamma = max(1.0, min(4.0, float(self.cfg.confidence_gamma)))
-        return max(-1.0, min(1.0, base * (confidence ** gamma)))
+    def _score_from_model_sentiment(self, raw_model_score: float) -> float:
+        """
+        The bot now uses the direct model sentiment as its score.
+
+        For chaos, keep score bounded at -1.0 so downstream risk sizing and
+        interval logic continue to operate on a safe range while raw_model_score
+        retains the exact -2 sentinel.
+        """
+        if raw_model_score == -2.0:
+            return -1.0
+        return max(-1.0, min(1.0, raw_model_score))
 
     def get_cached_sentiment(self, symbol: str) -> Optional[SentimentResult]:
         """
@@ -187,7 +200,6 @@ class SentimentModule:
         if not cached:
             return None
         result, ts = cached
-        # FIX 8: naive compatibility guard for comparison
         if ts.tzinfo is None:
             now_cmp = now.replace(tzinfo=None)
         else:
@@ -209,13 +221,7 @@ class SentimentModule:
         """
         res = self.reasoner.scorenews(symbol, newsitems)
 
-        # Fix M6: coerce raw sentiment to int before membership check.
-        try:
-            sdisc = int(round(float(res.get("sentiment", 0))))
-        except (TypeError, ValueError):
-            sdisc = 0
-        if sdisc not in (-2, -1, 0, 1):
-            sdisc = 0
+        raw_model_score, sdisc = self._coerce_model_sentiment(res.get("sentiment", 0.0))
 
         try:
             confidence = float(res.get("confidence", 0.0))
@@ -224,12 +230,13 @@ class SentimentModule:
         confidence = max(0.0, min(1.0, confidence))
 
         explanation = res.get("explanation", "") or ""
-        score = self._map_discrete_to_score(sdisc, confidence)
+        score = self._score_from_model_sentiment(raw_model_score)
 
         result = SentimentResult(
             score=score,
             raw_discrete=sdisc,
             rawcompound=score,
+            raw_model_score=raw_model_score,
             ndocuments=len(newsitems),
             explanation=explanation,
             confidence=confidence,
@@ -250,10 +257,8 @@ class SentimentModule:
         now = datetime.now(timezone.utc)
         last_known = self._get_last_known(symbol)
 
-        # (6) Chaos cooldown: if we recently deemed the symbol "unstable / -2", don't rescore.
         if last_known:
             last_res, last_ts = last_known
-            # FIX 8: naive compatibility guard
             if last_ts.tzinfo is None:
                 now_cmp = now.replace(tzinfo=None)
             else:
@@ -261,14 +266,11 @@ class SentimentModule:
             if last_res.raw_discrete == -2 and ((now_cmp - last_ts) <= self.chaos_cooldown):
                 return last_res
 
-        # (2) No new news -> do not call AI; just reuse last-known sentiment if available.
         if not newsitems:
             if last_known:
                 return last_known[0]
             return self._neutral("No recent news (no prior sentiment cached).", ndocs=0)
 
-        # (1) TTL cache: if within TTL, reuse cached sentiment even if new news exists.
-        # Rationale: avoids frequent rescores when headlines trickle in; TTL bounds staleness.
         cached_fresh = self.get_cached_sentiment(symbol)
         if cached_fresh is not None:
             return cached_fresh
@@ -320,7 +322,7 @@ class SentimentModule:
             return current_interval
         boundaries = {120: 0.8, 300: 0.5, 600: 0.2, 900: 0.0}
         current_boundary = boundaries.get(current_interval, 0.0)
-        target_boundary  = boundaries.get(target, 0.0)
+        target_boundary = boundaries.get(target, 0.0)
         midpoint = (current_boundary + target_boundary) / 2.0
         if abs(max_abs_s - midpoint) > 0.05:
             return target
