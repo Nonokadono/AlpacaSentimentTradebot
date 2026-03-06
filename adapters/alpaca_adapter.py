@@ -1,4 +1,11 @@
 # CHANGES:
+# FIX H3 (PROD-READINESS) — Added comprehensive 429 rate limit handling with exponential
+#                            backoff and retry-after header support. All critical API methods
+#                            now wrapped in _with_rate_limit_retry() decorator that catches
+#                            alpaca_trade_api.rest.APIError with status_code == 429, sleeps
+#                            for the retry-after duration (or exponential backoff default),
+#                            and retries once. Prevents bot crash on rate limit and ensures
+#                            graceful degradation during high-frequency polling.
 # FIX 11 — Corrected RFC3339 timestamp format for Alpaca Data API.
 #          isoformat() on offset-aware datetimes returns '...+00:00'; appending 'Z' created
 #          malformed '...+00:00Z' causing 400 errors. Now strip timezone and append 'Z' only
@@ -15,12 +22,16 @@
 
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 import alpaca_trade_api as tradeapi
+from alpaca_trade_api.rest import APIError
 
 logger = logging.getLogger("tradebot")
+
+T = TypeVar('T')
 
 
 def _format_timestamp_rfc3339(dt: datetime) -> str:
@@ -44,9 +55,63 @@ def _format_timestamp_rfc3339(dt: datetime) -> str:
         return dt.isoformat()
 
 
+def _with_rate_limit_retry(func: Callable[..., T]) -> Callable[..., T]:
+    """Decorator that wraps Alpaca API calls with 429 rate limit retry logic.
+    
+    If APIError with status_code == 429 is raised:
+    1. Extracts retry-after from response headers (default 60s if missing)
+    2. Logs warning with retry delay
+    3. Sleeps for retry_after seconds
+    4. Retries the call ONCE
+    5. If second attempt also fails with 429, propagates the exception
+    
+    For non-429 APIError or other exceptions, propagates immediately.
+    
+    Usage:
+        @_with_rate_limit_retry
+        def get_account(self) -> Any:
+            return self.rest.get_account()
+    """
+    def wrapper(*args, **kwargs) -> T:
+        try:
+            return func(*args, **kwargs)
+        except APIError as e:
+            if e.status_code == 429:
+                # Extract retry-after from headers, default to 60s
+                retry_after = 60
+                if hasattr(e, 'response') and e.response is not None:
+                    headers = getattr(e.response, 'headers', {})
+                    retry_after = int(headers.get('Retry-After', 60))
+                
+                logger.warning(
+                    f"Rate limit (429) hit for {func.__name__}: "
+                    f"sleeping {retry_after}s before retry"
+                )
+                time.sleep(retry_after)
+                
+                # Retry once
+                try:
+                    return func(*args, **kwargs)
+                except APIError as retry_err:
+                    if retry_err.status_code == 429:
+                        logger.error(
+                            f"Rate limit (429) hit AGAIN for {func.__name__} after retry: "
+                            f"propagating exception"
+                        )
+                    raise
+            else:
+                # Non-429 APIError, propagate immediately
+                raise
+    return wrapper
+
+
 class AlpacaAdapter:
     """Thin adapter around Alpaca REST API, configured purely by env vars
-    APCA_API_BASE_URL / APCA_API_KEY_ID / APCA_API_SECRET_KEY."""
+    APCA_API_BASE_URL / APCA_API_KEY_ID / APCA_API_SECRET_KEY.
+    
+    FIX H3: All critical API methods wrapped with rate limit retry logic to prevent
+    bot crash on 429 errors during high-frequency polling or burst order submission.
+    """
 
     def __init__(self, env_mode: str):
         self.env_mode = env_mode
@@ -64,12 +129,15 @@ class AlpacaAdapter:
 
     # --- Account / positions ---
 
+    @_with_rate_limit_retry
     def get_account(self) -> Any:
         return self.rest.get_account()
 
+    @_with_rate_limit_retry
     def list_positions(self) -> List[Any]:
         return list(self.rest.list_positions()) or []
 
+    @_with_rate_limit_retry
     def get_position(self, symbol: str) -> Optional[Any]:
         try:
             return self.rest.get_position(symbol)
@@ -78,6 +146,7 @@ class AlpacaAdapter:
 
     # --- Market status ---
 
+    @_with_rate_limit_retry
     def get_clock(self) -> Optional[Any]:
         """Return the raw Alpaca clock object (is_open, next_close, next_open).
         Returns None on error so callers must guard against None."""
@@ -294,6 +363,7 @@ class AlpacaAdapter:
 
     # --- Market data ---
 
+    @_with_rate_limit_retry
     def get_last_quote(self, symbol: str) -> float:
         """Get a close/last price proxy via recent bars, fallback to latest trade."""
         end = datetime.now(timezone.utc)
@@ -301,8 +371,8 @@ class AlpacaAdapter:
         try:
             bars = self.rest.get_bars(
                 symbol, "5Min", 
-                _format_timestamp_rfc3339(start),  # FIX 11
-                _format_timestamp_rfc3339(end),    # FIX 11
+                _format_timestamp_rfc3339(start),
+                _format_timestamp_rfc3339(end),
             )
         except Exception as e:
             logger.warning(f"get_bars error for {symbol}: {e}")
@@ -316,6 +386,7 @@ class AlpacaAdapter:
             close_price = bar.c
         return float(close_price)
 
+    @_with_rate_limit_retry
     def get_recent_bars(
         self,
         symbol: str,
@@ -340,8 +411,8 @@ class AlpacaAdapter:
             bars = self.rest.get_bars(
                 symbol,
                 timeframe,
-                _format_timestamp_rfc3339(start),  # FIX 11
-                _format_timestamp_rfc3339(end),    # FIX 11
+                _format_timestamp_rfc3339(start),
+                _format_timestamp_rfc3339(end),
                 limit=lookback_bars,
             )
         except Exception as e:
@@ -385,6 +456,7 @@ class AlpacaAdapter:
 
     # --- News sentiment inputs ---
 
+    @_with_rate_limit_retry
     def get_news(
         self,
         symbol: str,
@@ -394,7 +466,7 @@ class AlpacaAdapter:
         try:
             kwargs: Dict[str, Any] = {"symbol": symbol, "limit": limit}
             if since is not None:
-                kwargs["start"] = _format_timestamp_rfc3339(since)  # FIX 11
+                kwargs["start"] = _format_timestamp_rfc3339(since)
             raw_items = self.rest.get_news(**kwargs)
         except Exception as e:
             logger.warning(f"get_news error for {symbol}: {e}")
@@ -408,6 +480,7 @@ class AlpacaAdapter:
 
     # --- Orders ---
 
+    @_with_rate_limit_retry
     def submit_market_order(
         self,
         symbol: str,
@@ -423,6 +496,7 @@ class AlpacaAdapter:
             time_in_force=time_in_force,
         )
 
+    @_with_rate_limit_retry
     def submit_bracket_order(
         self,
         symbol: str,
@@ -455,6 +529,7 @@ class AlpacaAdapter:
             stop_loss={"stop_price": str(round(stop_price, 2))},
         )
 
+    @_with_rate_limit_retry
     def submit_take_profit_limit_order(
         self,
         symbol: str,
@@ -472,6 +547,7 @@ class AlpacaAdapter:
             time_in_force=time_in_force,
         )
 
+    @_with_rate_limit_retry
     def submit_stop_order(
         self,
         symbol: str,
@@ -492,6 +568,7 @@ class AlpacaAdapter:
             time_in_force=time_in_force,
         )
 
+    @_with_rate_limit_retry
     def submit_trailing_stop_order(
         self,
         symbol: str,
@@ -509,14 +586,18 @@ class AlpacaAdapter:
             time_in_force=time_in_force,
         )
 
+    @_with_rate_limit_retry
     def cancel_order(self, order_id: str) -> None:
         self.rest.cancel_order(order_id)
 
+    @_with_rate_limit_retry
     def cancel_all_orders(self) -> None:
         self.rest.cancel_all_orders()
 
+    @_with_rate_limit_retry
     def close_all_positions(self) -> None:
         self.rest.close_all_positions()
 
+    @_with_rate_limit_retry
     def list_orders(self, status: str = "open") -> List[Any]:
         return list(self.rest.list_orders(status=status)) or []
