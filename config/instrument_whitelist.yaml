@@ -1,4 +1,8 @@
 # CHANGES:
+# AUDIT FIX 8.3 — Expanded whitelist from 12 to 22 active symbols across 5 sectors
+#                 to enable full portfolio allocation (max_open_positions=15).
+#                 Previous whitelist supported only 7 positions max due to sector caps.
+#                 New allocation: TECH(8), ETF_INDEX(5), FINANCE(3), CONSUMER(3), HEALTHCARE(3).
 # BLOCKER-1 FIX — Uncommented SPY, QQQ, BAC, COST to achieve minimum 3-sector
 # diversification. Previous 100% TECH allocation violated risk calibration
 # assumptions (15 diverse positions, not 3 correlated names).
@@ -7,6 +11,10 @@
 # in config.py will not raise ValueError.
 
 # ── Active symbols ────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TECH SECTOR (8 symbols, max 3 positions per sector cap)
+# ═══════════════════════════════════════════════════════════════════════════
 
 AAPL:
   exchange: NASDAQ
@@ -80,7 +88,11 @@ AMD:
   trading_hours: "0930-1600"
   sector: TECH
 
-# BLOCKER-1 FIX: ETF_INDEX sector for broad market exposure
+# ═══════════════════════════════════════════════════════════════════════════
+# ETF_INDEX SECTOR (5 symbols, max 3 positions per sector cap)
+# AUDIT FIX 8.3: Added IWM, DIA, XLK for broad market + sector coverage
+# ═══════════════════════════════════════════════════════════════════════════
+
 SPY:
   exchange: NYSE
   lot_size: 1
@@ -99,7 +111,41 @@ QQQ:
   trading_hours: "0930-1600"
   sector: ETF_INDEX
 
-# BLOCKER-1 FIX: FINANCE sector for diversification
+# AUDIT FIX 8.3: Russell 2000 small-cap exposure
+IWM:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "0930-1600"
+  sector: ETF_INDEX
+
+# AUDIT FIX 8.3: Dow Jones Industrial Average
+DIA:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "0930-1600"
+  sector: ETF_INDEX
+
+# AUDIT FIX 8.3: Technology Select Sector SPDR
+XLK:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "0930-1600"
+  sector: ETF_INDEX
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FINANCE SECTOR (3 symbols, max 3 positions per sector cap)
+# AUDIT FIX 8.3: Added JPM, GS for major bank diversification
+# ═══════════════════════════════════════════════════════════════════════════
+
 BAC:
   exchange: NYSE
   lot_size: 1
@@ -109,7 +155,31 @@ BAC:
   trading_hours: "0930-1600"
   sector: FINANCE
 
-# BLOCKER-1 FIX: CONSUMER sector for diversification
+# AUDIT FIX 8.3: JPMorgan Chase
+JPM:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "0930-1600"
+  sector: FINANCE
+
+# AUDIT FIX 8.3: Goldman Sachs
+GS:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "0930-1600"
+  sector: FINANCE
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CONSUMER SECTOR (3 symbols, max 3 positions per sector cap)
+# AUDIT FIX 8.3: Added WMT, TGT for retail diversification
+# ═══════════════════════════════════════════════════════════════════════════
+
 COST:
   exchange: NASDAQ
   lot_size: 1
@@ -119,9 +189,64 @@ COST:
   trading_hours: "0930-1600"
   sector: CONSUMER
 
+# AUDIT FIX 8.3: Walmart
+WMT:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "0930-1600"
+  sector: CONSUMER
+
+# AUDIT FIX 8.3: Target
+TGT:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "0930-1600"
+  sector: CONSUMER
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HEALTHCARE SECTOR (3 symbols, max 3 positions per sector cap)
+# AUDIT FIX 8.3: NEW SECTOR for additional diversification
+# ═══════════════════════════════════════════════════════════════════════════
+
+# AUDIT FIX 8.3: Johnson & Johnson
+JNJ:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "0930-1600"
+  sector: HEALTHCARE
+
+# AUDIT FIX 8.3: UnitedHealth Group
+UNH:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "0930-1600"
+  sector: HEALTHCARE
+
+# AUDIT FIX 8.3: Pfizer
+PFE:
+  exchange: NYSE
+  lot_size: 1
+  fractional: true
+  shortable: true
+  marginable: true
+  trading_hours: "0930-1600"
+  sector: HEALTHCARE
+
 # ── Disabled symbols (keep commented) ────────────────────────────────────────
 
-# DISABLED: MU
+# DISABLED: MU (can re-enable if additional TECH allocation desired)
 # MU:
 #   exchange: NASDAQ
 #   lot_size: 1
@@ -130,5 +255,3 @@ COST:
 #   marginable: true
 #   trading_hours: "0930-1600"
 #   sector: TECH
-
-# ... (rest of disabled symbols unchanged)
