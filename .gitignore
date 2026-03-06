@@ -13,6 +13,8 @@ venv/
 /data/equity_state.json
 /dashboard_state.pkl
 /equity_state.json
+/active_trade_stats.json
+/watched_stop_exits.json
 *.log
 
 # Scrap / scratch files
