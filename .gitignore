@@ -9,18 +9,16 @@ venv/
 # VS Code
 .vscode/
 
-# Data / secrets
-data/equity_state.json
+# Runtime state / logs
+/data/equity_state.json
+/dashboard_state.pkl
+/equity_state.json
 *.log
 
 # Scrap / scratch files
 scrap.py
 todo.txt
-dashboard_state.pkl
-equity_state.json
-
 
 # Python cache
-__pycache__/
 */__pycache__/
 **/__pycache__/
