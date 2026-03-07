@@ -1,4 +1,13 @@
 # CHANGES:
+# MANUAL-CLOSE-RECONCILE-FIX — Added _reconcile_opening_compounds() helper and invoked it after
+#                               every critical position refresh so broker-side manual closes are
+#                               purged promptly from persisted opening state.
+# PRE-LIQUIDATION-REFRESH-FIX — Re-fetch broker positions immediately before weekend and daily-close
+#                               liquidation paths so stale top-of-loop snapshots do not drive close
+#                               attempts after manual operator intervention.
+# DAILY-CLOSE-CONTINUE-FIX — Added hard continue after daily-close liquidation branch so the loop
+#                            cannot proceed into kill-switch checks, sentiment checks, exposure
+#                            handling, or execution logic after deciding to flatten.
 # CLOSED-MARKET-GATE-FIX — Added a hard early-continue gate when the market is closed so the
 #                          loop cannot proceed into kill switch checks, order cancellation,
 #                          data pulls, or portfolio execution on a closed session.
@@ -115,6 +124,21 @@ def _persist_opening_compounds(opening_compounds: Dict[str, float]) -> None:
     _save_equity_state(state)
 
 
+def _reconcile_opening_compounds(
+    opening_compounds: Dict[str, float],
+    positions: Dict[str, PositionInfo],
+) -> None:
+    stale_syms = [s for s in list(opening_compounds.keys()) if s not in positions]
+    if not stale_syms:
+        return
+    logger.info(
+        f"Reconciling stale opening_compounds for broker-flat symbols: {stale_syms}"
+    )
+    for s in stale_syms:
+        del opening_compounds[s]
+    _persist_opening_compounds(opening_compounds)
+
+
 def _persist_vol_and_sentiment(
     risk_engine: RiskEngine,
     sentiment_module: SentimentModule,
@@ -218,14 +242,7 @@ def main() -> None:
     )
 
     positions_at_start = pm.get_positions(opening_compounds=_opening_compounds)
-    stale_syms = [s for s in list(_opening_compounds) if s not in positions_at_start]
-    if stale_syms:
-        logger.info(
-            f"Startup reconcile: purging stale opening_compounds for {stale_syms}"
-        )
-        for s in stale_syms:
-            del _opening_compounds[s]
-        _persist_opening_compounds(_opening_compounds)
+    _reconcile_opening_compounds(_opening_compounds, positions_at_start)
     trade_stats.sync_open_positions(positions_at_start)
 
     _rescore_interval: int = 600
@@ -253,6 +270,7 @@ def main() -> None:
             time.sleep(60)
             continue
 
+        _reconcile_opening_compounds(_opening_compounds, positions)
         trade_stats.sync_open_positions(positions)
         snapshot = get_equity_snapshot_from_account(acct, positions)
         log_equity_snapshot(snapshot, market_open=market_open)
@@ -267,6 +285,9 @@ def main() -> None:
         persist_state(dashboard_state)
 
         if adapter.is_pre_weekend_close():
+            positions = pm.get_positions(opening_compounds=_opening_compounds)
+            _reconcile_opening_compounds(_opening_compounds, positions)
+            trade_stats.sync_open_positions(positions)
             logger.warning(
                 "WEEKEND CLOSE DETECTED: Closing all positions and sleeping "
                 "until next market open."
@@ -286,12 +307,18 @@ def main() -> None:
             continue
 
         if not market_open:
+            positions = pm.get_positions(opening_compounds=_opening_compounds)
+            _reconcile_opening_compounds(_opening_compounds, positions)
+            trade_stats.sync_open_positions(positions)
             dashboard_state.update(bot_state="IDLE")
             persist_state(dashboard_state)
             time.sleep(60)
             continue
 
         if adapter.is_pre_daily_close():
+            positions = pm.get_positions(opening_compounds=_opening_compounds)
+            _reconcile_opening_compounds(_opening_compounds, positions)
+            trade_stats.sync_open_positions(positions)
             logger.warning(
                 "DAILY CLOSE DETECTED: Closing all positions before market close "
                 "to avoid overnight gap risk."
@@ -302,6 +329,10 @@ def main() -> None:
                 opening_compounds=_opening_compounds,
                 persist_opening_compounds=_persist_opening_compounds,
             )
+            dashboard_state.update(bot_state="IDLE")
+            persist_state(dashboard_state)
+            time.sleep(60)
+            continue
 
         ks_state = kill_switch.check(snapshot)
         log_kill_switch_state(ks_state)
@@ -322,13 +353,9 @@ def main() -> None:
                 persist_opening_compounds=_persist_opening_compounds,
             )
             positions = pm.get_positions(opening_compounds=_opening_compounds)
+            _reconcile_opening_compounds(_opening_compounds, positions)
             trade_stats.sync_open_positions(positions)
             snapshot = get_equity_snapshot_from_account(acct, positions)
-
-        for sym in list(_opening_compounds.keys()):
-            if sym not in positions:
-                del _opening_compounds[sym]
-        _persist_opening_compounds(_opening_compounds)
 
         exposure_cap_notional = snapshot.equity * cfg.risk_limits.gross_exposure_cap_pct
         if (
@@ -379,6 +406,7 @@ def main() -> None:
                     trade_stats.register_entry_from_proposed(proposed)
 
         positions = pm.get_positions(opening_compounds=_opening_compounds)
+        _reconcile_opening_compounds(_opening_compounds, positions)
         trade_stats.sync_open_positions(positions)
 
         _check_and_exit_on_sentiment(
@@ -393,6 +421,7 @@ def main() -> None:
 
         open_orders_final = adapter.list_orders(status="open")
         positions_refreshed = pm.get_positions(opening_compounds=_opening_compounds)
+        _reconcile_opening_compounds(_opening_compounds, positions_refreshed)
         trade_stats.sync_open_positions(positions_refreshed)
         price_rows = build_price_rows(cfg.instruments, adapter)
         trade_stats.update_watched_trade_outcomes({row.symbol: row.last_price for row in price_rows})
