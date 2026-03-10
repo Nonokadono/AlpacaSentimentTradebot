@@ -1,6 +1,6 @@
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from core.risk_engine import EquitySnapshot, ProposedTrade, PositionInfo
@@ -210,7 +210,7 @@ def log_proposed_trade(trade: ProposedTrade, env_mode: str = "PAPER") -> None:
     sig_part    = f"{BRIGHTPURPLE}{trade.signal_score:.3f}{line_color}"
 
     msg = (
-        f"{datetime.utcnow().isoformat()}Z  {env_mode}  ProposedTrade  "
+        f"{datetime.now(timezone.utc).isoformat()}Z  {env_mode}  ProposedTrade  "
         f"symbol={symbol_part}  {trade.side}  "
         f"qty={trade.qty:.4f}  notional={notional:.2f}  "
         f"entry={trade.entry_price:.4f}  stop={trade.stop_price:.4f}  tp={trade.take_profit_price:.4f}  "
@@ -255,13 +255,13 @@ def log_portfolio_overview(trades: List[ProposedTrade], env_mode: str = "PAPER")
     logger.info(sep)
 
     if not trades:
-        header = f"{datetime.utcnow().isoformat()}Z  {env_mode}  PORTFOLIO OVERVIEW"
+        header = f"{datetime.now(timezone.utc).isoformat()}Z  {env_mode}  PORTFOLIO OVERVIEW"
         logger.info(f"{DEEPBLUE}{header}{RESET}")
         logger.info(f"{DEEPBLUE}No new trades selected in this cycle.{RESET}")
         logger.info(sep)
         return
 
-    header = f"{datetime.utcnow().isoformat()}Z  {env_mode}  PORTFOLIO OVERVIEW"
+    header = f"{datetime.now(timezone.utc).isoformat()}Z  {env_mode}  PORTFOLIO OVERVIEW"
     logger.info(f"{lc}{header}{RESET}")
 
     for t in trades:
@@ -295,7 +295,7 @@ def log_equity_snapshot(
     dd_color    = SIGNALRED  if snapshot.drawdown_pct   < 0 else SIGNALGREEN
 
     msg = (
-        f"{datetime.utcnow().isoformat()}Z  EquitySnapshot  "
+        f"{datetime.now(timezone.utc).isoformat()}Z  EquitySnapshot  "
         f"equity={snapshot.equity:.2f}  cash={snapshot.cash:.2f}  "
         f"portfoliovalue={snapshot.portfolio_value:.2f}  "
         f"grossexp={snapshot.gross_exposure:.2f}  "
@@ -485,7 +485,7 @@ def log_sentiment_close_decision(
     symbol_part = f"{BRIGHTPURPLE}{symbol}{lc}"
 
     msg = (
-        f"{datetime.utcnow().isoformat()}Z  {env_mode}  SentimentExit  "
+        f"{datetime.now(timezone.utc).isoformat()}Z  {env_mode}  SentimentExit  "
         f"symbol={symbol_part}  side={side}  qty={qty:.4f}  "
         f"{score_frag}  conf={confidence:.2f}  "
         f"reason_for_exit={reason}  "

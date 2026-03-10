@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Bash(python -m pytest tests/ -x -q)",
+      "Bash(python -c \"from monitoring.dashboard import DashboardState, PositionRow, PriceRow, build_position_rows, build_price_rows, load_state, persist_state, launch_dashboard; ds = DashboardState\\(\\); print\\(f''DashboardState fields: {len\\(ds.__dataclass_fields__\\)}''\\); pr = PositionRow\\(''TEST'', 100.0, 95.0, 0.05, 5.0, 110.0, 90.0, ''long'', 10.0, 1000.0\\); print\\(f''PositionRow: {pr.symbol} side={pr.side} qty={pr.qty}''\\); print\\(''All imports OK''\\)\")",
+      "Bash(python -c \":*)"
+    ]
+  }
+}

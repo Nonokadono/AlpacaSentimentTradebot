@@ -95,11 +95,9 @@ class SentimentConfig:
     # Minimum model confidence for the soft exit tier.
     exit_confidence_min: float = 0.5
     #
-    # Improvement E: exponent applied to confidence before multiplying by base.
-    # gamma=1.0 -> linear (original behaviour); gamma=2.0 -> convex weighting
-    # that rewards high-confidence scores more and down-weights low-confidence
-    # ones.  Clamped to [1.0, 4.0] at runtime.
-    confidence_gamma: float = 2.0
+    # L3 FIX: Removed dead confidence_gamma field (was 2.0, never referenced
+    # at runtime).  If convex confidence weighting is needed in the future,
+    # re-add the field and wire it into _check_and_exit_on_sentiment().
     #
     # CRASH-1 FIX: PnL-coupled sentiment-exit threshold scaling.
     # pnl_exit_scale_enabled=False (default) means the else-branch in

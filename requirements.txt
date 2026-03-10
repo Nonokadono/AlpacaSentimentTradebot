@@ -1,4 +1,9 @@
+# GAP 8.5 FIX: Added missing dependencies and version pins.
 alpaca-trade-api>=3.0.0
 PyYAML>=6.0
 pytz>=2024.1
-PyQt5
+requests>=2.28.0
+PyQt5>=5.15.0
+# backports.zoneinfo is only required for Python < 3.9.
+# Uncomment the line below if running on Python 3.8:
+# backports.zoneinfo>=0.2.1

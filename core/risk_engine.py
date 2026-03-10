@@ -291,8 +291,11 @@ class RiskEngine:
             if vol_norm <= 0.0:
                 vol_norm = 0.002
         else:
-            # Warm-up fallback (same as the prior fixed constant).
-            vol_norm = 0.002
+            # H3 FIX: Raised warm-up fallback from 0.002 to 0.005 so that
+            # Kelly-sized positions are not crushed to the floor during the
+            # first 20 data points (~100 min of 5-min bars).  0.005 is a
+            # more representative per-bar std-dev for large-cap equities.
+            vol_norm = 0.005
 
         volfactor = volatility / vol_norm if volatility > 0 else 0.0
         vol_penalty = 1.0 / (1.0 + volfactor)

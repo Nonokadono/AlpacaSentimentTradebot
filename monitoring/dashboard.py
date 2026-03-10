@@ -1,44 +1,47 @@
-# CHANGES:
-# FIX 1: Replace threading with multiprocessing to comply with PyQt5's
-#   requirement that QApplication must be created in the main thread of a process.
-#   The GUI now spawns as a separate OS process via multiprocessing.Process.
+# REDESIGN: Modern frameless fintech-style PyQt5 dashboard.
 #
-# FIX 2: Remove invalid QTabWidget.setShortcut() calls. QTabWidget doesn't have
-#   a setShortcut method. Keyboard shortcuts (Ctrl+P, Ctrl+O) removed for now
-#   (can be re-added later using QShortcut if needed, but not blocking launch).
+# Architecture preserved:
+#   - multiprocessing.Process GUI (PyQt5 requires QApplication in main thread of process)
+#   - Pickle-based IPC via dashboard_state.pkl (atomic writes)
+#   - build_position_rows() / build_price_rows() helpers called from main.py
 #
-# FIX 3: _run_gui() now creates a fresh QApplication(sys.argv) unconditionally
-#   since it runs in a separate process with its own main thread.
+# UI changes:
+#   - Frameless window with custom title bar (drag, resize, min/max/close)
+#   - Metric cards row (equity, unrealized P&L, realized today, daily %, drawdown, exposure)
+#   - Enhanced positions table (side, qty, notional columns)
+#   - Modern dark color palette with global QSS stylesheet
+#   - Custom status bar with state badge
 
 from __future__ import annotations
 
 import logging
 import multiprocessing
+import os
 import pickle
 import sys
+import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Dict, List, Optional
 
 logger = logging.getLogger("tradebot")
 
 # ── dev_mode flag ──────────────────────────────────────────────────────────────
-# Set to True to run headless (raw logging, no GUI).
-# Set to False (default) to launch the full PyQt5 desktop window.
 dev_mode: bool = False
 
 # ── PyQt5 availability check ───────────────────────────────────────────────────
 try:
-    from PyQt5.QtCore import QTimer, Qt, pyqtSignal
-    from PyQt5.QtGui import QColor, QFont, QPalette
+    from PyQt5.QtCore import QPoint, QSize, QTimer, Qt
+    from PyQt5.QtGui import QColor, QCursor, QFont, QPainter, QPainterPath, QPen
     from PyQt5.QtWidgets import (
         QApplication,
+        QGraphicsDropShadowEffect,
         QHBoxLayout,
+        QHeaderView,
         QLabel,
-        QMainWindow,
-        QMessageBox,
         QPushButton,
+        QSizePolicy,
         QTabWidget,
         QTableWidget,
         QTableWidgetItem,
@@ -48,6 +51,32 @@ try:
     _PYQT5_AVAILABLE = True
 except ImportError:
     _PYQT5_AVAILABLE = False
+
+# ── Color palette ──────────────────────────────────────────────────────────────
+COLORS = {
+    "bg_primary":          "#0B0E14",
+    "bg_secondary":        "#111827",
+    "bg_tertiary":         "#1A1F2E",
+    "bg_elevated":         "#1F2937",
+    "text_primary":        "#E5E7EB",
+    "text_secondary":      "#9CA3AF",
+    "text_muted":          "#4B5563",
+    "accent":              "#3B82F6",
+    "accent_hover":        "#60A5FA",
+    "success":             "#10B981",
+    "success_bg":          "#064E3B",
+    "danger":              "#EF4444",
+    "danger_bg":           "#7F1D1D",
+    "warning":             "#F59E0B",
+    "warning_bg":          "#78350F",
+    "info":                "#06B6D4",
+    "border":              "#1F2937",
+    "border_subtle":       "#374151",
+    "divider":             "#1F2937",
+    "titlebar_bg":         "#0B0E14",
+    "titlebar_btn_hover":  "#1F2937",
+    "titlebar_close_hover": "#DC2626",
+}
 
 # ── Shared state dataclasses ───────────────────────────────────────────────────
 
@@ -62,6 +91,9 @@ class PositionRow:
     pnl: float              # absolute dollar P&L
     take_profit: float
     stop_loss: float
+    side: str = "long"      # "long" or "short"
+    qty: float = 0.0
+    notional: float = 0.0
 
 
 @dataclass
@@ -84,11 +116,30 @@ class DashboardState:
     cash: float = 0.0
     buying_power: float = 0.0
     cycle_count: int = 0
-    last_run_ts: float = 0.0          # time.time() of last cycle start
-    bot_state: str = "IDLE"           # "SCANNING" | "EXECUTING" | "IDLE" | "HALTED"
+    last_run_ts: float = 0.0
+    bot_state: str = "IDLE"
     market_open: bool = False
     positions: List[PositionRow] = field(default_factory=list)
     prices: List[PriceRow] = field(default_factory=list)
+    # Extended equity/risk fields for metric cards
+    equity: float = 0.0
+    portfolio_value: float = 0.0
+    unrealized_pl: float = 0.0
+    realized_pl_today: float = 0.0
+    daily_loss_pct: float = 0.0
+    drawdown_pct: float = 0.0
+    gross_exposure: float = 0.0
+    high_watermark_equity: float = 0.0
+    num_positions: int = 0
+    max_positions: int = 0
+
+    def __setstate__(self, state: dict) -> None:
+        """Backward-compatible unpickle: fill missing fields with defaults."""
+        defaults = DashboardState()
+        for f in fields(DashboardState):
+            if f.name not in state:
+                state[f.name] = getattr(defaults, f.name)
+        self.__dict__.update(state)
 
     def update(
         self,
@@ -100,6 +151,16 @@ class DashboardState:
         market_open: Optional[bool] = None,
         positions: Optional[List[PositionRow]] = None,
         prices: Optional[List[PriceRow]] = None,
+        equity: Optional[float] = None,
+        portfolio_value: Optional[float] = None,
+        unrealized_pl: Optional[float] = None,
+        realized_pl_today: Optional[float] = None,
+        daily_loss_pct: Optional[float] = None,
+        drawdown_pct: Optional[float] = None,
+        gross_exposure: Optional[float] = None,
+        high_watermark_equity: Optional[float] = None,
+        num_positions: Optional[int] = None,
+        max_positions: Optional[int] = None,
     ) -> None:
         """Update one or more fields. Called by main.py before persist_state()."""
         if cash is not None:
@@ -117,6 +178,26 @@ class DashboardState:
             self.positions = positions
         if prices is not None:
             self.prices = prices
+        if equity is not None:
+            self.equity = equity
+        if portfolio_value is not None:
+            self.portfolio_value = portfolio_value
+        if unrealized_pl is not None:
+            self.unrealized_pl = unrealized_pl
+        if realized_pl_today is not None:
+            self.realized_pl_today = realized_pl_today
+        if daily_loss_pct is not None:
+            self.daily_loss_pct = daily_loss_pct
+        if drawdown_pct is not None:
+            self.drawdown_pct = drawdown_pct
+        if gross_exposure is not None:
+            self.gross_exposure = gross_exposure
+        if high_watermark_equity is not None:
+            self.high_watermark_equity = high_watermark_equity
+        if num_positions is not None:
+            self.num_positions = num_positions
+        if max_positions is not None:
+            self.max_positions = max_positions
 
 
 # ── Singleton state shared between main loop and GUI ───────────────────────────
@@ -127,10 +208,26 @@ STATE_FILE = Path("dashboard_state.pkl")
 
 
 def persist_state(state: DashboardState) -> None:
-    """Pickle dashboard_state to disk for cross-process IPC."""
+    """Pickle dashboard_state to disk for cross-process IPC.
+
+    Uses atomic tempfile + os.replace pattern so a crash during
+    write cannot corrupt the dashboard state file.
+    """
     try:
-        with STATE_FILE.open("wb") as f:
-            pickle.dump(state, f)
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=STATE_FILE.parent,
+            prefix=".dashboard_state_",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(tmp_fd, "wb") as f:
+                pickle.dump(state, f)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            os.unlink(tmp_path)
+            raise
+        os.replace(tmp_path, STATE_FILE)
     except Exception as e:
         logger.warning(f"persist_state error: {e}")
 
@@ -147,362 +244,826 @@ def load_state() -> DashboardState:
         return DashboardState()
 
 
+# ── Global QSS stylesheet ─────────────────────────────────────────────────────
+
+_FONT_UI = "'Segoe UI', 'SF Pro Display', 'Helvetica Neue', sans-serif"
+_FONT_MONO = "'Cascadia Code', 'Consolas', 'Courier New', monospace"
+
+GLOBAL_QSS = f"""
+/* === Scrollbars === */
+QScrollBar:vertical {{
+    background: {COLORS['bg_primary']};
+    width: 8px;
+    border: none;
+    margin: 0;
+}}
+QScrollBar::handle:vertical {{
+    background: {COLORS['border_subtle']};
+    border-radius: 4px;
+    min-height: 30px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background: {COLORS['text_muted']};
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0px;
+}}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+    background: none;
+}}
+QScrollBar:horizontal {{
+    background: {COLORS['bg_primary']};
+    height: 8px;
+    border: none;
+}}
+QScrollBar::handle:horizontal {{
+    background: {COLORS['border_subtle']};
+    border-radius: 4px;
+    min-width: 30px;
+}}
+QScrollBar::handle:horizontal:hover {{
+    background: {COLORS['text_muted']};
+}}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+    width: 0px;
+}}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+    background: none;
+}}
+
+/* === Tab Widget === */
+QTabWidget::pane {{
+    background: {COLORS['bg_secondary']};
+    border: 1px solid {COLORS['border']};
+    border-top: none;
+    border-radius: 0 0 8px 8px;
+}}
+QTabBar::tab {{
+    background: {COLORS['bg_elevated']};
+    color: {COLORS['text_muted']};
+    padding: 8px 24px;
+    margin-right: 2px;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    font-family: {_FONT_UI};
+    font-size: 13px;
+    font-weight: 500;
+}}
+QTabBar::tab:selected {{
+    background: {COLORS['bg_secondary']};
+    color: {COLORS['accent']};
+    border-bottom: 2px solid {COLORS['accent']};
+}}
+QTabBar::tab:hover:!selected {{
+    background: {COLORS['bg_tertiary']};
+    color: {COLORS['text_secondary']};
+}}
+
+/* === Tables === */
+QTableWidget {{
+    background-color: {COLORS['bg_secondary']};
+    alternate-background-color: {COLORS['bg_tertiary']};
+    color: {COLORS['text_primary']};
+    gridline-color: {COLORS['divider']};
+    border: none;
+    font-family: {_FONT_MONO};
+    font-size: 13px;
+    selection-background-color: {COLORS['bg_tertiary']};
+    selection-color: {COLORS['text_primary']};
+    outline: none;
+}}
+QHeaderView::section {{
+    background-color: {COLORS['bg_elevated']};
+    color: {COLORS['text_secondary']};
+    padding: 8px 10px;
+    border: none;
+    border-bottom: 1px solid {COLORS['border']};
+    border-right: 1px solid {COLORS['border']};
+    font-family: {_FONT_UI};
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+}}
+QTableWidget::item {{
+    padding: 6px 10px;
+    border-bottom: 1px solid {COLORS['divider']};
+}}
+
+/* === Tooltip === */
+QToolTip {{
+    background: {COLORS['bg_elevated']};
+    color: {COLORS['text_primary']};
+    border: 1px solid {COLORS['border_subtle']};
+    padding: 4px 8px;
+    font-family: {_FONT_UI};
+    font-size: 12px;
+}}
+"""
+
 # ── PyQt5 GUI implementation ───────────────────────────────────────────────────
 
 if _PYQT5_AVAILABLE:
 
-    class TradeBotMainWindow(QMainWindow):
-        """PyQt5 main window for the Alpaca trading bot dashboard."""
+    # ── Custom widgets ─────────────────────────────────────────────────────
+
+    class TitleBarButton(QPushButton):
+        """Flat title-bar button (minimize / maximize / close)."""
+
+        def __init__(self, text: str, is_close: bool = False, parent: QWidget = None) -> None:
+            super().__init__(text, parent)
+            self._is_close = is_close
+            self.setFixedSize(46, 36)
+            self.setCursor(QCursor(Qt.PointingHandCursor))
+            base = (
+                f"QPushButton {{ background: transparent; border: none; "
+                f"color: {COLORS['text_secondary']}; font-size: 16px; "
+                f"font-family: {_FONT_UI}; }}"
+            )
+            if is_close:
+                hover = (
+                    f"QPushButton:hover {{ background: {COLORS['titlebar_close_hover']}; "
+                    f"color: #FFFFFF; }}"
+                )
+            else:
+                hover = (
+                    f"QPushButton:hover {{ background: {COLORS['titlebar_btn_hover']}; "
+                    f"color: {COLORS['text_primary']}; }}"
+                )
+            self.setStyleSheet(base + hover)
+
+    class TitleBar(QWidget):
+        """Custom frameless title bar with drag-to-move and window controls."""
+
+        def __init__(self, parent: QWidget) -> None:
+            super().__init__(parent)
+            self._parent = parent
+            self._drag_pos: Optional[QPoint] = None
+            self.setFixedHeight(40)
+            self.setStyleSheet(
+                f"background: {COLORS['titlebar_bg']}; "
+                f"border-bottom: 1px solid {COLORS['border']};"
+            )
+
+            layout = QHBoxLayout(self)
+            layout.setContentsMargins(16, 0, 0, 0)
+            layout.setSpacing(0)
+
+            # App title
+            title = QLabel("Alpaca TradeBot")
+            title.setStyleSheet(
+                f"color: {COLORS['text_secondary']}; "
+                f"font-family: {_FONT_UI}; font-size: 13px; font-weight: 600; "
+                f"background: transparent; border: none;"
+            )
+            layout.addWidget(title)
+            layout.addStretch()
+
+            # Window control buttons
+            self._btn_min = TitleBarButton("\u2014")  # em-dash
+            self._btn_max = TitleBarButton("\u25a1")  # white square
+            self._btn_close = TitleBarButton("\u2715", is_close=True)  # multiplication X
+            self._btn_min.clicked.connect(self._on_minimize)
+            self._btn_max.clicked.connect(self._on_maximize)
+            self._btn_close.clicked.connect(self._on_close)
+            layout.addWidget(self._btn_min)
+            layout.addWidget(self._btn_max)
+            layout.addWidget(self._btn_close)
+
+        def _on_minimize(self) -> None:
+            self._parent.showMinimized()
+
+        def _on_maximize(self) -> None:
+            if self._parent.isMaximized():
+                self._parent.showNormal()
+                self._btn_max.setText("\u25a1")
+            else:
+                self._parent.showMaximized()
+                self._btn_max.setText("\u25a3")  # filled square
+
+        def _on_close(self) -> None:
+            QApplication.quit()
+            os._exit(0)
+
+        def mousePressEvent(self, event) -> None:
+            if event.button() == Qt.LeftButton:
+                self._drag_pos = event.globalPos() - self._parent.frameGeometry().topLeft()
+                event.accept()
+
+        def mouseDoubleClickEvent(self, event) -> None:
+            if event.button() == Qt.LeftButton:
+                self._on_maximize()
+
+        def mouseMoveEvent(self, event) -> None:
+            if self._drag_pos is not None and event.buttons() == Qt.LeftButton:
+                if self._parent.isMaximized():
+                    self._parent.showNormal()
+                    self._btn_max.setText("\u25a1")
+                    # Recalculate drag pos after un-maximize
+                    self._drag_pos = QPoint(
+                        self._parent.width() // 2,
+                        self.height() // 2,
+                    )
+                self._parent.move(event.globalPos() - self._drag_pos)
+                event.accept()
+
+        def mouseReleaseEvent(self, event) -> None:
+            self._drag_pos = None
+
+    class MetricCard(QWidget):
+        """Rounded card showing a single KPI metric."""
+
+        def __init__(self, title: str, parent: QWidget = None) -> None:
+            super().__init__(parent)
+            self.setMinimumWidth(140)
+            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            self.setFixedHeight(80)
+            self.setStyleSheet(
+                f"MetricCard {{ background: {COLORS['bg_secondary']}; "
+                f"border: 1px solid {COLORS['border']}; border-radius: 8px; }}"
+            )
+
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(14, 10, 14, 10)
+            layout.setSpacing(2)
+
+            self._title_label = QLabel(title.upper())
+            self._title_label.setStyleSheet(
+                f"color: {COLORS['text_muted']}; font-family: {_FONT_UI}; "
+                f"font-size: 10px; font-weight: 600; letter-spacing: 1px; "
+                f"background: transparent; border: none;"
+            )
+            layout.addWidget(self._title_label)
+
+            self._value_label = QLabel("\u2014")  # em-dash placeholder
+            self._value_label.setStyleSheet(
+                f"color: {COLORS['text_primary']}; font-family: {_FONT_MONO}; "
+                f"font-size: 20px; font-weight: 700; "
+                f"background: transparent; border: none;"
+            )
+            layout.addWidget(self._value_label)
+
+        def set_value(self, text: str, color: Optional[str] = None) -> None:
+            self._value_label.setText(text)
+            c = color or COLORS['text_primary']
+            self._value_label.setStyleSheet(
+                f"color: {c}; font-family: {_FONT_MONO}; "
+                f"font-size: 20px; font-weight: 700; "
+                f"background: transparent; border: none;"
+            )
+
+    class StatusBadge(QLabel):
+        """Self-coloring bot state badge."""
+
+        _STATE_STYLES = {
+            "IDLE": (COLORS['text_muted'], COLORS['bg_elevated']),
+            "SCANNING": ("#FEF08A", COLORS['warning_bg']),
+            "EXECUTING": ("#86EFAC", COLORS['success_bg']),
+            "HALTED": ("#FCA5A5", COLORS['danger_bg']),
+        }
+
+        def __init__(self, parent: QWidget = None) -> None:
+            super().__init__("IDLE", parent)
+            self.set_state("IDLE")
+
+        def set_state(self, state: str) -> None:
+            s = state.upper()
+            fg, bg = self._STATE_STYLES.get(s, self._STATE_STYLES["IDLE"])
+            self.setText(s)
+            self.setStyleSheet(
+                f"background: {bg}; color: {fg}; "
+                f"padding: 3px 12px; border-radius: 4px; "
+                f"font-family: {_FONT_UI}; font-size: 11px; font-weight: 700; "
+                f"letter-spacing: 1px;"
+            )
+
+    # ── Main window ────────────────────────────────────────────────────────
+
+    class TradeBotMainWindow(QWidget):
+        """Modern frameless PyQt5 dashboard for the Alpaca trading bot."""
+
+        _EDGE_SIZE = 6  # pixels from edge for resize grab
 
         def __init__(self, refresh_seconds: float = 5.0) -> None:
             super().__init__()
-            self._refresh_seconds = int(refresh_seconds * 1000)  # ms
+            self._refresh_ms = int(refresh_seconds * 1000)
             self._pulse = False
+
+            # Frameless + translucent for rounded corners
+            self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowMinMaxButtonsHint)
+            self.setAttribute(Qt.WA_TranslucentBackground)
             self.setWindowTitle("Alpaca TradeBot Dashboard")
-            self.setGeometry(100, 100, 1200, 700)
+            self.setMinimumSize(960, 600)
+            self.resize(1300, 760)
 
-            # Apply dark theme
-            self._apply_dark_theme()
+            # Resize tracking
+            self._resize_edge: Optional[str] = None
+            self._resize_start_pos: Optional[QPoint] = None
+            self._resize_start_geo = None
+            self.setMouseTracking(True)
 
-            # Build UI
-            self._build_menu()
-            self._build_central_widget()
-            self._build_status_bar()
+            # Outer layout (margin for drop shadow)
+            outer_layout = QVBoxLayout(self)
+            outer_layout.setContentsMargins(10, 10, 10, 10)
+            outer_layout.setSpacing(0)
 
-            # Start refresh timer
+            # Main content container (painted background)
+            self._container = QWidget()
+            self._container.setObjectName("MainContainer")
+            self._container.setStyleSheet(
+                f"QWidget#MainContainer {{ "
+                f"background: {COLORS['bg_primary']}; "
+                f"border: 1px solid {COLORS['border']}; "
+                f"border-radius: 10px; }}"
+            )
+            outer_layout.addWidget(self._container)
+
+            # Drop shadow
+            shadow = QGraphicsDropShadowEffect(self)
+            shadow.setBlurRadius(24)
+            shadow.setOffset(0, 6)
+            shadow.setColor(QColor(0, 0, 0, 100))
+            self._container.setGraphicsEffect(shadow)
+
+            # Container layout
+            container_layout = QVBoxLayout(self._container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(0)
+
+            # Title bar
+            self._title_bar = TitleBar(self)
+            container_layout.addWidget(self._title_bar)
+
+            # Content area
+            content = QWidget()
+            content.setStyleSheet("background: transparent; border: none;")
+            content_layout = QVBoxLayout(content)
+            content_layout.setContentsMargins(16, 12, 16, 0)
+            content_layout.setSpacing(10)
+            container_layout.addWidget(content, stretch=1)
+
+            # -- Metric cards row --
+            self._build_metric_cards(content_layout)
+
+            # -- Account info bar --
+            self._build_account_bar(content_layout)
+
+            # -- Tabs (positions / prices) --
+            self._build_tabs(content_layout)
+
+            # -- Status bar --
+            self._build_status_bar(container_layout)
+
+            # Refresh timer
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._refresh)
-            self._timer.start(self._refresh_seconds)
-
-            # Initial load
+            self._timer.start(self._refresh_ms)
             self._refresh()
 
-        def _apply_dark_theme(self) -> None:
-            """Apply custom dark palette to the application."""
-            palette = QPalette()
-            palette.setColor(QPalette.Window, QColor("#0d0d0d"))
-            palette.setColor(QPalette.WindowText, QColor("#e0e0e0"))
-            palette.setColor(QPalette.Base, QColor("#111827"))
-            palette.setColor(QPalette.AlternateBase, QColor("#1f2937"))
-            palette.setColor(QPalette.Text, QColor("#e0e0e0"))
-            palette.setColor(QPalette.Button, QColor("#1f2937"))
-            palette.setColor(QPalette.ButtonText, QColor("#9ca3af"))
-            palette.setColor(QPalette.Highlight, QColor("#22d3ee"))
-            palette.setColor(QPalette.HighlightedText, QColor("#0d0d0d"))
-            QApplication.instance().setPalette(palette)
+        # ── Build helpers ──────────────────────────────────────────────────
 
-        def _build_menu(self) -> None:
-            """Build the top menu bar."""
-            menubar = self.menuBar()
-            file_menu = menubar.addMenu("File")
+        def _build_metric_cards(self, parent_layout: QVBoxLayout) -> None:
+            row = QWidget()
+            row.setStyleSheet("background: transparent; border: none;")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(10)
 
-            settings_action = file_menu.addAction("Settings")
-            settings_action.triggered.connect(self._show_settings_todo)
+            self._card_equity = MetricCard("Equity")
+            self._card_unrealized = MetricCard("Unrealized P&L")
+            self._card_realized = MetricCard("Realized Today")
+            self._card_daily = MetricCard("Daily Change")
+            self._card_drawdown = MetricCard("Drawdown")
+            self._card_exposure = MetricCard("Gross Exposure")
 
-            console_action = file_menu.addAction("Console")
-            console_action.triggered.connect(self._show_console_todo)
+            for card in (
+                self._card_equity,
+                self._card_unrealized,
+                self._card_realized,
+                self._card_daily,
+                self._card_drawdown,
+                self._card_exposure,
+            ):
+                row_layout.addWidget(card)
 
-            file_menu.addSeparator()
+            parent_layout.addWidget(row)
 
-            exit_action = file_menu.addAction("Exit")
-            exit_action.triggered.connect(self._exit_app)
-
-        def _build_central_widget(self) -> None:
-            """Build the main content area."""
-            central = QWidget()
-            self.setCentralWidget(central)
-            layout = QVBoxLayout(central)
-            layout.setContentsMargins(8, 8, 8, 8)
-            layout.setSpacing(8)
-
-            # Top panel: account info
-            account_panel = QWidget()
-            account_layout = QHBoxLayout(account_panel)
-            account_layout.setContentsMargins(8, 8, 8, 8)
-            self._cash_label = QLabel("Cash: $0.00")
-            self._cash_label.setFont(QFont("Courier New", 11, QFont.Bold))
-            self._cash_label.setStyleSheet("color: #22d3ee;")
-            self._bp_label = QLabel("Buying Power: $0.00")
-            self._bp_label.setFont(QFont("Courier New", 11, QFont.Bold))
-            self._bp_label.setStyleSheet("color: #22d3ee;")
-            account_layout.addWidget(self._cash_label)
-            account_layout.addWidget(self._bp_label)
-            account_layout.addStretch()
-            account_panel.setStyleSheet(
-                "background-color: #111827; border: 1px solid #1f2937; border-radius: 4px;"
+        def _build_account_bar(self, parent_layout: QVBoxLayout) -> None:
+            bar = QWidget()
+            bar.setStyleSheet(
+                f"background: {COLORS['bg_secondary']}; "
+                f"border: 1px solid {COLORS['border']}; border-radius: 6px;"
             )
-            layout.addWidget(account_panel)
+            bar.setFixedHeight(36)
+            bar_layout = QHBoxLayout(bar)
+            bar_layout.setContentsMargins(14, 0, 14, 0)
+            bar_layout.setSpacing(24)
 
-            # Tabbed content: Positions and Prices
+            lbl_style = (
+                f"color: {COLORS['text_secondary']}; font-family: {_FONT_UI}; "
+                f"font-size: 12px; background: transparent; border: none;"
+            )
+            val_style = (
+                f"color: {COLORS['info']}; font-family: {_FONT_MONO}; "
+                f"font-size: 12px; font-weight: 600; background: transparent; border: none;"
+            )
+
+            self._acct_cash = QLabel("$0.00")
+            self._acct_cash.setStyleSheet(val_style)
+            self._acct_bp = QLabel("$0.00")
+            self._acct_bp.setStyleSheet(val_style)
+            self._acct_pos = QLabel("0 / 0")
+            self._acct_pos.setStyleSheet(val_style)
+
+            cash_lbl = QLabel("Cash")
+            cash_lbl.setStyleSheet(lbl_style)
+            bp_lbl = QLabel("Buying Power")
+            bp_lbl.setStyleSheet(lbl_style)
+            pos_lbl = QLabel("Positions")
+            pos_lbl.setStyleSheet(lbl_style)
+
+            for lbl, val in ((cash_lbl, self._acct_cash), (bp_lbl, self._acct_bp), (pos_lbl, self._acct_pos)):
+                bar_layout.addWidget(lbl)
+                bar_layout.addWidget(val)
+
+            bar_layout.addStretch()
+            parent_layout.addWidget(bar)
+
+        def _build_tabs(self, parent_layout: QVBoxLayout) -> None:
             self._tabs = QTabWidget()
             self._tabs.setStyleSheet(
-                "QTabWidget::pane { border: 1px solid #1f2937; background: #111827; }"
-                "QTabBar::tab { background: #1f2937; color: #9ca3af; padding: 6px 12px; }"
-                "QTabBar::tab:selected { background: #111827; color: #22d3ee; }"
+                "background: transparent; border: none;"
             )
 
-            # Positions tab
             self._positions_table = self._create_table(
-                ["Symbol", "Current Price", "Entry Price", "% Change", "P&L ($)", "Take Profit", "Stop Loss"]
+                ["Symbol", "Side", "Qty", "Entry", "Current", "% Chg", "P&L", "Notional", "TP", "SL"]
             )
-            self._tabs.addTab(self._positions_table, "Positions")
-
-            # Prices tab
             self._prices_table = self._create_table(
                 ["Symbol", "Last Price", "Bid", "Ask", "Daily % Change"]
             )
+            self._tabs.addTab(self._positions_table, "Positions")
             self._tabs.addTab(self._prices_table, "Prices")
 
-            # FIX 2: Removed invalid QTabWidget.setShortcut() calls.
-            # Keyboard shortcuts can be re-added later using QShortcut if needed.
-
-            layout.addWidget(self._tabs)
+            parent_layout.addWidget(self._tabs, stretch=1)
 
         def _create_table(self, headers: List[str]) -> QTableWidget:
-            """Create a styled QTableWidget with the given headers."""
             table = QTableWidget()
             table.setColumnCount(len(headers))
             table.setHorizontalHeaderLabels(headers)
             table.setAlternatingRowColors(True)
             table.setEditTriggers(QTableWidget.NoEditTriggers)
             table.setSelectionBehavior(QTableWidget.SelectRows)
-            table.horizontalHeader().setStretchLastSection(True)
-            table.setStyleSheet(
-                "QTableWidget { background-color: #111827; color: #e0e0e0; gridline-color: #1f2937; }"
-                "QHeaderView::section { background-color: #1f2937; color: #9ca3af; padding: 4px; border: none; }"
-            )
+            table.setShowGrid(False)
+            table.verticalHeader().setVisible(False)
+            table.setFocusPolicy(Qt.NoFocus)
+            # Stretch columns proportionally
+            header = table.horizontalHeader()
+            header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            for i in range(len(headers)):
+                header.setSectionResizeMode(i, QHeaderView.Stretch)
             return table
 
-        def _build_status_bar(self) -> None:
-            """Build the bottom status bar."""
-            status = self.statusBar()
-            status.setStyleSheet("background-color: #111827; color: #6b7280;")
-
-            # Live indicator
-            self._live_dot = QLabel("●")
-            self._live_dot.setStyleSheet("color: #4b5563; font-size: 14px;")
-            status.addWidget(self._live_dot)
-
-            # Cycle count
-            self._cycle_label = QLabel("Bot Cycle: #0")
-            status.addWidget(self._cycle_label)
-
-            # Last run
-            self._lastrun_label = QLabel("Last Run: —")
-            status.addWidget(self._lastrun_label)
-
-            # Bot state badge
-            self._state_badge = QLabel("IDLE")
-            self._state_badge.setStyleSheet(
-                "background-color: #1f2937; color: #6b7280; padding: 2px 8px; border-radius: 3px;"
+        def _build_status_bar(self, parent_layout: QVBoxLayout) -> None:
+            bar = QWidget()
+            bar.setFixedHeight(32)
+            bar.setStyleSheet(
+                f"background: {COLORS['bg_secondary']}; "
+                f"border-top: 1px solid {COLORS['border']}; "
+                f"border-bottom-left-radius: 10px; "
+                f"border-bottom-right-radius: 10px;"
             )
-            status.addPermanentWidget(self._state_badge)
+            bar_layout = QHBoxLayout(bar)
+            bar_layout.setContentsMargins(16, 0, 16, 0)
+            bar_layout.setSpacing(16)
+
+            lbl_style = (
+                f"color: {COLORS['text_muted']}; font-family: {_FONT_UI}; "
+                f"font-size: 11px; background: transparent; border: none;"
+            )
+
+            self._live_dot = QLabel("\u25cf")  # filled circle
+            self._live_dot.setStyleSheet(
+                f"color: {COLORS['text_muted']}; font-size: 12px; "
+                f"background: transparent; border: none;"
+            )
+            self._market_label = QLabel("Market Closed")
+            self._market_label.setStyleSheet(lbl_style)
+            self._cycle_label = QLabel("Cycle #0")
+            self._cycle_label.setStyleSheet(lbl_style)
+            self._lastrun_label = QLabel("Last Run: \u2014")
+            self._lastrun_label.setStyleSheet(lbl_style)
+            self._state_badge = StatusBadge()
+
+            bar_layout.addWidget(self._live_dot)
+            bar_layout.addWidget(self._market_label)
+            bar_layout.addWidget(self._cycle_label)
+            bar_layout.addWidget(self._lastrun_label)
+            bar_layout.addStretch()
+            bar_layout.addWidget(self._state_badge)
+
+            parent_layout.addWidget(bar)
+
+        # ── Refresh logic ──────────────────────────────────────────────────
 
         def _refresh(self) -> None:
-            """Load state from pickle file and update all widgets."""
             state = load_state()
 
-            # Update account info
-            self._cash_label.setText(f"Cash: ${state.cash:,.2f}")
-            self._bp_label.setText(f"Buying Power: ${state.buying_power:,.2f}")
+            # Metric cards
+            self._card_equity.set_value(f"${state.equity:,.2f}")
+            pl_color = COLORS['success'] if state.unrealized_pl >= 0 else COLORS['danger']
+            self._card_unrealized.set_value(f"${state.unrealized_pl:+,.2f}", pl_color)
+            rpl_color = COLORS['success'] if state.realized_pl_today >= 0 else COLORS['danger']
+            self._card_realized.set_value(f"${state.realized_pl_today:+,.2f}", rpl_color)
+            dl_color = COLORS['success'] if state.daily_loss_pct >= 0 else COLORS['danger']
+            self._card_daily.set_value(f"{state.daily_loss_pct * 100:+.3f}%", dl_color)
+            dd_color = COLORS['danger'] if state.drawdown_pct < 0 else COLORS['text_primary']
+            self._card_drawdown.set_value(f"{state.drawdown_pct * 100:.3f}%", dd_color)
+            self._card_exposure.set_value(f"${state.gross_exposure:,.2f}")
 
-            # Update status bar
+            # Account bar
+            self._acct_cash.setText(f"${state.cash:,.2f}")
+            self._acct_bp.setText(f"${state.buying_power:,.2f}")
+            self._acct_pos.setText(f"{state.num_positions} / {state.max_positions}")
+
+            # Status bar
             self._pulse = not self._pulse
             if state.market_open:
-                self._live_dot.setText("●" if self._pulse else "○")
-                self._live_dot.setStyleSheet("color: #22c55e; font-size: 14px;")
+                dot_char = "\u25cf" if self._pulse else "\u25cb"
+                self._live_dot.setText(dot_char)
+                self._live_dot.setStyleSheet(
+                    f"color: {COLORS['success']}; font-size: 12px; "
+                    f"background: transparent; border: none;"
+                )
+                self._market_label.setText("Market Open")
+                self._market_label.setStyleSheet(
+                    f"color: {COLORS['success']}; font-family: {_FONT_UI}; "
+                    f"font-size: 11px; font-weight: 600; "
+                    f"background: transparent; border: none;"
+                )
             else:
-                self._live_dot.setText("○")
-                self._live_dot.setStyleSheet("color: #4b5563; font-size: 14px;")
+                self._live_dot.setText("\u25cb")  # hollow circle
+                self._live_dot.setStyleSheet(
+                    f"color: {COLORS['text_muted']}; font-size: 12px; "
+                    f"background: transparent; border: none;"
+                )
+                self._market_label.setText("Market Closed")
+                self._market_label.setStyleSheet(
+                    f"color: {COLORS['text_muted']}; font-family: {_FONT_UI}; "
+                    f"font-size: 11px; background: transparent; border: none;"
+                )
 
-            self._cycle_label.setText(f"Bot Cycle: #{state.cycle_count:,}")
-
+            self._cycle_label.setText(f"Cycle #{state.cycle_count:,}")
             if state.last_run_ts > 0:
                 elapsed = time.time() - state.last_run_ts
                 self._lastrun_label.setText(f"Last Run: {elapsed:.1f}s ago")
 
-            state_upper = state.bot_state.upper()
-            self._state_badge.setText(state_upper)
-            if state_upper == "SCANNING":
-                self._state_badge.setStyleSheet(
-                    "background-color: #854d0e; color: #fef08a; padding: 2px 8px; border-radius: 3px;"
-                )
-            elif state_upper == "EXECUTING":
-                self._state_badge.setStyleSheet(
-                    "background-color: #14532d; color: #86efac; padding: 2px 8px; border-radius: 3px;"
-                )
-            elif state_upper == "HALTED":
-                self._state_badge.setStyleSheet(
-                    "background-color: #7f1d1d; color: #fca5a5; padding: 2px 8px; border-radius: 3px;"
-                )
-            else:
-                self._state_badge.setStyleSheet(
-                    "background-color: #1f2937; color: #6b7280; padding: 2px 8px; border-radius: 3px;"
-                )
+            self._state_badge.set_state(state.bot_state)
 
-            # Update positions table
+            # Tables
             self._update_positions_table(state.positions)
-
-            # Update prices table
             self._update_prices_table(state.prices)
 
+        # ── Table renderers ────────────────────────────────────────────────
+
         def _update_positions_table(self, positions: List[PositionRow]) -> None:
-            """Refresh the positions table with current data."""
             table = self._positions_table
             table.setRowCount(0)
 
             if not positions:
                 table.setRowCount(1)
-                item = QTableWidgetItem("— No open positions —")
-                item.setForeground(QColor("#4b5563"))
+                item = QTableWidgetItem("\u2014  No open positions")
+                item.setForeground(QColor(COLORS['text_muted']))
                 item.setTextAlignment(Qt.AlignCenter)
                 table.setItem(0, 0, item)
                 for col in range(1, table.columnCount()):
                     table.setItem(0, col, QTableWidgetItem(""))
                 return
 
-            mono_font = QFont("Courier New", 10)
+            mono = QFont("Consolas", 11)
+            mono_bold = QFont("Consolas", 11, QFont.Bold)
+
             for row_data in positions:
                 row = table.rowCount()
                 table.insertRow(row)
 
                 # Symbol
                 sym_item = QTableWidgetItem(row_data.symbol)
-                sym_item.setFont(QFont("Courier New", 10, QFont.Bold))
+                sym_item.setFont(mono_bold)
+                sym_item.setForeground(QColor(COLORS['text_primary']))
                 table.setItem(row, 0, sym_item)
 
-                # Current Price
-                cur_item = QTableWidgetItem(f"${row_data.current_price:,.2f}")
-                cur_item.setFont(mono_font)
-                cur_item.setForeground(QColor("#22d3ee"))
-                table.setItem(row, 1, cur_item)
+                # Side
+                side_upper = row_data.side.upper()
+                side_item = QTableWidgetItem(side_upper)
+                side_item.setFont(QFont("Segoe UI", 10, QFont.Bold))
+                side_color = COLORS['success'] if side_upper == "LONG" else COLORS['danger']
+                side_item.setForeground(QColor(side_color))
+                table.setItem(row, 1, side_item)
+
+                # Qty
+                qty_item = QTableWidgetItem(f"{abs(row_data.qty):,.0f}")
+                qty_item.setFont(mono)
+                qty_item.setForeground(QColor(COLORS['text_secondary']))
+                table.setItem(row, 2, qty_item)
 
                 # Entry Price
                 entry_item = QTableWidgetItem(f"${row_data.entry_price:,.2f}")
-                entry_item.setFont(mono_font)
-                table.setItem(row, 2, entry_item)
+                entry_item.setFont(mono)
+                entry_item.setForeground(QColor(COLORS['text_secondary']))
+                table.setItem(row, 3, entry_item)
+
+                # Current Price
+                cur_item = QTableWidgetItem(f"${row_data.current_price:,.2f}")
+                cur_item.setFont(mono)
+                cur_item.setForeground(QColor(COLORS['info']))
+                table.setItem(row, 4, cur_item)
 
                 # % Change
                 pct_str = f"{row_data.pct_change * 100:+.2f}%"
                 pct_item = QTableWidgetItem(pct_str)
-                pct_item.setFont(mono_font)
-                pct_item.setForeground(QColor("#22c55e" if row_data.pct_change >= 0 else "#ef4444"))
-                table.setItem(row, 3, pct_item)
+                pct_item.setFont(mono)
+                pct_color = COLORS['success'] if row_data.pct_change >= 0 else COLORS['danger']
+                pct_item.setForeground(QColor(pct_color))
+                table.setItem(row, 5, pct_item)
 
                 # P&L
                 pnl_str = f"${row_data.pnl:+,.2f}"
                 pnl_item = QTableWidgetItem(pnl_str)
-                pnl_item.setFont(mono_font)
-                pnl_item.setForeground(QColor("#22c55e" if row_data.pnl >= 0 else "#ef4444"))
-                table.setItem(row, 4, pnl_item)
+                pnl_item.setFont(mono_bold)
+                pnl_color = COLORS['success'] if row_data.pnl >= 0 else COLORS['danger']
+                pnl_item.setForeground(QColor(pnl_color))
+                table.setItem(row, 6, pnl_item)
+
+                # Notional
+                not_item = QTableWidgetItem(f"${row_data.notional:,.2f}")
+                not_item.setFont(mono)
+                not_item.setForeground(QColor(COLORS['text_secondary']))
+                table.setItem(row, 7, not_item)
 
                 # Take Profit
-                tp_item = QTableWidgetItem(f"${row_data.take_profit:,.2f}")
-                tp_item.setFont(mono_font)
-                tp_item.setForeground(QColor("#f59e0b"))
-                table.setItem(row, 5, tp_item)
+                tp_text = f"${row_data.take_profit:,.2f}" if row_data.take_profit > 0 else "\u2014"
+                tp_item = QTableWidgetItem(tp_text)
+                tp_item.setFont(mono)
+                tp_item.setForeground(QColor(COLORS['warning']))
+                table.setItem(row, 8, tp_item)
 
                 # Stop Loss
-                sl_item = QTableWidgetItem(f"${row_data.stop_loss:,.2f}")
-                sl_item.setFont(mono_font)
-                sl_item.setForeground(QColor("#f59e0b"))
-                table.setItem(row, 6, sl_item)
+                sl_text = f"${row_data.stop_loss:,.2f}" if row_data.stop_loss > 0 else "\u2014"
+                sl_item = QTableWidgetItem(sl_text)
+                sl_item.setFont(mono)
+                sl_item.setForeground(QColor(COLORS['warning']))
+                table.setItem(row, 9, sl_item)
 
         def _update_prices_table(self, prices: List[PriceRow]) -> None:
-            """Refresh the prices table with current data."""
             table = self._prices_table
             table.setRowCount(0)
 
             if not prices:
                 table.setRowCount(1)
-                item = QTableWidgetItem("— No price data —")
-                item.setForeground(QColor("#4b5563"))
+                item = QTableWidgetItem("\u2014  No price data")
+                item.setForeground(QColor(COLORS['text_muted']))
                 item.setTextAlignment(Qt.AlignCenter)
                 table.setItem(0, 0, item)
                 for col in range(1, table.columnCount()):
                     table.setItem(0, col, QTableWidgetItem(""))
                 return
 
-            mono_font = QFont("Courier New", 10)
+            mono = QFont("Consolas", 11)
+            mono_bold = QFont("Consolas", 11, QFont.Bold)
+
             for row_data in prices:
                 row = table.rowCount()
                 table.insertRow(row)
 
                 # Symbol
                 sym_item = QTableWidgetItem(row_data.symbol)
-                sym_item.setFont(QFont("Courier New", 10, QFont.Bold))
+                sym_item.setFont(mono_bold)
+                sym_item.setForeground(QColor(COLORS['text_primary']))
                 table.setItem(row, 0, sym_item)
 
                 # Last Price
                 last_item = QTableWidgetItem(f"${row_data.last_price:,.2f}")
-                last_item.setFont(mono_font)
-                last_item.setForeground(QColor("#22d3ee"))
+                last_item.setFont(mono)
+                last_item.setForeground(QColor(COLORS['info']))
                 table.setItem(row, 1, last_item)
 
                 # Bid
                 bid_item = QTableWidgetItem(f"${row_data.bid:,.2f}")
-                bid_item.setFont(mono_font)
+                bid_item.setFont(mono)
+                bid_item.setForeground(QColor(COLORS['text_secondary']))
                 table.setItem(row, 2, bid_item)
 
                 # Ask
                 ask_item = QTableWidgetItem(f"${row_data.ask:,.2f}")
-                ask_item.setFont(mono_font)
+                ask_item.setFont(mono)
+                ask_item.setForeground(QColor(COLORS['text_secondary']))
                 table.setItem(row, 3, ask_item)
 
                 # Daily % Change
                 daily_str = f"{row_data.daily_pct_change * 100:+.2f}%"
                 daily_item = QTableWidgetItem(daily_str)
-                daily_item.setFont(mono_font)
-                daily_item.setForeground(QColor("#22c55e" if row_data.daily_pct_change >= 0 else "#ef4444"))
+                daily_item.setFont(mono)
+                daily_color = COLORS['success'] if row_data.daily_pct_change >= 0 else COLORS['danger']
+                daily_item.setForeground(QColor(daily_color))
                 table.setItem(row, 4, daily_item)
 
-        def _show_settings_todo(self) -> None:
-            """Show TODO message for Settings menu item."""
-            QMessageBox.information(self, "TODO", "Settings panel not yet implemented.")
+        # ── Edge resize handling ───────────────────────────────────────────
 
-        def _show_console_todo(self) -> None:
-            """Show TODO message for Console menu item."""
-            QMessageBox.information(self, "TODO", "Console overlay not yet implemented.")
+        def _edge_at(self, pos: QPoint) -> Optional[str]:
+            """Return resize edge string or None if not on an edge."""
+            r = self.rect()
+            e = self._EDGE_SIZE
+            x, y = pos.x(), pos.y()
+            on_left = x <= e
+            on_right = x >= r.width() - e
+            on_top = y <= e
+            on_bottom = y >= r.height() - e
+            if on_top and on_left:
+                return "tl"
+            if on_top and on_right:
+                return "tr"
+            if on_bottom and on_left:
+                return "bl"
+            if on_bottom and on_right:
+                return "br"
+            if on_left:
+                return "l"
+            if on_right:
+                return "r"
+            if on_top:
+                return "t"
+            if on_bottom:
+                return "b"
+            return None
 
-        def _exit_app(self) -> None:
-            """Exit the application (both GUI and main process)."""
-            QApplication.quit()
-            import os
-            os._exit(0)
+        def _cursor_for_edge(self, edge: Optional[str]):
+            cursors = {
+                "l": Qt.SizeHorCursor, "r": Qt.SizeHorCursor,
+                "t": Qt.SizeVerCursor, "b": Qt.SizeVerCursor,
+                "tl": Qt.SizeFDiagCursor, "br": Qt.SizeFDiagCursor,
+                "tr": Qt.SizeBDiagCursor, "bl": Qt.SizeBDiagCursor,
+            }
+            return cursors.get(edge, Qt.ArrowCursor)
+
+        def mousePressEvent(self, event) -> None:
+            if event.button() == Qt.LeftButton:
+                edge = self._edge_at(event.pos())
+                if edge:
+                    self._resize_edge = edge
+                    self._resize_start_pos = event.globalPos()
+                    self._resize_start_geo = self.geometry()
+                    event.accept()
+                    return
+            super().mousePressEvent(event)
+
+        def mouseMoveEvent(self, event) -> None:
+            if self._resize_edge and self._resize_start_pos:
+                delta = event.globalPos() - self._resize_start_pos
+                geo = self._resize_start_geo
+                minw, minh = self.minimumWidth(), self.minimumHeight()
+                new_geo = geo.__class__(geo)
+
+                if "r" in self._resize_edge:
+                    new_geo.setWidth(max(minw, geo.width() + delta.x()))
+                if "b" in self._resize_edge:
+                    new_geo.setHeight(max(minh, geo.height() + delta.y()))
+                if "l" in self._resize_edge:
+                    new_w = max(minw, geo.width() - delta.x())
+                    new_geo.setLeft(geo.right() - new_w)
+                if "t" in self._resize_edge:
+                    new_h = max(minh, geo.height() - delta.y())
+                    new_geo.setTop(geo.bottom() - new_h)
+
+                self.setGeometry(new_geo)
+                event.accept()
+                return
+
+            edge = self._edge_at(event.pos())
+            self.setCursor(self._cursor_for_edge(edge))
+            super().mouseMoveEvent(event)
+
+        def mouseReleaseEvent(self, event) -> None:
+            self._resize_edge = None
+            self._resize_start_pos = None
+            self._resize_start_geo = None
+            super().mouseReleaseEvent(event)
 
 
 # ── Public helpers called by main.py ───────────────────────────────────────────
 
 def build_position_rows(
     positions: dict,          # Dict[str, PositionInfo] from PositionManager
-    open_orders: list,        # list of Alpaca order objects (used for TP/SL lookup)
+    open_orders: list,        # list of Alpaca order objects (kept for backward compat)
 ) -> List[PositionRow]:
     """Convert a PositionManager positions dict into UI PositionRow objects.
 
-    TP and SL are extracted by matching the symbol against the open_orders list.
-    If no matching bracket leg is found the values default to 0.0 — the UI
-    renders them as $0.00 rather than crashing.
+    TP and SL are read directly from PositionInfo.take_profit_price and
+    PositionInfo.stop_price, which PositionManager already populates from
+    the broker's open-order list.  This avoids a redundant order re-parse
+    and ensures the dashboard stays in sync with the console log.
     """
     rows: List[PositionRow] = []
-    # Build a quick lookup: symbol -> (tp_price, sl_price) from open orders
-    tp_map: Dict[str, float] = {}
-    sl_map: Dict[str, float] = {}
-    for o in open_orders:
-        sym = getattr(o, "symbol", None)
-        if sym is None:
-            continue
-        order_type = str(getattr(o, "type", "")).lower()
-        if order_type == "limit":
-            lp = getattr(o, "limit_price", None)
-            if lp is not None:
-                tp_map[sym] = float(lp)
-        if order_type in ("stop", "trailing_stop", "stop_limit"):
-            sp = getattr(o, "stop_price", None)
-            if sp is not None:
-                sl_map[sym] = float(sp)
 
     for sym, pos in positions.items():
-        # Extract entry price from avg_entry_price if available, otherwise 0.0
         entry_price = float(getattr(pos, "avg_entry_price", 0.0) or 0.0)
         current_price = float(pos.market_price)
         if entry_price > 0:
@@ -518,8 +1079,11 @@ def build_position_rows(
                 entry_price=entry_price,
                 pct_change=pct_change,
                 pnl=pnl,
-                take_profit=tp_map.get(sym, 0.0),
-                stop_loss=sl_map.get(sym, 0.0),
+                take_profit=float(pos.take_profit_price) if pos.take_profit_price is not None else 0.0,
+                stop_loss=float(pos.stop_price) if pos.stop_price is not None else 0.0,
+                side=str(pos.side),
+                qty=qty,
+                notional=float(pos.notional),
             )
         )
     return rows
@@ -529,16 +1093,7 @@ def build_price_rows(
     instruments: dict,   # Dict[str, InstrumentMeta]
     adapter,             # AlpacaAdapter instance
 ) -> List[PriceRow]:
-    """Fetch live quotes for all whitelisted symbols and return PriceRow list.
-
-    Uses adapter.get_last_quote() for the last trade price.  Bid/ask are
-    fetched via adapter.rest.get_latest_quote() when available; on failure
-    they fall back to last_price so the table is never empty.
-
-    Daily % change is computed as (last - prev_close) / prev_close using the
-    first bar of the current session fetched via get_recent_bars().  Falls back
-    to 0.0 on any error so the UI degrades gracefully.
-    """
+    """Fetch live quotes for all whitelisted symbols and return PriceRow list."""
     rows: List[PriceRow] = []
     for sym in instruments:
         try:
@@ -578,17 +1133,13 @@ def build_price_rows(
 
 
 # ── GUI process singleton ──────────────────────────────────────────────────────
-# FIX 1: Replace threading.Thread with multiprocessing.Process so the GUI
-# runs in its own process with its own main thread (PyQt5 requirement).
 _gui_process: Optional[multiprocessing.Process] = None
 
 
 def _run_gui_process(refresh_seconds: float) -> None:
-    """QApplication event loop entry point for the GUI process.
-    
-    FIX 3: Creates a fresh QApplication since this runs in a separate process.
-    """
+    """QApplication event loop entry point for the GUI process."""
     app = QApplication(sys.argv)
+    app.setStyleSheet(GLOBAL_QSS)
     window = TradeBotMainWindow(refresh_seconds=refresh_seconds)
     window.show()
     sys.exit(app.exec_())
@@ -601,9 +1152,6 @@ def launch_dashboard(refresh_seconds: float = 5.0) -> None:
       1. dev_mode == False
       2. PyQt5 is installed (_PYQT5_AVAILABLE == True)
       3. Not already running (singleton guard)
-
-    When any condition fails, logs a message and returns silently.
-    The bot never crashes when PyQt5 is missing.
     """
     global _gui_process
 
@@ -622,7 +1170,6 @@ def launch_dashboard(refresh_seconds: float = 5.0) -> None:
         logger.warning("Dashboard already running, skipping duplicate launch")
         return
 
-    # FIX 1: Spawn a separate process instead of a thread.
     _gui_process = multiprocessing.Process(
         target=_run_gui_process,
         args=(refresh_seconds,),

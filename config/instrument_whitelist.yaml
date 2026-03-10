@@ -90,6 +90,10 @@ SPY:
   trading_hours: "0930-1600"
   sector: ETF_INDEX
 
+# H2 FIX: Reclassified QQQ from ETF_INDEX to TECH because QQQ carries
+# ~60% mega-cap tech exposure.  With max_positions_per_sector=3, this
+# ensures QQQ competes with named-TECH symbols for sector slots,
+# preventing ~90% effective TECH correlation in the portfolio.
 QQQ:
   exchange: NASDAQ
   lot_size: 1
@@ -97,7 +101,7 @@ QQQ:
   shortable: true
   marginable: true
   trading_hours: "0930-1600"
-  sector: ETF_INDEX
+  sector: TECH
 
 # BLOCKER-1 FIX: FINANCE sector for diversification
 BAC:

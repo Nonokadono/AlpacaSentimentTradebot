@@ -15,6 +15,7 @@
 
 import logging
 import os
+import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -61,6 +62,11 @@ class AlpacaAdapter:
             base_url=base_url,
             api_version="v2",
         )
+        # L4 FIX: Cache the Alpaca clock result for 5 seconds to reduce
+        # redundant API calls (get_market_open, get_market_close_time,
+        # is_pre_close_blackout, etc. all call get_clock() each cycle).
+        self._clock_cache: Optional[Any] = None
+        self._clock_cache_ts: float = 0.0
 
     # --- Account / positions ---
 
@@ -80,21 +86,37 @@ class AlpacaAdapter:
 
     def get_clock(self) -> Optional[Any]:
         """Return the raw Alpaca clock object (is_open, next_close, next_open).
-        Returns None on error so callers must guard against None."""
+        Returns None on error so callers must guard against None.
+
+        L4 FIX: Results are cached for 5 seconds to avoid redundant API calls
+        when multiple methods (get_market_open, is_pre_close_blackout, etc.)
+        all query the clock within the same loop iteration.
+        """
+        now = _time.monotonic()
+        if self._clock_cache is not None and (now - self._clock_cache_ts) < 5.0:
+            return self._clock_cache
         try:
-            return self.rest.get_clock()
+            clock = self.rest.get_clock()
+            self._clock_cache = clock
+            self._clock_cache_ts = now
+            return clock
         except Exception as e:
             logger.warning(f"get_clock error: {e}")
             return None
 
     def get_market_open(self) -> bool:
         """Returns True if the US equity market is currently open, False otherwise.
-        Uses Alpaca's v2/clock endpoint."""
-        try:
-            clock = self.rest.get_clock()
-            return bool(clock.is_open)
-        except Exception:
+
+        GAP 8.1 FIX: Now uses self.get_clock() (5-second cached) instead of
+        self.rest.get_clock() (uncached).  Previously every call was a raw API
+        call, causing 4-12 redundant clock requests per loop iteration from
+        callers such as is_pre_weekend_close(), is_pre_close_blackout(),
+        is_monday_open_blackout(), and _compute_price_action_score().
+        """
+        clock = self.get_clock()
+        if clock is None:
             return False
+        return bool(clock.is_open)
 
     def get_market_close_time(self) -> Optional[datetime]:
         """
@@ -364,23 +386,34 @@ class AlpacaAdapter:
         """
         Return True if market is open AND within minutes_before of close
         AND the close is on a weekday (Mon-Thu, weekday 0-3).
-    
+
         Default 15 minutes ensures:
         - Enough time to close all positions before 16:00 ET close
         - Buffer for market order execution (typically 30-60 seconds)
         - Reliable trigger within one 10-minute loop cycle
+
+        GAP 8.2 FIX: Added try/except guard matching the pattern used by
+        is_pre_weekend_close(), is_pre_close_blackout(), and
+        is_monday_open_blackout(). Without this guard, an unexpected exception
+        could propagate to main.py and skip the daily close liquidation.
+        - Catches all exceptions, logs at WARNING level, and returns False.
+        - Never raises.
         """
-        if not self.get_market_open():
+        try:
+            if not self.get_market_open():
+                return False
+            close_time = self.get_market_close_time()
+            if close_time is None:
+                return False
+            # Only fire on weekdays (Mon-Thu), not Friday (handled by is_pre_weekend_close)
+            if close_time.weekday() not in (0, 1, 2, 3):
+                return False
+            now_utc = datetime.now(timezone.utc)
+            minutes_until_close = (close_time - now_utc).total_seconds() / 60.0
+            return 0 <= minutes_until_close <= minutes_before
+        except Exception as e:
+            logger.warning(f"is_pre_daily_close error: {e}")
             return False
-        close_time = self.get_market_close_time()
-        if close_time is None:
-            return False
-        # Only fire on weekdays (Mon-Thu), not Friday (handled by is_pre_weekend_close)
-        if close_time.weekday() not in (0, 1, 2, 3):
-           return False
-        now_utc = datetime.now(timezone.utc)
-        minutes_until_close = (close_time - now_utc).total_seconds() / 60.0
-        return 0 <= minutes_until_close <= minutes_before
 
 
     # --- News sentiment inputs ---

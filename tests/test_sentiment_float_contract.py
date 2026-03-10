@@ -1,6 +1,10 @@
 # CHANGES:
 # Added regression tests for the direct float sentiment contract and chaos sentinel.
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import unittest
 
 from ai_client import _normalize_model_sentiment

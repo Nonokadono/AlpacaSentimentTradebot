@@ -214,10 +214,14 @@ def _reconcile_opening_compounds(
 def _persist_vol_and_sentiment(
     risk_engine: RiskEngine,
     sentiment_module: SentimentModule,
+    signal_engine: Optional["SignalEngine"] = None,
 ) -> None:
     state = _safe_load_equity_state({})
     state["vol_history"] = risk_engine.export_vol_history()
     state["sentiment_cache"] = sentiment_module.export_cache()
+    # GAP 8.4 FIX: persist MACD history so signal line EMA is accurate after restarts.
+    if signal_engine is not None:
+        state["macd_history"] = signal_engine.export_macd_history()
     _save_equity_state(state)
 
 
@@ -365,10 +369,13 @@ def main() -> None:
     _startup_state = _safe_load_equity_state({})
     risk_engine.import_vol_history(_startup_state.get("vol_history", {}))
     sentiment.import_cache(_startup_state.get("sentiment_cache", {}))
+    # GAP 8.4 FIX: Restore MACD history so signal line EMA is accurate after restarts.
+    signal_engine.import_macd_history(_startup_state.get("macd_history", {}))
     logger.info(
-        "Startup state restored: vol_history symbols=%d  sentiment_cache symbols=%d",
+        "Startup state restored: vol_history symbols=%d  sentiment_cache symbols=%d  macd_history symbols=%d",
         len(risk_engine._vol_history),
         len(sentiment._cache),
+        len(signal_engine._macd_history),
     )
 
     try:
@@ -381,7 +388,7 @@ def main() -> None:
         positions_at_start = {}
     trade_stats.sync_open_positions(positions_at_start)
 
-    _rescore_interval: int = 600
+    _rescore_interval: int = 60
     try:
         launch_dashboard(refresh_seconds=5.0)
     except Exception as exc:
@@ -456,6 +463,16 @@ def main() -> None:
         _update_dashboard_state_safely(
             cash=snapshot.cash,
             buying_power=snapshot.day_trading_buying_power,
+            equity=snapshot.equity,
+            portfolio_value=snapshot.portfolio_value,
+            unrealized_pl=snapshot.unrealized_pl,
+            realized_pl_today=snapshot.realized_pl_today,
+            daily_loss_pct=snapshot.daily_loss_pct,
+            drawdown_pct=snapshot.drawdown_pct,
+            gross_exposure=snapshot.gross_exposure,
+            high_watermark_equity=snapshot.high_watermark_equity,
+            num_positions=len(positions),
+            max_positions=cfg.risk_limits.max_open_positions,
             cycle_count=_cycle_count,
             market_open=market_open,
             bot_state="SCANNING",
@@ -558,6 +575,14 @@ def main() -> None:
                     positions=build_position_rows(positions, open_orders_ui),
                     prices=price_rows,
                     bot_state="IDLE",
+                    equity=snapshot.equity,
+                    unrealized_pl=snapshot.unrealized_pl,
+                    realized_pl_today=snapshot.realized_pl_today,
+                    daily_loss_pct=snapshot.daily_loss_pct,
+                    drawdown_pct=snapshot.drawdown_pct,
+                    gross_exposure=snapshot.gross_exposure,
+                    num_positions=len(positions),
+                    max_positions=cfg.risk_limits.max_open_positions,
                 )
             except Exception as exc:
                 logger.warning("Exposure-cap dashboard refresh failed: %s", exc)
@@ -585,10 +610,7 @@ def main() -> None:
                     "LIVE_TRADING_ENABLED is false; skipping execute_proposed_trade submissions."
                 )
             else:
-                logger.info("Canceling all open orders before portfolio execution.")
                 try:
-                    # AUDIT FIX 1.3 — Prevent live-path crash if order cancellation fails.
-                    adapter.cancel_all_orders()
                     open_orders = _safe_list_open_orders(adapter)
                     proposed_trades = portfolio_builder.build_portfolio(
                         snapshot,
@@ -654,13 +676,21 @@ def main() -> None:
                 positions=build_position_rows(positions_refreshed, open_orders_final),
                 prices=price_rows,
                 bot_state="IDLE",
+                equity=snapshot.equity,
+                unrealized_pl=snapshot.unrealized_pl,
+                realized_pl_today=snapshot.realized_pl_today,
+                daily_loss_pct=snapshot.daily_loss_pct,
+                drawdown_pct=snapshot.drawdown_pct,
+                gross_exposure=snapshot.gross_exposure,
+                num_positions=len(positions_refreshed),
+                max_positions=cfg.risk_limits.max_open_positions,
             )
         except Exception as exc:
             logger.warning("End-of-loop monitoring refresh failed: %s", exc)
             positions_refreshed = positions
 
         try:
-            _persist_vol_and_sentiment(risk_engine, sentiment)
+            _persist_vol_and_sentiment(risk_engine, sentiment, signal_engine)
         except EquityStateError as exc:
             logger.error("Vol/sentiment persistence failed: %s", exc)
             _entry_disabled_due_to_persistence = True

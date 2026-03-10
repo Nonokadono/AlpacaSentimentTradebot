@@ -92,6 +92,22 @@ def _check_and_exit_on_sentiment(
         opening_compound = float(opening_compounds.get(symbol, 0.0))
         current_score = float(current_sentiment.score)
 
+        # H4 FIX: If baseline was lost (default 0.0) for a position that exists,
+        # adopt the current sentiment as the reference point.  Delta will be 0.0
+        # for this cycle (so soft/strong exits won't fire), but hard exit
+        # (chaos -2) still fires unconditionally.  Future cycles measure delta
+        # from the adopted baseline, restoring normal exit coverage.
+        if opening_compound == 0.0 and symbol not in opening_compounds:
+            opening_compounds[symbol] = current_score
+            persist_opening_compounds(opening_compounds)
+            logger.warning(
+                "Adopted current sentiment %.3f as baseline for %s "
+                "(missing opening_compound).",
+                current_score,
+                symbol,
+            )
+            opening_compound = current_score
+
         if pos.side == "long":
             delta = float(opening_compound - current_score)
         else:
@@ -504,12 +520,25 @@ class OrderExecutor:
             self.adapter.cancel_all_orders()
             self.adapter.close_all_positions()
             logger.info("All positions closed (atomic broker call).")
+            # B2 FIX: Wait for each position to confirm flat before purging
+            # baselines, so partial close failures retain sentiment-exit coverage.
+            purged_symbols: list = []
             for symbol in list(opening_compounds.keys()):
+                if self._wait_for_flat(symbol):
+                    purged_symbols.append(symbol)
+                else:
+                    logger.warning(
+                        "Position %s not confirmed flat after atomic close; "
+                        "retaining opening_compound baseline.",
+                        symbol,
+                    )
+            for symbol in purged_symbols:
                 if symbol in opening_compounds:
                     del opening_compounds[symbol]
             persist_opening_compounds(opening_compounds)
             logger.info(
-                "Purged all opening_compounds after weekend atomic close."
+                "Purged opening_compounds for confirmed-flat symbols: %s",
+                purged_symbols,
             )
         except Exception as e:
             logger.error(

@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
+import tempfile
 import uuid
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
@@ -25,6 +27,28 @@ TRADE_STATS_PATH = Path("data/trade_stats.jsonl")
 TRADE_STATS_HTML_PATH = Path("data/trade_stats_report.html")
 ACTIVE_TRADES_PATH = Path("data/active_trade_stats.json")
 WATCHED_STOP_EXITS_PATH = Path("data/watched_stop_exits.json")
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """GAP 8.7 FIX: Crash-safe write using tempfile + fsync + os.replace.
+
+    Ensures that a power failure or crash during write cannot leave a
+    partially-written or corrupted file at the target path.
+    """
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.stem}_",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        os.unlink(tmp_path)
+        raise
+    os.replace(tmp_path, path)
 
 
 @dataclass
@@ -435,11 +459,13 @@ class TradeStatsTracker:
         return output_path
 
     def _save_active_trades(self, trades: Dict[str, ActiveTrade]) -> None:
+        """GAP 8.7 FIX: Atomic write via tempfile + os.replace."""
         ACTIVE_TRADES_PATH.parent.mkdir(parents=True, exist_ok=True)
-        ACTIVE_TRADES_PATH.write_text(
-            json.dumps({symbol: asdict(trade) for symbol, trade in trades.items()}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        content = json.dumps(
+            {symbol: asdict(trade) for symbol, trade in trades.items()},
+            ensure_ascii=False, indent=2,
         )
+        _atomic_write_text(ACTIVE_TRADES_PATH, content)
 
     def _load_watched_stop_exits(self) -> Dict[str, WatchedStopExit]:
         if not WATCHED_STOP_EXITS_PATH.exists():
@@ -448,11 +474,13 @@ class TradeStatsTracker:
         return {trade_id: WatchedStopExit(**payload) for trade_id, payload in raw.items()}
 
     def _save_watched_stop_exits(self, watched: Dict[str, WatchedStopExit]) -> None:
+        """GAP 8.7 FIX: Atomic write via tempfile + os.replace."""
         WATCHED_STOP_EXITS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        WATCHED_STOP_EXITS_PATH.write_text(
-            json.dumps({trade_id: asdict(watch) for trade_id, watch in watched.items()}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        content = json.dumps(
+            {trade_id: asdict(watch) for trade_id, watch in watched.items()},
+            ensure_ascii=False, indent=2,
         )
+        _atomic_write_text(WATCHED_STOP_EXITS_PATH, content)
 
     def _close_active_trade_record(
         self,

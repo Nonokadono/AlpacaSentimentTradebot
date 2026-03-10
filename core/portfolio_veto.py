@@ -1,11 +1,14 @@
 # core/portfolio_veto.py
 import json
+import logging
 import os
 from typing import Dict, List
 
 import requests
 
 from core.risk_engine import ProposedTrade
+
+logger = logging.getLogger("tradebot")
 
 
 class PortfolioVeto:
@@ -86,7 +89,7 @@ class PortfolioVeto:
         try:
             resp = requests.post(self.apiurl, headers=headers, json=payload, timeout=30)
             if not resp.ok:
-                print("PortfolioVeto API error", resp.status_code, resp.text)
+                logger.warning("PortfolioVeto API error %s: %s", resp.status_code, resp.text)
                 return trades
 
             data = resp.json()
@@ -111,5 +114,5 @@ class PortfolioVeto:
                     allowed.append(t)
             return allowed
         except Exception as e:
-            print("PortfolioVeto exception", e)
+            logger.warning("PortfolioVeto exception: %s", e)
             return trades

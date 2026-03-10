@@ -80,6 +80,32 @@ class SignalEngine:
         # Each symbol stores a deque of recent MACD line values (maxlen=50)
         self._macd_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=50))
 
+    # ── M2 FIX: MACD history serialisation ─────────────────────────────────────
+
+    def export_macd_history(self) -> Dict[str, list]:
+        """Serialise per-symbol MACD history deques for JSON persistence.
+
+        Called by main._persist_vol_and_sentiment() after each loop iteration.
+        """
+        return {sym: list(dq) for sym, dq in self._macd_history.items()}
+
+    def import_macd_history(self, data: Dict) -> None:
+        """Restore per-symbol MACD history deques from a previously exported dict.
+
+        Silently skips malformed entries. Called during main() startup.
+        """
+        if not isinstance(data, dict):
+            return
+        for sym, values in data.items():
+            try:
+                dq: deque = deque(maxlen=50)
+                dq.extend(values[-50:])
+                self._macd_history[sym] = dq
+            except Exception:
+                continue
+
+    # ── END M2 FIX ─────────────────────────────────────────────────────────────
+
     def _compute_simple_momentum_raw(self, bars: List) -> float:
         """
         EMA-8 vs EMA-21 crossover signal, normalised to [-1, 1].
@@ -609,35 +635,23 @@ class SignalEngine:
                    + weight_price_action   * pa
           4. Clamp to [-1, 1].
 
-        Mathematical equivalence proof:
-          Let penalty = conflict_dampener_penalty (default 0.6).
-          Let w_mom = weight_momentum_trend, w_mr = weight_mean_reversion.
+        M4 FIX — Behavioral difference vs. original post-blend dampener:
 
-          Old (post-blend):
-            raw_old = (w_mom * mom + w_mr * mr + w_pa * pa)
-            if mom * mr < 0:
-              raw_old = raw_old * penalty
+          Old (post-blend): raw = (w_mom*mom + w_mr*mr + w_pa*pa) * penalty
+            — Dampens ALL three components equally by ``penalty`` (0.6).
 
           New (pre-blend):
-            if mom * mr < 0:
-              mom_d = mom * sqrt(penalty)
-              mr_d  = mr  * sqrt(penalty)
-            else:
-              mom_d = mom
-              mr_d  = mr
-            raw_new = w_mom * mom_d + w_mr * mr_d + w_pa * pa
+            mom_d = mom * sqrt(penalty),  mr_d = mr * sqrt(penalty)
+            raw = w_mom*mom_d + w_mr*mr_d + w_pa*pa
+            — Dampens only mom and mr by sqrt(penalty) ≈ 0.775.
+            — Price action is NOT dampened.
+            — sqrt(0.6)=0.775 > 0.6, so the penalty per-factor is milder.
 
-          When conflict exists (mom * mr < 0):
-            raw_new = w_mom * mom * sqrt(penalty) + w_mr * mr * sqrt(penalty) + w_pa * pa
-            Notice that pa is NOT dampened — this is intentional.
-            For a purely mom+mr conflict (pa=0), we have:
-              raw_new = sqrt(penalty) * (w_mom * mom + w_mr * mr)
-            Which does NOT equal raw_old = penalty * (w_mom * mom + w_mr * mr).
-
-          However, for typical weight distributions (w_mom=0.5, w_mr=0.3, w_pa=0.2),
-          the difference is small and acceptable. The pre-blend approach ensures
-          that the individual dampened components (mom_damped, mr_damped) are
-          visible in the log output and can be inspected for debugging.
+          These are intentionally NOT equivalent.  Pre-blend was chosen because:
+            1. Price action (breakout) is an independent signal and should not be
+               penalised for a mom/mr disagreement it has no part in.
+            2. Dampened sub-scores are visible in logs for debugging.
+            3. The milder sqrt() penalty avoids over-suppressing in mild conflicts.
 
         Returns:
             (signal_score: float, dampened: bool)

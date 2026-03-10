@@ -303,24 +303,24 @@ class SentimentModule:
         Return a rescore sleep interval in seconds based on the highest
         absolute sentiment score across open positions.
         Thresholds:
-            |s| >= 0.8  -> 120s   (high conviction / high risk)
-            |s| >= 0.5  -> 300s   (strong signal)
-            |s| >= 0.2  -> 600s   (current default)
-            |s| <  0.2  -> 900s   (neutral band, minimal alpha)
+            |s| >= 0.8  ->  60s   (high conviction / high risk — once per minute)
+            |s| >= 0.5  -> 120s   (strong signal)
+            |s| >= 0.2  -> 180s   (moderate signal)
+            |s| <  0.2  -> 300s   (neutral band, minimal alpha)
         """
         if max_abs_s >= 0.8:
-            return 120
+            return 60
         if max_abs_s >= 0.5:
-            return 300
+            return 120
         if max_abs_s >= 0.2:
-            return 600
-        return 900
+            return 180
+        return 300
 
     def adaptive_rescore_interval_hysteresis(self, max_abs_s: float, current_interval: int) -> int:
         target = self.adaptive_rescore_interval(max_abs_s)
         if target == current_interval:
             return current_interval
-        boundaries = {120: 0.8, 300: 0.5, 600: 0.2, 900: 0.0}
+        boundaries = {60: 0.8, 120: 0.5, 180: 0.2, 300: 0.0}
         current_boundary = boundaries.get(current_interval, 0.0)
         target_boundary = boundaries.get(target, 0.0)
         midpoint = (current_boundary + target_boundary) / 2.0
