@@ -108,10 +108,9 @@ class TestExecuteProposedTrade:
         executor.execute_proposed_trade(proposed)
         executor.adapter.submit_market_order.assert_called()
 
-    def test_api_error_returns_none(self):
-        from alpaca_trade_api.rest import APIError
+    def test_broker_error_returns_none(self):
         executor = _make_executor()
-        executor.adapter.submit_bracket_order.side_effect = APIError({"message": "fail"})
+        executor.adapter.submit_bracket_order.side_effect = Exception("broker error")
         proposed = _make_proposed()
         result = executor.execute_proposed_trade(proposed)
         assert result is None

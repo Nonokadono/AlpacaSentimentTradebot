@@ -9,7 +9,7 @@
 # PURGE-FIX — close_position_due_to_sentiment() now purges opening_compounds[symbol] only after
 #             a confirmed flat position, and retains the baseline on close failure.
 # WAIT-TIMEOUT-FIX — Added threading.Timer hard kill for _wait_for_position() to prevent hung
-#                    Alpaca poll from blocking the bot indefinitely. Timer spawns a daemon thread
+#                    IBKR poll from blocking the bot indefinitely. Timer spawns a daemon thread
 #                    that logs a CRITICAL error and raises SystemExit after timeout+5s grace period.
 #                    Main loop catches SystemExit and logs the forced termination before exiting.
 # PROTECTION-PATH-FIX — Fixed entry execution gating so fixed stop-loss / take-profit bracket
@@ -25,9 +25,7 @@ import time
 import threading
 from typing import Callable, Dict, Optional
 
-from alpaca_trade_api.rest import APIError
-
-from adapters.alpaca_adapter import AlpacaAdapter
+from adapters.ibkr_adapter import IbkrAdapter
 from config.config import BotConfig, ExecutionConfig
 from core.risk_engine import PositionInfo, ProposedTrade
 from core.sentiment import SentimentModule, SentimentResult
@@ -43,7 +41,7 @@ logger = logging.getLogger("tradebot")
 
 def _check_and_exit_on_sentiment(
     positions: Dict[str, PositionInfo],
-    adapter: AlpacaAdapter,
+    adapter: IbkrAdapter,
     sentiment_module: SentimentModule,
     executor: "OrderExecutor",
     cfg: BotConfig,
@@ -185,7 +183,7 @@ def _check_and_exit_on_sentiment(
 
 class OrderExecutor:
     """
-    Submits entry and exit orders to Alpaca.
+    Submits entry and exit orders to IBKR.
 
     Execution path (execute_proposed_trade):
       1. Log the proposed trade.
@@ -213,7 +211,7 @@ class OrderExecutor:
 
     def __init__(
         self,
-        adapter: AlpacaAdapter,
+        adapter: IbkrAdapter,
         env_mode: str,
         live_trading_enabled: bool,
         execution_cfg: ExecutionConfig,
@@ -252,7 +250,7 @@ class OrderExecutor:
         def _hard_kill():
             logger.critical(
                 f"HARD KILL: _wait_for_position({symbol}) exceeded {kill_timeout}s "
-                f"timeout+grace. Alpaca poll likely hung. Forcing bot termination."
+                f"timeout+grace. IBKR poll likely hung. Forcing bot termination."
             )
             raise SystemExit(1)
 
@@ -407,11 +405,8 @@ class OrderExecutor:
                 )
                 return order
 
-        except APIError as e:
-            logger.error(f"API error executing trade for {symbol}: {e}")
-            return None
         except Exception as e:
-            logger.error(f"Unexpected error executing trade for {symbol}: {e}")
+            logger.error(f"Error executing trade for {symbol}: {e}")
             return None
 
     def close_position_due_to_sentiment(
@@ -507,7 +502,7 @@ class OrderExecutor:
             logger.warning(
                 f"[ENV MODE GUARD] Weekend liquidation blocked: "
                 f"env_mode={env_mode} (expected LIVE). All positions preserved. "
-                f"If you intended to liquidate, set APCA_API_ENV=LIVE and restart."
+                f"If you intended to liquidate, set IB_ENV=LIVE and restart."
             )
             return
 

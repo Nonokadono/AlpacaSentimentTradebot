@@ -67,7 +67,7 @@ class NewsReasoner:
         """
         Input:
             symbol: string ticker, e.g. "AAPL"
-            newsitems: list of dicts from Alpaca news API
+            newsitems: list of dicts from broker news API
 
         Output dict:
             - sentiment: float in [-1, 1], or exact integer -2 for chaos

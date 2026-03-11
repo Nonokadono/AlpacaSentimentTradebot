@@ -31,9 +31,9 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Dict
 
-ENV_MODE = os.getenv("APCA_API_ENV", "PAPER").upper()
+ENV_MODE = os.getenv("IB_ENV", "PAPER").upper()
 if ENV_MODE not in ("PAPER", "LIVE"):
-    raise ValueError(f"Invalid APCA_API_ENV={ENV_MODE}, expected PAPER or LIVE")
+    raise ValueError(f"Invalid IB_ENV={ENV_MODE}, expected PAPER or LIVE")
 
 LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
 

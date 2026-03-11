@@ -32,7 +32,7 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo  # type: ignore[import]
 
-from adapters.alpaca_adapter import AlpacaAdapter
+from adapters.ibkr_adapter import IbkrAdapter
 from config.config import load_config
 from core.portfolio_builder import PortfolioBuilder
 from core.risk_engine import RiskEngine, EquitySnapshot, PositionInfo
@@ -153,7 +153,7 @@ def _persist_opening_compounds(opening_compounds: Dict[str, float]) -> None:
     _save_equity_state(state)
 
 
-def _safe_list_open_orders(adapter: AlpacaAdapter) -> List[Any]:
+def _safe_list_open_orders(adapter: IbkrAdapter) -> List[Any]:
     # AUDIT FIX 1.3 — Centralize guarded open-order lookup for reconciliation and UI paths.
     try:
         open_orders = adapter.list_orders(status="open")
@@ -333,7 +333,7 @@ def _update_dashboard_state_safely(**kwargs: Any) -> None:
 
 def _refresh_positions_safely(
     pm: PositionManager,
-    adapter: AlpacaAdapter,
+    adapter: IbkrAdapter,
     opening_compounds: Dict[str, float],
 ) -> Dict[str, PositionInfo]:
     positions = _guarded_call(
@@ -352,7 +352,7 @@ def main() -> None:
     setup_logging(cfg.env_mode)
     log_environment_switch(cfg.env_mode, user="manual_start")
 
-    adapter = AlpacaAdapter(cfg.env_mode)
+    adapter = IbkrAdapter(cfg.env_mode)
     # AUDIT FIX 1.5 — Use configured sentiment thresholds and cache controls at runtime.
     sentiment = SentimentModule(cfg.sentiment)
     signal_engine = SignalEngine(adapter, sentiment, cfg.technical)
@@ -379,7 +379,7 @@ def main() -> None:
     )
 
     try:
-        # AUDIT FIX 1.3 — Guard startup broker refresh so transient Alpaca outages cannot crash boot.
+        # AUDIT FIX 1.3 — Guard startup broker refresh so transient IBKR outages cannot crash boot.
         positions_at_start = _refresh_positions_safely(pm, adapter, _opening_compounds)
     except Exception:
         logger.warning(

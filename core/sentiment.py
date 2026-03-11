@@ -246,7 +246,7 @@ class SentimentModule:
 
     def scorenewsitems(self, symbol: str, newsitems: List[dict]) -> SentimentResult:
         """
-        newsitems: list of dicts (typically *new since last check* from Alpaca news API),
+        newsitems: list of dicts (typically *new since last check* from news API),
                   each with at least 'headline' and/or 'summary'.
 
         Cost controls:

@@ -9,7 +9,7 @@
 import logging
 from typing import Dict, List, Any
 
-from adapters.alpaca_adapter import AlpacaAdapter
+from adapters.ibkr_adapter import IbkrAdapter
 from core.signals import SignalEngine, Signal
 from core.sentiment import SentimentModule
 from core.risk_engine import RiskEngine, EquitySnapshot, PositionInfo, ProposedTrade
@@ -34,7 +34,7 @@ class PortfolioBuilder:
     def __init__(
         self,
         cfg: BotConfig,
-        adapter: AlpacaAdapter,
+        adapter: IbkrAdapter,
         sentiment: SentimentModule,
         signal_engine: SignalEngine,
         risk_engine: RiskEngine,

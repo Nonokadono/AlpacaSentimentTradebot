@@ -21,11 +21,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
-# ── Mock Bar object (simulates Alpaca bar) ──────────────────────────────────
+# ── Mock Bar object (simulates broker bar) ──────────────────────────────────
 
 @dataclass
 class MockBar:
-    """Simulates an Alpaca bar with OHLCV fields."""
+    """Simulates a broker bar with OHLCV fields."""
     o: float   # open
     h: float   # high
     l: float   # low
@@ -66,7 +66,7 @@ def make_flat_bars(price: float, count: int, noise: float = 0.05) -> List[MockBa
     return make_bars(closes)
 
 
-# ── Mock Alpaca objects ─────────────────────────────────────────────────────
+# ── Mock broker objects ─────────────────────────────────────────────────────
 
 @dataclass
 class MockAccount:

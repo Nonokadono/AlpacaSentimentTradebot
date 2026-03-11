@@ -14,10 +14,10 @@ from datetime import datetime, timedelta, date
 from unittest.mock import MagicMock, patch
 
 # We need to patch environment variables before importing main
-os.environ.setdefault("APCA_API_KEY_ID", "test_key")
-os.environ.setdefault("APCA_API_SECRET_KEY", "test_secret")
-os.environ.setdefault("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
-os.environ.setdefault("APCA_API_ENV", "PAPER")
+os.environ.setdefault("IB_HOST", "127.0.0.1")
+os.environ.setdefault("IB_PORT", "7497")
+os.environ.setdefault("IB_CLIENT_ID", "1")
+os.environ.setdefault("IB_ENV", "PAPER")
 
 from core.risk_engine import PositionInfo
 

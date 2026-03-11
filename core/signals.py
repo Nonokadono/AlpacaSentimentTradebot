@@ -32,7 +32,7 @@ from collections import defaultdict, deque
 
 import math
 
-from adapters.alpaca_adapter import AlpacaAdapter
+from adapters.ibkr_adapter import IbkrAdapter
 from config.config import ENV_MODE, TechnicalSignalConfig
 from monitoring.monitor import log_instrument_report
 
@@ -69,7 +69,7 @@ class SignalEngine:
 
     def __init__(
         self,
-        adapter: AlpacaAdapter,
+        adapter: IbkrAdapter,
         sentiment: SentimentModule,
         technicalcfg: TechnicalSignalConfig,
     ):
@@ -777,7 +777,7 @@ class SignalEngine:
 
     def _get_news_items(self, symbol: str) -> List[Dict]:
         """
-        Fetch news from Alpaca adapter.
+        Fetch news from IBKR adapter.
         Here we just ask for latest 10 items.
         """
         return self.adapter.get_news(symbol, limit=10)

@@ -409,7 +409,7 @@ if _PYQT5_AVAILABLE:
             layout.setSpacing(0)
 
             # App title
-            title = QLabel("Alpaca TradeBot")
+            title = QLabel("IBKR TradeBot")
             title.setStyleSheet(
                 f"color: {COLORS['text_secondary']}; "
                 f"font-family: {_FONT_UI}; font-size: 13px; font-weight: 600; "
@@ -539,7 +539,7 @@ if _PYQT5_AVAILABLE:
     # ── Main window ────────────────────────────────────────────────────────
 
     class TradeBotMainWindow(QWidget):
-        """Modern frameless PyQt5 dashboard for the Alpaca trading bot."""
+        """Modern frameless PyQt5 dashboard for the IBKR trading bot."""
 
         _EDGE_SIZE = 6  # pixels from edge for resize grab
 
@@ -551,7 +551,7 @@ if _PYQT5_AVAILABLE:
             # Frameless + translucent for rounded corners
             self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowMinMaxButtonsHint)
             self.setAttribute(Qt.WA_TranslucentBackground)
-            self.setWindowTitle("Alpaca TradeBot Dashboard")
+            self.setWindowTitle("IBKR TradeBot Dashboard")
             self.setMinimumSize(960, 600)
             self.resize(1300, 760)
 
@@ -1052,7 +1052,7 @@ if _PYQT5_AVAILABLE:
 
 def build_position_rows(
     positions: dict,          # Dict[str, PositionInfo] from PositionManager
-    open_orders: list,        # list of Alpaca order objects (kept for backward compat)
+    open_orders: list,        # list of broker order objects (kept for backward compat)
 ) -> List[PositionRow]:
     """Convert a PositionManager positions dict into UI PositionRow objects.
 
@@ -1091,7 +1091,7 @@ def build_position_rows(
 
 def build_price_rows(
     instruments: dict,   # Dict[str, InstrumentMeta]
-    adapter,             # AlpacaAdapter instance
+    adapter,             # IbkrAdapter instance
 ) -> List[PriceRow]:
     """Fetch live quotes for all whitelisted symbols and return PriceRow list."""
     rows: List[PriceRow] = []
@@ -1104,7 +1104,7 @@ def build_price_rows(
         bid = last_price
         ask = last_price
         try:
-            q = adapter.rest.get_latest_quote(sym)
+            q = adapter.get_latest_quote(sym)
             bid = float(getattr(q, "bp", last_price) or last_price)
             ask = float(getattr(q, "ap", last_price) or last_price)
         except Exception:

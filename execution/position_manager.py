@@ -13,7 +13,7 @@
 import logging
 from typing import Dict, Optional
 
-from adapters.alpaca_adapter import AlpacaAdapter
+from adapters.ibkr_adapter import IbkrAdapter
 from core.risk_engine import PositionInfo
 
 logger = logging.getLogger("tradebot")
@@ -21,20 +21,20 @@ logger = logging.getLogger("tradebot")
 
 class PositionManager:
     """
-    Maps raw Alpaca REST positions into typed PositionInfo objects.
+    Maps raw IBKR REST positions into typed PositionInfo objects.
 
     Responsibilities:
       - Fetch all open positions from the broker.
-      - Convert raw Alpaca position objects into PositionInfo dataclasses.
+      - Convert raw IBKR position objects into PositionInfo dataclasses.
       - Patch opening_compound from the in-memory registry (_opening_compounds)
         so downstream sentiment-exit logic has a valid entry-time baseline.
-      - Populate avg_entry_price from the Alpaca position object so that
+      - Populate avg_entry_price from the IBKR position object so that
         PnL-coupled sentiment-exit threshold scaling has a valid denominator.
       - MONITOR-FIX: Fetch open orders to bind current TP/SL prices to positions.
       - CONFIDENCE-STORE: Unpack (compound, confidence) tuples from the registry.
     """
 
-    def __init__(self, adapter: AlpacaAdapter) -> None:
+    def __init__(self, adapter: IbkrAdapter) -> None:
         self.adapter = adapter
 
     def get_positions(
@@ -42,7 +42,7 @@ class PositionManager:
         opening_compounds: Optional[Dict[str, tuple]] = None,
     ) -> Dict[str, PositionInfo]:
         """
-        Fetch and map all open Alpaca positions.
+        Fetch and map all open IBKR positions.
 
         Parameters
         ----------
@@ -89,7 +89,7 @@ class PositionManager:
                         # Legacy scalar — treat as compound only
                         opening_compound = float(opening_data)
 
-                # CRASH-2 FIX: read avg_entry_price from the raw Alpaca position
+                # CRASH-2 FIX: read avg_entry_price from the raw IBKR position
                 # object. getattr with default 0.0 is safe for mock/test objects
                 # that omit this attribute; the guard in order_executor.py
                 # (`if pos.avg_entry_price > 0.0`) treats 0.0 as "not available"
